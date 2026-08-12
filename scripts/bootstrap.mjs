@@ -92,6 +92,7 @@ const SOURCE_BUILD_INPUTS = [
 // npm 安装包不携带 TypeScript / Web 源码；bootstrap 只能在所有生产入口都在时
 // 采用预构建模式，不能因某一个 dist 文件碰巧存在就生成无法启动的 .biao。
 export const PREBUILT_RUNTIME_INPUTS = [
+  'package.json',
   'dist/index.js',
   'dist/server/main.js',
   'dist/cli/index.js',
@@ -100,6 +101,7 @@ export const PREBUILT_RUNTIME_INPUTS = [
   'dist/worker/kimi.js',
   'dist/worker/cli.js',
   'web/dist/index.html',
+  'web/dist/manifest.json',
   'bin/biao.js',
   'bin/biao-worker.js',
   'bin/cli-worker.js',
@@ -122,11 +124,10 @@ export function referencedWebRuntimeInputs(repoRoot) {
 
   const html = readFileSync(indexPath, 'utf8');
   const inputs = new Set();
-  for (const match of html.matchAll(/(?:src|href)=["']([^"']+)["']/g)) {
-    const raw = match[1];
-    if (!raw || /^(?:[a-z]+:|\/\/|#)/i.test(raw)) continue;
+  const addWebInput = (raw) => {
+    if (!raw || /^(?:[a-z]+:|\/\/|#)/i.test(raw)) return;
     const withoutQuery = raw.split(/[?#]/, 1)[0];
-    if (!withoutQuery) continue;
+    if (!withoutQuery) return;
     const candidate = withoutQuery.startsWith('/')
       ? resolve(webRoot, `.${withoutQuery}`)
       : resolve(dirname(indexPath), withoutQuery);
@@ -134,6 +135,33 @@ export function referencedWebRuntimeInputs(repoRoot) {
       throw new Error(`网页入口引用越过 web/dist：${raw}`);
     }
     inputs.add(relative(root, candidate).split(sep).join('/'));
+  };
+  for (const match of html.matchAll(/(?:src|href)=["']([^"']+)["']/g)) {
+    addWebInput(match[1]);
+  }
+
+  const manifestPath = join(webRoot, 'manifest.json');
+  if (existsSync(manifestPath)) {
+    let manifest;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    } catch {
+      throw new Error('web/dist/manifest.json 无法解析');
+    }
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      throw new Error('web/dist/manifest.json 格式无效');
+    }
+    for (const entry of Object.values(manifest)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const record = entry;
+      if (typeof record.file === 'string') addWebInput(record.file);
+      for (const field of ['css', 'assets']) {
+        if (!Array.isArray(record[field])) continue;
+        for (const path of record[field]) {
+          if (typeof path === 'string') addWebInput(path);
+        }
+      }
+    }
   }
   return [...inputs];
 }

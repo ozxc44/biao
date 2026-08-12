@@ -40,6 +40,7 @@ function seedSourceCheckout(root: string): void {
 
 function seedPrebuiltPackage(root: string): void {
   for (const relativePath of [
+    'package.json',
     'dist/index.js',
     'dist/server/main.js',
     'dist/cli/index.js',
@@ -48,6 +49,7 @@ function seedPrebuiltPackage(root: string): void {
     'dist/worker/kimi.js',
     'dist/worker/cli.js',
     'web/dist/index.html',
+    'web/dist/manifest.json',
     'web/dist/assets/app.js',
     'web/dist/assets/app.css',
     'bin/biao-worker.js',
@@ -64,12 +66,32 @@ function seedPrebuiltPackage(root: string): void {
   ]) {
     const path = join(root, relativePath);
     mkdirSync(join(path, '..'), { recursive: true });
-    writeFileSync(path, relativePath.endsWith('.html') ? '<!doctype html>\n' : '// packaged runtime\n');
+    const contents = relativePath.endsWith('.html')
+      ? '<!doctype html>\n'
+      : relativePath.endsWith('manifest.json')
+        ? '{}\n'
+        : relativePath === 'package.json'
+          ? '{"type":"module"}\n'
+          : '// packaged runtime\n';
+    writeFileSync(path, contents);
   }
   writeFileSync(
     join(root, 'web', 'dist', 'index.html'),
     '<!doctype html><script type="module" src="./assets/app.js"></script><link rel="stylesheet" href="./assets/app.css">\n',
   );
+  writeFileSync(
+    join(root, 'web', 'dist', 'manifest.json'),
+    JSON.stringify({
+      'index.html': {
+        file: 'assets/app.js',
+        css: ['assets/app.css'],
+        assets: ['assets/logo.svg'],
+        isEntry: true,
+      },
+    }),
+  );
+  const logoPath = join(root, 'web', 'dist', 'assets', 'logo.svg');
+  writeFileSync(logoPath, '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
 }
 
 function writeExecutable(path: string, body: string): void {
@@ -666,6 +688,9 @@ describe('clone 后自举配置', () => {
       'dist/db/schema.sql',
       'scripts/install.sh',
       'web/dist/assets/app.js',
+      'web/dist/assets/logo.svg',
+      'web/dist/manifest.json',
+      'package.json',
     ]) {
       const root = makeRoot();
       const workspace = join(root, workspaceName);

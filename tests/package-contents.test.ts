@@ -33,7 +33,8 @@ describe('npm package contents', () => {
     const packageRoot = join(import.meta.dirname, '..');
     const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as { files?: string[] };
     const declared = packageJson.files ?? [];
-    const isCovered = (path: string) => declared.some((entry) => path === entry || path.startsWith(`${entry.replace(/\/$/, '')}/`));
+    const isCovered = (path: string) => path === 'package.json'
+      || declared.some((entry) => path === entry || path.startsWith(`${entry.replace(/\/$/, '')}/`));
 
     expect(PREBUILT_RUNTIME_INPUTS.filter((path) => !isCovered(path))).toEqual([]);
     expect(declared).toContain('scripts/verify-package.mjs');
