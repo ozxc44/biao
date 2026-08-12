@@ -64,9 +64,10 @@ describe('biao pm intake', () => {
           counts: { review_requested: 1, acceptance_ready: 0, failed: 0, blocked: 0, stale_agent: 0 },
           items: [
             {
-              kind: 'review_requested',
+              kind: 'question_asked',
               plan_id: 'p1',
               task_id: 't1',
+              question_id: 'q1',
               event_id: 'e1',
               timestamp: 1786466877493,
             },
@@ -77,7 +78,7 @@ describe('biao pm intake', () => {
     const { stdout } = await runCli(['pm', 'intake', '--consumer', 'pm', '--json'], { BIAO_URL: url });
     const parsed = JSON.parse(stdout);
     expect(parsed.ok).toBe(true);
-    expect(parsed.data.items[0]).toMatchObject({ kind: 'review_requested', plan_id: 'p1', task_id: 't1' });
+    expect(parsed.data.items[0]).toMatchObject({ kind: 'question_asked', plan_id: 'p1', task_id: 't1', question_id: 'q1' });
     // 不应展开详情
     expect(parsed.data.items[0]).not.toHaveProperty('result_md');
   });

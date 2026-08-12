@@ -22,6 +22,7 @@
     "bootstrap.sh",
     "scripts/bootstrap.mjs",
     "scripts/redis-probe.mjs",
+    "scripts/verify-package.mjs",
     "scripts/pm-agent.mjs",
     "scripts/codex-pm-agent.mjs",
     "scripts/supervisor.mjs",
@@ -47,6 +48,7 @@
     "dev": "tsx src/server/main.ts",
     "test": "vitest run",
     "test:web": "npm --prefix web test",
+    "verify:package": "node scripts/verify-package.mjs",
     "prepack": "npm run build"
   },
   "engines": {

@@ -1,7 +1,10 @@
-import { delimiter, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parseWorkspaceRoots, resolveAndValidateWorkspacePath } from '../src/server/security.js';
-import { assertSafeServerConfig, resolveServerConfig } from '../src/server/main.js';
+import { assertSafeServerConfig, isServerEntrypoint, resolveServerConfig } from '../src/server/main.js';
 
 describe('workspace path security', () => {
   it('parses, resolves and deduplicates workspace roots', () => {
@@ -44,6 +47,20 @@ describe('workspace path security', () => {
 });
 
 describe('server configuration contract', () => {
+  it('server 入口经符号链接或系统路径规范化后仍识别为直接执行', () => {
+    const root = mkdtempSync(join(tmpdir(), 'biao-server-entry-'));
+    try {
+      const entry = join(root, 'main.js');
+      const alias = join(root, 'main-alias.js');
+      writeFileSync(entry, '// main\n');
+      symlinkSync(entry, alias);
+      expect(isServerEntrypoint(alias, pathToFileURL(entry).href)).toBe(true);
+      expect(isServerEntrypoint(join(root, 'missing.js'), pathToFileURL(entry).href)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('derives token, workspace roots and sqlite path from environment', () => {
     const config = resolveServerConfig(
       {},

@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 function sanitizedEnvironment() {
   const env = { ...process.env };
@@ -50,7 +53,16 @@ export function runRedisProbe(raw = process.env.BIAO_REDIS_PROBE_URL) {
   return !result.error && result.status === 0 && result.stdout.trim() === 'PONG';
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export function isRedisProbeMain(argvPath, moduleUrl = import.meta.url) {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(resolve(argvPath)) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isRedisProbeMain(process.argv[1])) {
   try {
     process.exit(runRedisProbe() ? 0 : 1);
   } catch {

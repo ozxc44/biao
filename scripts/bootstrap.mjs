@@ -10,6 +10,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -77,6 +78,91 @@ function runNpm(cwd, args, label) {
   });
   if (result.error) throw new Error(`${label}失败：${result.error.message}`);
   if (result.status !== 0) throw new Error(`${label}失败，退出码 ${result.status}`);
+}
+
+const SOURCE_BUILD_INPUTS = [
+  ['package.json', 'file'],
+  ['package-lock.json', 'file'],
+  ['tsconfig.json', 'file'],
+  ['src', 'directory'],
+  ['web/package.json', 'file'],
+  ['web/package-lock.json', 'file'],
+];
+
+// npm 安装包不携带 TypeScript / Web 源码；bootstrap 只能在所有生产入口都在时
+// 采用预构建模式，不能因某一个 dist 文件碰巧存在就生成无法启动的 .biao。
+export const PREBUILT_RUNTIME_INPUTS = [
+  'dist/index.js',
+  'dist/server/main.js',
+  'dist/cli/index.js',
+  'dist/worker/supervisor.js',
+  'dist/worker/codex.js',
+  'dist/worker/kimi.js',
+  'dist/worker/cli.js',
+  'web/dist/index.html',
+  'bin/biao.js',
+  'bin/biao-worker.js',
+  'bin/cli-worker.js',
+  'bin/codex-worker.js',
+  'bin/kimi-worker.js',
+  'bin/worker-help.js',
+  'dist/db/schema.sql',
+  'scripts/install.sh',
+  'scripts/pm-agent.mjs',
+  'scripts/codex-pm-agent.mjs',
+  'scripts/supervisor.mjs',
+  'scripts/redis-probe.mjs',
+];
+
+export function referencedWebRuntimeInputs(repoRoot) {
+  const root = resolve(repoRoot);
+  const webRoot = join(root, 'web', 'dist');
+  const indexPath = join(webRoot, 'index.html');
+  if (!existsSync(indexPath)) return [];
+
+  const html = readFileSync(indexPath, 'utf8');
+  const inputs = new Set();
+  for (const match of html.matchAll(/(?:src|href)=["']([^"']+)["']/g)) {
+    const raw = match[1];
+    if (!raw || /^(?:[a-z]+:|\/\/|#)/i.test(raw)) continue;
+    const withoutQuery = raw.split(/[?#]/, 1)[0];
+    if (!withoutQuery) continue;
+    const candidate = withoutQuery.startsWith('/')
+      ? resolve(webRoot, `.${withoutQuery}`)
+      : resolve(dirname(indexPath), withoutQuery);
+    if (!isInside(webRoot, candidate)) {
+      throw new Error(`网页入口引用越过 web/dist：${raw}`);
+    }
+    inputs.add(relative(root, candidate).split(sep).join('/'));
+  }
+  return [...inputs];
+}
+
+function pathHasKind(root, relativePath, kind) {
+  const path = join(root, relativePath);
+  if (!existsSync(path)) return false;
+  const metadata = statSync(path);
+  return kind === 'directory' ? metadata.isDirectory() : metadata.isFile();
+}
+
+export function detectBootstrapRuntimeLayout(repoRoot) {
+  const root = resolve(repoRoot);
+  if (SOURCE_BUILD_INPUTS.every(([path, kind]) => pathHasKind(root, path, kind))) return 'source';
+  if (PREBUILT_RUNTIME_INPUTS.every((path) => pathHasKind(root, path, 'file'))) return 'prebuilt';
+  return 'incomplete';
+}
+
+export function missingPrebuiltRuntimeInputs(repoRoot) {
+  const root = resolve(repoRoot);
+  const required = [...PREBUILT_RUNTIME_INPUTS, ...referencedWebRuntimeInputs(root)];
+  return [...new Set(required)].filter((path) => !pathHasKind(root, path, 'file'));
+}
+
+function assertCompleteRuntime(repoRoot, context) {
+  const missing = missingPrebuiltRuntimeInputs(repoRoot);
+  if (missing.length > 0) {
+    throw new Error(`${context}后运行时不完整，缺少：${missing.join('、')}。请完成构建或重新安装发布包`);
+  }
 }
 
 function validateBootstrapToken(raw, source) {
@@ -147,18 +233,25 @@ export function bootstrap(options) {
   }
   assertDirectory(project, 'project');
 
+  const runtimeLayout = detectBootstrapRuntimeLayout(repoRoot);
+  if (runtimeLayout === 'incomplete') {
+    throw new Error('安装内容不完整：既不是可构建的 Git 源码，也不是完整的预构建运行时；请重新 clone 或重新安装发布包');
+  }
+
   const configExists = existsSync(configPath);
   const upgrading = configExists && !options.force && options.upgrade === true;
   if (configExists && !options.force && !upgrading) {
-    return { created: false, setupDir, configPath };
+    assertCompleteRuntime(repoRoot, '检查已有配置');
+    return { created: false, setupDir, configPath, runtimeLayout };
   }
 
   const runCommand = options.commandRunner ?? runNpm;
-  if (!options.skipInstall) {
-    runCommand(repoRoot, ['install'], '根目录依赖安装');
-    runCommand(join(repoRoot, 'web'), ['install'], 'Web 依赖安装');
+  if (runtimeLayout === 'source' && !options.skipInstall) {
+    runCommand(repoRoot, ['install', '--workspaces=false'], '根目录依赖安装');
+    runCommand(join(repoRoot, 'web'), ['install', '--workspaces=false'], 'Web 依赖安装');
   }
-  if (!options.skipBuild) runCommand(repoRoot, ['run', 'build'], '项目构建');
+  if (runtimeLayout === 'source' && !options.skipBuild) runCommand(repoRoot, ['run', 'build', '--workspaces=false'], '项目构建');
+  assertCompleteRuntime(repoRoot, runtimeLayout === 'source' ? '源码准备' : '预构建包校验');
 
   const port = Number(options.port ?? 7331);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`端口无效：${options.port}`);
@@ -198,7 +291,9 @@ export function bootstrap(options) {
 
   writeExecutable(
     join(setupDir, 'doctor'),
-    wrapper(`failed=0
+    wrapper(`redis_probe_url=$BIAO_REDIS_URL
+unset BIAO_API_TOKEN BIAO_BOOTSTRAP_TOKEN BIAO_REDIS_URL
+failed=0
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=12)||(a===20&&b>=19)?0:1)'; then
   echo "[ok] Node.js 20.19+ / 22.12+: $(node --version)"
   echo "[ok] npm: $(command -v npm)"
@@ -206,8 +301,8 @@ else
   echo "[missing] Node.js 20.19+ / 22.12+ 和 npm" >&2
   failed=1
 fi
-if command -v redis-cli >/dev/null 2>&1; then
-  if redis-cli -u "$BIAO_REDIS_URL" ping 2>/dev/null | grep -q PONG; then
+if command -v redis-cli >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+  if BIAO_REDIS_PROBE_URL=$redis_probe_url node "$SCRIPT_DIR/../scripts/redis-probe.mjs" >/dev/null 2>&1; then
     echo "[ok] Redis 可连接"
   else
     echo "[missing] Redis 不可连接；请检查 .biao/config.env 中的 BIAO_REDIS_URL" >&2
@@ -465,6 +560,7 @@ Supervisor 只给最小门铃，永不自动 ack；每个事项必须在读取�
     setupDir,
     configPath,
     tokenGenerated: !upgrading && options.token == null,
+    runtimeLayout,
   };
 }
 
@@ -539,15 +635,25 @@ function usage() {
 `;
 }
 
-const selfPath = fileURLToPath(import.meta.url);
-if (process.argv[1] && resolve(process.argv[1]) === selfPath) {
+const bootstrapModulePath = fileURLToPath(import.meta.url);
+
+export function isBootstrapMain(argvPath, moduleUrl = import.meta.url) {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(resolve(argvPath)) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isBootstrapMain(process.argv[1])) {
   try {
     const args = parseArgs(process.argv.slice(2));
     if (args.help) {
       console.log(usage());
       process.exit(0);
     }
-    const repoRoot = resolve(dirname(selfPath), '..');
+    const repoRoot = resolve(dirname(bootstrapModulePath), '..');
     const workspace = resolve(args.workspace ?? repoRoot);
     const project = resolve(args.project ?? workspace);
     const token = resolveBootstrapToken(args, process.env);

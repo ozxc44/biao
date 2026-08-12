@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 const tempRoots: string[] = [];
 
@@ -23,7 +24,52 @@ function makeRoot(): string {
     join(root, 'bin', 'biao.js'),
     '#!/usr/bin/env node\nconsole.log(JSON.stringify({args: process.argv.slice(2), url: process.env.BIAO_URL, agent: process.env.BIAO_AGENT_ID}))\n',
   );
+  seedPrebuiltPackage(root);
   return root;
+}
+
+function seedSourceCheckout(root: string): void {
+  mkdirSync(join(root, 'src'), { recursive: true });
+  mkdirSync(join(root, 'web'), { recursive: true });
+  writeFileSync(join(root, 'package.json'), '{}\n');
+  writeFileSync(join(root, 'package-lock.json'), '{}\n');
+  writeFileSync(join(root, 'tsconfig.json'), '{}\n');
+  writeFileSync(join(root, 'web', 'package.json'), '{}\n');
+  writeFileSync(join(root, 'web', 'package-lock.json'), '{}\n');
+}
+
+function seedPrebuiltPackage(root: string): void {
+  for (const relativePath of [
+    'dist/index.js',
+    'dist/server/main.js',
+    'dist/cli/index.js',
+    'dist/worker/supervisor.js',
+    'dist/worker/codex.js',
+    'dist/worker/kimi.js',
+    'dist/worker/cli.js',
+    'web/dist/index.html',
+    'web/dist/assets/app.js',
+    'web/dist/assets/app.css',
+    'bin/biao-worker.js',
+    'bin/cli-worker.js',
+    'bin/codex-worker.js',
+    'bin/kimi-worker.js',
+    'bin/worker-help.js',
+    'dist/db/schema.sql',
+    'scripts/install.sh',
+    'scripts/pm-agent.mjs',
+    'scripts/codex-pm-agent.mjs',
+    'scripts/supervisor.mjs',
+    'scripts/redis-probe.mjs',
+  ]) {
+    const path = join(root, relativePath);
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, relativePath.endsWith('.html') ? '<!doctype html>\n' : '// packaged runtime\n');
+  }
+  writeFileSync(
+    join(root, 'web', 'dist', 'index.html'),
+    '<!doctype html><script type="module" src="./assets/app.js"></script><link rel="stylesheet" href="./assets/app.css">\n',
+  );
 }
 
 function writeExecutable(path: string, body: string): void {
@@ -55,6 +101,18 @@ describe('clone 后自举配置', () => {
       skipBuild: true,
       redis_url: 'redis://localhost:6380',
     });
+  });
+
+  it('入口路径经过符号链接或系统路径规范化后仍识别为直接执行', async () => {
+    const { isBootstrapMain } = await loadBootstrap();
+    const root = makeRoot();
+    const entry = join(root, 'bootstrap-entry.mjs');
+    const alias = join(root, 'bootstrap-alias.mjs');
+    writeFileSync(entry, '// entry\n');
+    symlinkSync(entry, alias);
+
+    expect(isBootstrapMain(alias, pathToFileURL(entry).href)).toBe(true);
+    expect(isBootstrapMain(join(root, 'missing.mjs'), pathToFileURL(entry).href)).toBe(false);
   });
 
   it('拒绝把 Token 放进 argv，并引导使用安全入口', async () => {
@@ -143,7 +201,11 @@ describe('clone 后自举配置', () => {
     for (const name of ['doctor', 'start', 'copy-token', 'token-status', 'pm', 'pm-intake', 'pm-start', 'pm-agent', 'codex-pm-agent', 'supervisor', 'worker-codex', 'worker-kimi', 'worker-custom']) {
       expect(statSync(join(root, '.biao', name)).mode & 0o111).not.toBe(0);
     }
-    expect(readFileSync(join(root, '.biao', 'doctor'), 'utf8')).toContain('Node.js 20.19+');
+    const doctor = readFileSync(join(root, '.biao', 'doctor'), 'utf8');
+    expect(doctor).toContain('Node.js 20.19+');
+    expect(doctor).toContain('scripts/redis-probe.mjs');
+    expect(doctor).toContain('unset BIAO_API_TOKEN');
+    expect(doctor).not.toContain('redis-cli -u');
     expect(readFileSync(join(root, '.biao', 'supervisor'), 'utf8')).toContain('scripts/supervisor.mjs');
     expect(readFileSync(join(root, '.biao', 'pm-start'), 'utf8')).toContain('pm start');
     expect(readFileSync(join(root, '.biao', 'pm-agent'), 'utf8')).toContain('scripts/pm-agent.mjs');
@@ -504,7 +566,9 @@ describe('clone 后自举配置', () => {
     const root = makeRoot();
     const workspace = join(root, 'workspace');
     mkdirSync(workspace);
-    mkdirSync(join(root, 'web'));
+    seedSourceCheckout(root);
+    rmSync(join(root, 'dist'), { recursive: true, force: true });
+    rmSync(join(root, 'web', 'dist'), { recursive: true, force: true });
     const calls: Array<{ cwd: string; args: string[]; label: string }> = [];
 
     bootstrap({
@@ -512,14 +576,110 @@ describe('clone 后自举配置', () => {
       workspace,
       project: workspace,
       token: 'test-token',
-      commandRunner: (cwd: string, args: string[], label: string) => calls.push({ cwd, args, label }),
+      commandRunner: (cwd: string, args: string[], label: string) => {
+        calls.push({ cwd, args, label });
+        if (label === '项目构建') seedPrebuiltPackage(root);
+      },
     });
 
     expect(calls).toEqual([
-      { cwd: root, args: ['install'], label: '根目录依赖安装' },
-      { cwd: join(root, 'web'), args: ['install'], label: 'Web 依赖安装' },
-      { cwd: root, args: ['run', 'build'], label: '项目构建' },
+      { cwd: root, args: ['install', '--workspaces=false'], label: '根目录依赖安装' },
+      { cwd: join(root, 'web'), args: ['install', '--workspaces=false'], label: 'Web 依赖安装' },
+      { cwd: root, args: ['run', 'build', '--workspaces=false'], label: '项目构建' },
     ]);
+  });
+
+  it('全新 clone 跳过构建或构建未生成完整入口时 fail closed', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    seedSourceCheckout(root);
+    rmSync(join(root, 'dist'), { recursive: true, force: true });
+    rmSync(join(root, 'web', 'dist'), { recursive: true, force: true });
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      skipInstall: true,
+      skipBuild: true,
+    })).toThrow(/运行时不完整|完成构建/);
+    expect(existsSync(join(root, '.biao'))).toBe(false);
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      skipInstall: true,
+      commandRunner: () => undefined,
+    })).toThrow(/运行时不完整|完成构建/);
+    expect(existsSync(join(root, '.biao'))).toBe(false);
+  });
+
+  it('npm tarball 的完整预构建运行时无需源码、Web manifest 或开发构建即可配置', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    seedPrebuiltPackage(root);
+    const calls: Array<{ cwd: string; args: string[]; label: string }> = [];
+
+    const result = bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      commandRunner: (cwd: string, args: string[], label: string) => calls.push({ cwd, args, label }),
+    });
+
+    expect(result.runtimeLayout).toBe('prebuilt');
+    expect(calls).toEqual([]);
+    expect(readFileSync(join(root, '.biao', 'start'), 'utf8')).toContain('dist/server/main.js');
+  });
+
+  it('非源码布局的预构建入口缺失时 fail closed，且不生成半成品配置', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    seedPrebuiltPackage(root);
+    rmSync(join(root, 'web', 'dist', 'index.html'));
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+    })).toThrow(/安装内容不完整|预构建运行时/);
+    expect(existsSync(join(root, '.biao'))).toBe(false);
+  });
+
+  it('预构建布局会校验 Worker/SQLite/安装入口以及 index.html 引用的网页资源', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const workspaceName = 'workspace';
+
+    for (const missingPath of [
+      'bin/worker-help.js',
+      'dist/db/schema.sql',
+      'scripts/install.sh',
+      'web/dist/assets/app.js',
+    ]) {
+      const root = makeRoot();
+      const workspace = join(root, workspaceName);
+      mkdirSync(workspace);
+      rmSync(join(root, missingPath));
+
+      expect(() => bootstrap({
+        repoRoot: root,
+        workspace,
+        project: workspace,
+        token: 'test-token',
+      }), missingPath).toThrow(/安装内容不完整|运行时不完整/);
+      expect(existsSync(join(root, '.biao'))).toBe(false);
+    }
   });
 
   it('拒绝不存在的 workspace 和不在 workspace 内的 project', async () => {

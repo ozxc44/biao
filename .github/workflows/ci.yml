@@ -54,8 +54,8 @@ jobs:
 
       - name: Audit high-severity vulnerabilities
         run: |
-          npm audit --audit-level=high
-          npm --prefix web audit --audit-level=high
+          npm audit --workspaces=false --audit-level=high
+          npm --prefix web audit --workspaces=false --audit-level=high
 
       - name: Test server and CLI
         run: npm test
@@ -67,4 +67,7 @@ jobs:
         run: npm run build
 
       - name: Verify package contents
-        run: npm pack --dry-run --ignore-scripts
+        run: npm run verify:package
+
+      - name: Smoke-test installed package
+        run: bash .github/scripts/package-smoke.sh

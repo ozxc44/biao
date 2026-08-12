@@ -735,6 +735,7 @@ async function main() {
                 kind: i.kind,
                 plan_id: i.plan_id,
                 task_id: i.task_id,
+                question_id: i.question_id,
                 agent_id: i.agent_id,
                 event_id: i.event_id,
                 timestamp: i.timestamp,

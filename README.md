@@ -78,6 +78,8 @@ bootstrap 会自动完成：
 6. 生成服务、安全复制 Token、交互式 PM、显式 opt-in 的 PM Agent 唤醒器、Supervisor、Codex、Kimi 和自定义 Worker 启动器；使用 `--pm-agent codex` 时直接接入内置 Codex PM 适配器；
 7. 生成供 Agent 阅读的 `.biao/PM_AGENT.md`。
 
+从 Git clone 的源码目录运行时，bootstrap 会安装依赖并完成构建；通过 `npm install <受信任的本地包.tgz>` 安装后运行时，它会校验完整的预构建运行时并跳过开发依赖安装与重复构建。不要把裸解压 tarball 当成安装，因为它不包含生产依赖。两种受支持布局只要缺少任一必需入口或网页静态资源都会立即停止，不会生成一个表面成功、实际不可启动的 `.biao/`。
+
 生成的 `.biao/` 已被 Git 忽略，不会把本机路径或 Token 提交到仓库。
 
 随后启动服务：
@@ -986,7 +988,7 @@ SUPERSEDE_TEST_REDIS_URL="redis://127.0.0.1:6379/9" \
 npm test
 npm --prefix web test -- --run
 npm run build
-npm pack --dry-run --ignore-scripts
+npm run verify:package
 ```
 
 一次产品级验收至少覆盖：

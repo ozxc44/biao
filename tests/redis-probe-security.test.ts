@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -68,5 +68,26 @@ describe('Redis bootstrap probe security', () => {
     expect(rejected.status).toBe(1);
     expect(`${rejected.stdout}${rejected.stderr}`).not.toContain(secretUrl);
     expect(`${rejected.stdout}${rejected.stderr}`).not.toContain('secret');
+  });
+
+  it('通过符号链接或系统别名路径直接执行时不会假成功跳过探测', () => {
+    const fake = fakeCli();
+    const script = join(import.meta.dirname, '..', 'scripts', 'redis-probe.mjs');
+    const alias = join(fake.root, 'redis-probe-alias.mjs');
+    symlinkSync(script, alias);
+
+    const run = spawnSync(process.execPath, [alias], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fake.bin}${delimiter}${process.env.PATH ?? ''}`,
+        PROBE_ARGV: fake.argv,
+        PROBE_ENV: fake.env,
+        BIAO_REDIS_PROBE_URL: 'redis://127.0.0.1:6380/4',
+      },
+    });
+
+    expect(run.status).toBe(0);
+    expect(readFileSync(fake.argv, 'utf8')).toContain('6380');
   });
 });

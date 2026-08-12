@@ -11,6 +11,7 @@ import { SqliteStore } from '../db/sqlite-store.js';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { realpathSync } from 'node:fs';
 import type { BiaoConfig } from '../types/index.js';
 
 function parseArgs(argv: string[] = process.argv.slice(2)): Partial<BiaoConfig> & { planDir?: string } {
@@ -157,8 +158,17 @@ export async function startServer(overrides: Partial<BiaoConfig> = {}): Promise<
   };
 }
 
+export function isServerEntrypoint(argvPath: string | undefined, moduleUrl = import.meta.url): boolean {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(resolve(argvPath)) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
 // 直接运行（node dist/server/main.js）
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isServerEntrypoint(process.argv[1])) {
   startServer().catch((e) => {
     console.error('[biao] 启动失败：', e);
     process.exit(1);
