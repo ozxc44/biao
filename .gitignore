@@ -1,0 +1,20 @@
+# 本机依赖、构建产物与运行态；源码、打包入口和文档仍由 Git 跟踪。
+node_modules/
+dist/
+web/dist/
+
+# bootstrap / PM Worker 运行时可能包含 Token、绝对路径、日志和任务证据。
+.biao/
+.codex/
+work/
+/data/
+/dump.rdb
+
+coverage/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.tgz
+*.log
+scripts/agent-exec.sh

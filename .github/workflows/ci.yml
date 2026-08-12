@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/1
+      ACCEPTANCE_REVERIFY_TEST_REDIS_URL: redis://127.0.0.1:6379/2
+      LEASE_LIFECYCLE_TEST_REDIS_URL: redis://127.0.0.1:6379/3
+      LEGACY_REVIEW_TEST_REDIS_URL: redis://127.0.0.1:6379/4
+      OWNERSHIP_TEST_REDIS_URL: redis://127.0.0.1:6379/5
+      REPAIR_OWNERSHIP_TEST_REDIS_URL: redis://127.0.0.1:6379/6
+      RESTORE_DOORBELL_TEST_REDIS_URL: redis://127.0.0.1:6379/7
+      RESTORE_MAINTENANCE_TEST_REDIS_URL: redis://127.0.0.1:6379/8
+      SUPERSEDE_TEST_REDIS_URL: redis://127.0.0.1:6379/9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20.19.5
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Install web dependencies
+        run: npm --prefix web ci
+
+      - name: Audit high-severity vulnerabilities
+        run: |
+          npm audit --audit-level=high
+          npm --prefix web audit --audit-level=high
+
+      - name: Test server and CLI
+        run: npm test
+
+      - name: Test web console
+        run: npm run test:web
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify package contents
+        run: npm pack --dry-run --ignore-scripts
