@@ -72,6 +72,93 @@ function fakeRedis(): Redis {
 }
 
 describe('HTTP bearer authentication', () => {
+  it('lets a human establish a durable local Owner browser session without receiving the Agent bearer token', async () => {
+    const app = await createHttpServer(fakeRedis(), config());
+    const localBrowserHeaders = {
+      host: '127.0.0.1:7331',
+      origin: 'http://127.0.0.1:7331',
+      'sec-fetch-site': 'same-origin',
+    };
+
+    try {
+      const before = await app.inject({ method: 'GET', url: '/auth/session' });
+      expect(before.statusCode).toBe(200);
+      expect(before.json()).toEqual({
+        ok: true,
+        data: { authenticated: false, mode: 'local_owner', local_session_available: true },
+      });
+
+      const start = await app.inject({ method: 'POST', url: '/auth/local-session', headers: localBrowserHeaders });
+      expect(start.statusCode).toBe(200);
+      expect(start.json()).toEqual({
+        ok: true,
+        data: { authenticated: true, mode: 'local_owner', local_session_available: true },
+      });
+      const cookie = start.headers['set-cookie'];
+      expect(cookie).toContain('HttpOnly');
+      expect(cookie).toContain('SameSite=Strict');
+      expect(cookie).not.toContain('test-secret');
+
+      const api = await app.inject({
+        method: 'GET',
+        url: '/',
+        headers: { accept: 'application/json', cookie: String(cookie) },
+      });
+      expect(api.statusCode).toBe(200);
+      expect(api.json()).toMatchObject({ ok: true, service: 'biao' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not mint a local Owner browser session for a non-loopback binding', async () => {
+    const app = await createHttpServer(fakeRedis(), config({ host: '0.0.0.0' }));
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/auth/local-session',
+        headers: {
+          host: 'biao.example.test:7331',
+          origin: 'http://biao.example.test:7331',
+          'sec-fetch-site': 'same-origin',
+        },
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({
+        ok: false,
+        data: null,
+        error: { code: 'LOCAL_SESSION_UNAVAILABLE', message: '本机 Owner 会话只允许 loopback 部署' },
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a cross-site request that tries to change a local Owner session', async () => {
+    const app = await createHttpServer(fakeRedis(), config());
+
+    try {
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/auth/local-session',
+        headers: {
+          host: '127.0.0.1:7331',
+          origin: 'https://untrusted.example',
+          'sec-fetch-site': 'cross-site',
+        },
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({
+        ok: false,
+        data: null,
+        error: { code: 'LOCAL_SESSION_ORIGIN_DENIED', message: '本机 Owner 会话必须从控制台同源页面创建' },
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it('API 目录向已认证客户端列出 CLI 已使用的版本与活跃 ownership 路由', async () => {
     const app = await createHttpServer(fakeRedis(), config());
 

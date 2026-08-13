@@ -145,7 +145,7 @@ npm install /absolute/path/to/vtp-biao-0.1.0.tgz
 ./.biao/start
 ```
 
-预构建布局把两类内容明确分开：`node_modules/@vtp/biao` 只保存可替换的只读代码与网页静态资源；调用命令的当前目录下 `.biao/` 保存 `config.env`、Token、SQLite/数据以及启动器。启动器从外置 `.biao/config.env` 读取配置，再通过写死并安全引用的 packageRoot 绝对路径执行已安装代码，不会把 `node_modules` 当作可变数据目录。因此重新安装或升级 npm 包不会顺带删除运行状态。bootstrap 会校验服务、CLI、Worker、SQLite schema 与网页静态资源，并跳过开发依赖安装和重复构建。保持服务终端运行后，可在另一终端执行 `./.biao/copy-token`。
+预构建布局把两类内容明确分开：`node_modules/@vtp/biao` 只保存可替换的只读代码与网页静态资源；调用命令的当前目录下 `.biao/` 保存 `config.env`、Agent Token、SQLite/数据以及启动器。启动器从外置 `.biao/config.env` 读取配置，再通过写死并安全引用的 packageRoot 绝对路径执行已安装代码，不会把 `node_modules` 当作可变数据目录。因此重新安装或升级 npm 包不会顺带删除运行状态。bootstrap 会校验服务、CLI、Worker、SQLite schema 与网页静态资源，并跳过开发依赖安装和重复构建。
 
 需要把状态放在其它位置时使用显式 `--runtime-dir /absolute/biao-state`。预构建布局会拒绝 packageRoot 内或任意 `node_modules` 内的 runtime-dir，避免包升级时丢失数据。升级时先在同一个消费目录安装新版 tarball，再从该目录刷新启动器；已有配置、Token 和数据会原样保留，启动器改为指向新版 packageRoot：
 
@@ -169,15 +169,11 @@ npm install /absolute/path/to/vtp-biao-new.tgz
 .biao/start
 ```
 
-保持服务终端运行，另开一个终端完成网页鉴权：
+浏览器直接打开启动日志中的地址。首次点击 **“进入控制台”**，Biao 会在 loopback（`127.0.0.1` / `localhost`）服务上为当前浏览器创建一个有效期 30 天的 HttpOnly 本机 Owner 会话；刷新和新标签页自动复用，右上角可随时“退出此浏览器”。浏览器不会收到、保存或显示 `BIAO_API_TOKEN`，轮换该 Token 会立即使本机 Owner 会话失效。
 
-```bash
-.biao/copy-token
-```
+`BIAO_API_TOKEN` 是给 CLI、Worker 和受控 API 客户端使用的 Bearer 凭据。生成的 Worker/PM/Supervisor 启动器会从权限 `600` 的 `.biao/config.env` 读取它；不需要复制到浏览器。`.biao/token-status` 只显示其指纹末尾，`.biao/copy-token` 仅保留给受控 CLI 调试，不用于网页登录。
 
-浏览器打开启动日志中的地址，把剪贴板内容粘贴到网页右上角 **API Token** 并保存。网页只在当前标签页的 `sessionStorage` 中保存凭据；关闭标签页后需要重新粘贴。`copy-token` 只通过 stdin 调用系统剪贴板，不会把 Token 写进命令参数、URL、版本库或默认终端输出。只想确认本机是否已经配置凭据时运行 `.biao/token-status`，它只显示 SHA-256 指纹末尾，不显示 Token。
-
-控制台首次打开和新标签页默认使用中文；右上角可以切换到 English。语言选择只保留在当前标签页会话中：刷新会延续当前选择，另开标签页仍从中文开始，不写入长期 `localStorage`。Token 配置状态与操作提示会随语言立即切换。
+控制台首次打开和新标签页默认使用中文；右上角可以切换到 English。语言选择只保留在当前标签页会话中：刷新会延续当前选择，另开标签页仍从中文开始，不写入长期 `localStorage`。
 
 macOS 使用系统 `pbcopy`。Linux 需要 `wl-copy`、`xclip` 或 `xsel` 中任意一个；没有安全剪贴板工具时命令会给出安装指引并以非零状态退出，不会回退为把 Token 打印到终端。
 
@@ -619,12 +615,14 @@ node bin/biao-worker.js
 
 失败响应会额外包含 `error.code` 和 `error.message`。
 
-启用认证后，每个请求都需要：
+启用认证后，Worker、CLI 和受控 API 客户端需要：
 
 ```http
 Authorization: Bearer <BIAO_API_TOKEN>
 Content-Type: application/json
 ```
+
+本机 loopback 控制台使用 HttpOnly 本机 Owner 会话，不携带或暴露 Bearer Token。
 
 标准 Worker 生命周期如下。
 
@@ -1048,7 +1046,7 @@ Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤�
 | `BIAO_WORKSPACE_ROOTS` | 空 | 允许访问的工作区根目录；多个路径使用系统路径分隔符 |
 | `BIAO_API_TOKEN` | 空 | API Bearer Token；非本机监听必须配置 |
 
-CLI、Worker 和网页控制台在启用认证时使用同一个 Token。一旦配置 `BIAO_API_TOKEN`，除 `/health`、`/version` 和前端静态资源外，所有 API 读写请求都必须携带 `Authorization: Bearer <token>`；未配置 Token 时保持 loopback 本机兼容。网页入口仍可直接打开，右上角 **API Token** 控件会将 Token 只保存在当前标签页的 `sessionStorage`，不会写入 URL；保存后看板会重新执行带认证的读取。
+CLI、Worker 和受控 API 客户端在启用认证时使用 `BIAO_API_TOKEN` 作为 Bearer 凭据。除 `/health`、`/version`、前端静态资源和本机登录端点外，API 读写请求必须携带 `Authorization: Bearer <token>`，或在 loopback 部署中携带浏览器的 HttpOnly 本机 Owner 会话。网页不再提供 Token 输入框：首次本机确认后自动登录；非 loopback 部署不会签发本机会话，必须接入独立的人类身份提供方后再开放网页 PM。
 
 ## 安全与部署
 

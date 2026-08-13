@@ -293,8 +293,9 @@ describe('clone 后自举配置', () => {
     expect(guide).toContain('不会自动 ack');
     expect(guide).toContain('.biao/pm pm intake');
     expect(guide).toContain('.biao/pm pm ack');
-    expect(guide).toContain('.biao/copy-token');
-    expect(guide).toContain('sessionStorage');
+    expect(guide).toContain('HttpOnly');
+    expect(guide).toContain('进入控制台');
+    expect(guide).not.toContain('粘贴到网页右上角');
     expect(guide).not.toMatch(/\.biao\/pm (?:intake|ack)\b/);
 
     const output = execFileSync(join(root, '.biao', 'pm'), ['status'], { encoding: 'utf8' });
@@ -431,30 +432,32 @@ describe('clone 后自举配置', () => {
     expect(`${run.stdout}${run.stderr}`).not.toContain(token);
   });
 
-  it('bootstrap 完成提示给出启动、复制和右上角粘贴的安全网页登录顺序', async () => {
+  it('bootstrap 完成提示给出本机 Owner 会话登录顺序，不让浏览器接触 Token', async () => {
     const { formatCompletion } = await loadBootstrap();
     const output = formatCompletion({ created: true, upgraded: false });
 
     expect(output).toContain('.biao/start');
-    expect(output).toContain('.biao/copy-token');
-    expect(output).toContain('右上角');
-    expect(output).toContain('sessionStorage');
+    expect(output).toContain('进入控制台');
+    expect(output).toContain('HttpOnly');
+    expect(output).toContain('.biao/token-status');
+    expect(output).not.toContain('.biao/copy-token');
+    expect(output).not.toContain('粘贴 Token');
     expect(output).not.toContain('BIAO_API_TOKEN=');
 
     const external = formatCompletion({ created: true, upgraded: false, setupDir: '/srv/biao state' });
     expect(external).toContain('/srv/biao state/start');
-    expect(external).toContain('/srv/biao state/copy-token');
+    expect(external).toContain('/srv/biao state/token-status');
   });
 
-  it('README 与 Worker 接入文档提供不经 URL 或终端输出的网页登录步骤', () => {
+  it('README 与 Worker 接入文档说明本机 Owner 会话与 Agent Token 的边界', () => {
     const root = join(import.meta.dirname, '..');
     const readme = readFileSync(join(root, 'README.md'), 'utf8');
     const workerGuide = readFileSync(join(root, 'docs', 'worker-integration.md'), 'utf8');
     for (const document of [readme, workerGuide]) {
-      expect(document).toContain('.biao/copy-token');
-      expect(document).toContain('右上角');
-      expect(document).toContain('sessionStorage');
-      expect(document).toMatch(/不(?:会|要).*URL/);
+      expect(document).toContain('HttpOnly');
+      expect(document).toContain('BIAO_API_TOKEN');
+      expect(document).toMatch(/浏览器.*(?:不会|不接收|不需要)/);
+      expect(document).not.toContain('粘贴到网页右上角');
     }
     expect(readme).not.toMatch(/--token(?:=|\s+)/);
     expect(readme).toContain('--token-file');

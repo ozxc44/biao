@@ -42,18 +42,22 @@ button { color: inherit; }
 .btn.small { padding: 6px 9px; font-size: 12px; }
 .icon-button { width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--border); background: white; cursor: pointer; font-size: 24px; line-height: 1; }
 
-.token-control { position: relative; z-index: 20; }
-.token-control summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: white; font-weight: 650; }
-.token-control summary::-webkit-details-marker { display: none; }
+.local-owner-control { position: relative; z-index: 20; }
+.local-owner-control summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: white; font-weight: 650; }
+.local-owner-control summary::-webkit-details-marker { display: none; }
 .token-state { padding: 2px 6px; border-radius: 99px; background: #eef1f4; color: var(--muted); font-size: 10px; }
 .token-state.configured { background: #dcfce7; color: var(--green); }
-.token-control form { position: absolute; right: 0; top: calc(100% + 8px); width: min(340px, calc(100vw - 28px)); padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: white; box-shadow: var(--shadow); }
-.token-control label, .create-plan-form label, .review-form label { display: block; margin-bottom: 5px; color: #475569; font-weight: 650; font-size: 12px; }
-.token-control input, .create-plan-form input, .review-form textarea { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; color: var(--text); background: white; }
-.token-control form .button-row { margin-top: 10px; }
+.local-owner-control-panel { position: absolute; right: 0; top: calc(100% + 8px); width: min(300px, calc(100vw - 28px)); padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: white; box-shadow: var(--shadow); }
+.local-owner-control-panel p { margin: 0 0 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.create-plan-form label, .review-form label { display: block; margin-bottom: 5px; color: #475569; font-weight: 650; font-size: 12px; }
+.create-plan-form input, .review-form textarea { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; color: var(--text); background: white; }
 .field-message { color: var(--muted); font-size: 11px; margin-top: 6px; }
 
 .notice { padding: 48px 20px; text-align: center; color: var(--muted); }
+.local-owner-gate { width: min(520px, 100%); margin: 11vh auto 0; padding: 30px; border: 1px solid var(--border); border-radius: 16px; background: var(--card); box-shadow: var(--shadow); }
+.local-owner-gate h2 { margin: 0; font-size: 24px; }
+.local-owner-gate > p:not(.eyebrow) { margin: 10px 0 18px; color: var(--muted); line-height: 1.6; }
+.local-owner-gate small { display: block; margin-top: 14px; color: var(--muted); font-size: 12px; }
 .notice p { margin-bottom: 14px; }
 .notice.error, .inline-error { color: var(--red); }
 .banner { margin-bottom: 14px; padding: 10px 12px; border-radius: 9px; background: #edf6ff; color: #1d4f91; }

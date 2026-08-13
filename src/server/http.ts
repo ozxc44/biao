@@ -61,6 +61,15 @@ import { keys } from '../redis/keys.js';
 import type { BiaoConfig } from '../types/index.js';
 import { resolveAndValidateWorkspacePath } from './security.js';
 import {
+  isLoopbackHost,
+  isValidLocalOwnerSession,
+  issueLocalOwnerSession,
+  localOwnerClearCookie,
+  localOwnerSetCookie,
+  readCookie,
+  LOCAL_OWNER_COOKIE,
+} from './human-session.js';
+import {
   QUESTION_ANSWER_MAX_CHARS,
   QUESTION_BODY_MAX_CHARS,
   QUESTION_CHECKPOINT_MAX_CHARS,
@@ -135,6 +144,33 @@ const API_ENDPOINTS: Record<string, string> = {
 };
 
 const API_HINT = 'API 路径在根路径（无 /api 前缀，也兼容 /api 前缀）。curl http://localhost:7331/health 验证。';
+
+function isLocalOwnerSessionPath(pathname: string): boolean {
+  return /^(?:\/api)?\/auth\/(?:session|local-session)$/.test(pathname);
+}
+
+function localOwnerSessionAvailable(config: BiaoConfig): boolean {
+  return Boolean(config.apiToken) && isLoopbackHost(config.host);
+}
+
+function hasLocalOwnerSession(cookieHeader: string | undefined, config: BiaoConfig): boolean {
+  return Boolean(
+    config.apiToken &&
+    localOwnerSessionAvailable(config) &&
+    isValidLocalOwnerSession(readCookie(cookieHeader, LOCAL_OWNER_COOKIE), config.apiToken),
+  );
+}
+
+/**
+ * Session 的创建只能来自控制台自己的同源浏览器请求。loopback 绑定保证请求来自本机，
+ * Origin + Sec-Fetch-Site 再阻断第三方页面把访问者静默登录为本机 Owner（login CSRF）。
+ */
+function isSameOriginBrowserRequest(headers: Record<string, string | string[] | undefined>): boolean {
+  const host = typeof headers.host === 'string' ? headers.host : undefined;
+  const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
+  const fetchSite = typeof headers['sec-fetch-site'] === 'string' ? headers['sec-fetch-site'] : undefined;
+  return Boolean(host && origin === `http://${host}` && fetchSite === 'same-origin');
+}
 
 const nonEmptyString = { type: 'string', minLength: 1 } as const;
 const absolutePath = { type: 'string', minLength: 1, pattern: '^/' } as const;
@@ -598,9 +634,11 @@ export async function createHttpServer(
         requestUrl.pathname === '/' &&
         (req.headers.accept ?? '').includes('text/html') &&
         !(req.headers.accept ?? '').includes('application/json');
-      if (publicApiPath || publicFrontendEntry) return;
+      if (publicApiPath || publicFrontendEntry || isLocalOwnerSessionPath(requestUrl.pathname)) return;
 
-      if (req.headers.authorization !== `Bearer ${config.apiToken}`) {
+      const bearerAuthenticated = req.headers.authorization === `Bearer ${config.apiToken}`;
+      const humanAuthenticated = hasLocalOwnerSession(req.headers.cookie, config);
+      if (!bearerAuthenticated && !humanAuthenticated) {
         return reply.status(401).send({
           ok: false,
           data: null,
@@ -614,6 +652,7 @@ export async function createHttpServer(
     // 被拒请求制造无意义 permit；onResponse/onError 都按 owner 精确释放。
     app.addHook('preHandler', async (req, reply) => {
       const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
+      if (isLocalOwnerSessionPath(requestUrl.pathname)) return;
       const isRestore = /^(?:\/api)?\/db\/restore$/.test(requestUrl.pathname);
       const watchdogAutoFix = /^(?:\/api)?\/watchdog$/.test(requestUrl.pathname) &&
         ['true', '1'].includes(requestUrl.searchParams.get('auto_fix') ?? '');
@@ -655,7 +694,7 @@ export async function createHttpServer(
     // 仍在 settle 后才释放。
     app.addHook('preSerialization', async (req, reply, payload) => {
       const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
-      if (!maintenanceDiagnosticPath(requestUrl.pathname)) {
+      if (!maintenanceDiagnosticPath(requestUrl.pathname) && !isLocalOwnerSessionPath(requestUrl.pathname)) {
         const gate = await getRestoreMaintenanceGate(redis);
         if (gate) {
           reply.status(maintenanceStatus(gate.code));
@@ -673,6 +712,63 @@ export async function createHttpServer(
     });
     app.addHook('onResponse', async (req) => {
       await releaseRequestPermit(req).catch(() => undefined);
+    });
+
+    // 人类 PM 使用 HttpOnly 的本机 Owner 会话；Agent 继续走 Bearer Token。Cookie 从不携带
+    // BIAO_API_TOKEN，本机服务重启也可用同一配置密钥验证；旋转 API Token 会立即失效全部会话。
+    app.get('/auth/session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!config.apiToken) {
+        return { ok: true, data: { authenticated: true, mode: 'auth_disabled', local_session_available: false } };
+      }
+      return {
+        ok: true,
+        data: {
+          authenticated: hasLocalOwnerSession(req.headers.cookie, config),
+          mode: 'local_owner',
+          local_session_available: localOwnerSessionAvailable(config),
+        },
+      };
+    });
+
+    app.post('/auth/local-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!localOwnerSessionAvailable(config)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_UNAVAILABLE', message: '本机 Owner 会话只允许 loopback 部署' },
+        });
+      }
+      if (!isSameOriginBrowserRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_ORIGIN_DENIED', message: '本机 Owner 会话必须从控制台同源页面创建' },
+        });
+      }
+      reply.header('Set-Cookie', localOwnerSetCookie(issueLocalOwnerSession(config.apiToken!)));
+      return { ok: true, data: { authenticated: true, mode: 'local_owner', local_session_available: true } };
+    });
+
+    app.delete('/auth/local-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!isSameOriginBrowserRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_ORIGIN_DENIED', message: '本机 Owner 会话必须从控制台同源页面创建' },
+        });
+      }
+      reply.header('Set-Cookie', localOwnerClearCookie());
+      return {
+        ok: true,
+        data: {
+          authenticated: false,
+          mode: config.apiToken ? 'local_owner' : 'auth_disabled',
+          local_session_available: localOwnerSessionAvailable(config),
+        },
+      };
     });
 
     // GET / → JSON 返回 API 目录；Accept: text/html 时返回前端看板

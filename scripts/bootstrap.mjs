@@ -676,7 +676,7 @@ case "$os_name" in
     ;;
 esac
 
-echo "[biao] API Token 已复制到系统剪贴板；请粘贴到网页右上角 API Token。"`),
+echo "[biao] API Token 已复制到系统剪贴板；仅用于受控 Agent/CLI 调试，不用于网页登录。"`),
   );
   writeExecutable(
     join(setupDir, 'token-status'),
@@ -747,7 +747,7 @@ exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"`),
 
 ## 网页控制台鉴权
 
-启动 \`.biao/start\` 后，另开终端运行 \`.biao/copy-token\`，再把剪贴板内容粘贴到网页右上角 **API Token**。网页只把凭据保存在当前标签页的 \`sessionStorage\`；该命令不会把 Token 写入 argv、URL 或默认终端输出。只核对配置状态时可运行 \`.biao/token-status\`，它只显示 SHA-256 指纹末尾。
+启动 \`.biao/start\` 后，直接在本机浏览器打开控制台并点击“进入控制台”。Biao 会创建一个 HttpOnly 的本机 Owner 会话；浏览器不会收到、保存或显示 Agent API Token。关闭会话或轮换 \`BIAO_API_TOKEN\` 会使该浏览器重新要求本机确认。\`.biao/token-status\` 仅供操作者核对 Agent/CLI 凭据是否已配置，它只显示 SHA-256 指纹末尾。
 
 ## 每次开始
 
@@ -887,7 +887,7 @@ export function formatCompletion(result) {
   const command = (name) => shellQuote(join(setupDir, name));
   if (result.upgraded) {
     return `[biao] 已保留 ${join(setupDir, 'config.env')}，并升级启动器与 PM 手册。
-  网页鉴权：运行 ${command('copy-token')}，再粘贴到网页右上角 API Token（仅存当前标签页 sessionStorage）`;
+  网页登录：在本机浏览器打开控制台，首次点击“进入控制台”（不粘贴 Token）`;
   }
   if (!result.created) {
     return `[biao] 已存在 ${join(setupDir, 'config.env')}；未覆盖。需要重建时使用 --force，更新启动器时使用 --upgrade。`;
@@ -895,9 +895,9 @@ export function formatCompletion(result) {
   return `[biao] 配置完成。
   环境检查：${command('doctor')}
   启动服务：${command('start')}
-  网页鉴权：另开终端运行 ${command('copy-token')} → 粘贴到网页右上角 API Token
-              Token 仅存当前标签页 sessionStorage，命令不会打印凭据
-  Token 状态：${command('token-status')}（只显示 SHA-256 指纹末尾）
+  网页登录：在本机浏览器打开控制台，首次点击“进入控制台”
+              浏览器使用 HttpOnly 本机 Owner 会话，不接收 Agent Token
+  Agent 凭据：${command('token-status')}（只显示 API Token 指纹末尾）
   PM 入口：  ${command('pm-start')} --once
   PM 唤醒器：配置 BIAO_PM_AGENT_CMD 后由 ${command('supervisor')} 按需启动
   PM 手册：  ${join(setupDir, 'PM_AGENT.md')}

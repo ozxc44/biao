@@ -19,7 +19,7 @@
 
 `.biao/config.env` 包含服务地址、工作区和 API Token，权限为 `600`。将它视为本机凭据：不提交、不打印、不传给执行子进程。
 
-网页控制台启用鉴权时，保持 `.biao/start` 运行，另开终端执行 `.biao/copy-token`，再把剪贴板内容粘贴到网页右上角 **API Token**。网页只保存到当前标签页的 `sessionStorage`；命令不会把 Token 写进 argv、URL、版本库或默认终端输出。`.biao/token-status` 仅显示是否已配置和 SHA-256 指纹末尾。Linux 若没有 `wl-copy`、`xclip` 或 `xsel`，复制命令会安全失败并提示安装，不会回退为在终端显示凭据。
+人类 PM 在 loopback 本机直接打开网页，首次点击“进入控制台”即可获得 HttpOnly 本机 Owner 会话；浏览器不会接收或保存 API Token。`BIAO_API_TOKEN` 仅供 Worker、PM CLI 和受控 API 客户端使用，生成的启动器会从 `.biao/config.env` 读取它。`.biao/token-status` 仅显示是否已配置和 SHA-256 指纹末尾；`.biao/copy-token` 仅供受控 CLI 调试，不用于网页登录。
 
 ## PM Agent 不是 Worker
 

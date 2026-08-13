@@ -149,13 +149,9 @@ Bootstrap fails closed if a required runtime entry, schema, or web asset is miss
 .biao/start
 ```
 
-In another terminal:
+Open the address printed by the server directly in a browser. On the first visit, choose **Enter console**. On a loopback (`127.0.0.1` / `localhost`) deployment, Biao creates a 30-day HttpOnly local Owner session for that browser; refreshes and new tabs reuse it, and the upper-right menu can sign out that browser. The browser never receives, stores, or displays `BIAO_API_TOKEN`; rotating that Token invalidates all local Owner sessions.
 
-```bash
-.biao/copy-token
-```
-
-Paste the clipboard value into **API Token** in the upper-right corner. The console stores it only in the current tab's `sessionStorage`, never in a URL. `.biao/token-status` shows only a fingerprint suffix. macOS uses `pbcopy`; Linux needs `wl-copy`, `xclip`, or `xsel`. If no safe clipboard tool exists, the command exits nonzero instead of printing the secret.
+`BIAO_API_TOKEN` is a Bearer credential for CLI, Workers, and controlled API clients. Generated Worker/PM/Supervisor launchers read it from owner-only `.biao/config.env`; it does not belong in the browser. `.biao/token-status` shows only a fingerprint suffix. `.biao/copy-token` remains for controlled CLI diagnostics, not console sign-in.
 
 The console defaults to Chinese in every new tab; switch to English in the upper-right. Language state survives refresh in that tab only.
 
@@ -451,7 +447,7 @@ The generic Worker owns scheduling and Verify; the command performs the task and
 
 ### HTTP Worker lifecycle
 
-Responses use `{"ok":true,"data":{}}`; failures add `error.code` and `error.message`. With authentication enabled, every request sends Bearer authorization and JSON content type.
+Responses use `{"ok":true,"data":{}}`; failures add `error.code` and `error.message`. With authentication enabled, Workers, the CLI, and controlled API clients send Bearer authorization and JSON content type. The local loopback console instead uses its HttpOnly local Owner session and never receives the Bearer token.
 
 #### 1. Register a process generation
 
@@ -686,7 +682,7 @@ Minimal intake omits task bodies, logs, Verify, ownership, and Question text. Th
 | `BIAO_WORKSPACE_ROOTS` | empty | Allowed roots, platform-path-delimiter separated |
 | `BIAO_API_TOKEN` | empty | Bearer token; required off loopback |
 
-With a token configured, every API except `/health`, `/version`, and static assets requires Bearer authorization. Biao refuses non-loopback listening unless both token and precise workspace roots are set.
+With a token configured, API clients use Bearer authorization; the local loopback console may instead use its HttpOnly local Owner session. Biao refuses non-loopback listening unless both token and precise workspace roots are set; it never issues a local Owner session there, so an independent human identity provider is required before exposing the PM console.
 
 ## Security checklist
 
