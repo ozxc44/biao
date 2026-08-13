@@ -67,7 +67,9 @@ done
 probe_smoke_redis
 
 package_name=$(npm pack --pack-destination "$pack_dir" --ignore-scripts --silent | tail -n 1)
-npm install --prefix "$consumer_dir" "$pack_dir/$package_name" --ignore-scripts --no-audit --no-fund
+# SQLite 是原生依赖；真实安装必须允许运行其受 npm 锁文件约束的 install 脚本，
+# 以下载或编译当前 Node/OS/架构对应的绑定。
+npm install --prefix "$consumer_dir" "$pack_dir/$package_name" --no-audit --no-fund
 
 installed_root="$consumer_dir/node_modules/@vtp/biao"
 installed_real_root=$(cd "$installed_root" && pwd -P)

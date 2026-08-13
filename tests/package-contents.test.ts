@@ -104,5 +104,6 @@ describe('npm package contents', () => {
     expect(smoke).toContain('runtime_root="$consumer_dir/.biao"');
     expect(smoke).toContain('cd "$consumer_dir"');
     expect(smoke).not.toContain('$installed_root/.biao/');
+    expect(smoke).not.toMatch(/npm install[^\n]*--ignore-scripts/);
   });
 });
