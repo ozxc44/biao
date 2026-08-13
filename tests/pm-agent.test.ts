@@ -110,16 +110,16 @@ async function runForgedInternalHandoff(
   return { code, stdout, stderr, acknowledgement: acknowledgement.trim() };
 }
 
-function crashLockHolderOnceCommand(outputPath: string, crashMarkerPath: string): string {
+function blockLockHolderOnceCommand(outputPath: string, crashMarkerPath: string): string {
   const dir = createTempDir('biao-pm-agent-crash-child-');
-  const child = join(dir, 'crash-parent-once.mjs');
+  const child = join(dir, 'block-parent-once.mjs');
   writeFileSync(child, `#!/usr/bin/env node
     import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
     appendFileSync(${JSON.stringify(outputPath)}, readFileSync(0, 'utf8').trim() + '\\n');
     if (!existsSync(${JSON.stringify(crashMarkerPath)})) {
-      writeFileSync(${JSON.stringify(crashMarkerPath)}, 'crashed');
-      process.kill(process.ppid, 'SIGKILL');
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      writeFileSync(${JSON.stringify(crashMarkerPath)}, String(process.pid));
+      setInterval(() => {}, 1000);
+      await new Promise(() => {});
     }
   `, { mode: 0o755 });
   chmodSync(child, 0o755);
@@ -499,22 +499,44 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
     const dir = createTempDir('biao-pm-agent-crash-release-');
     const output = join(dir, 'child.jsonl');
     const crashMarker = join(dir, 'crashed-once');
-    const command = crashLockHolderOnceCommand(output, crashMarker);
-
-    const crashed = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
-      BIAO_PM_AGENT_CMD: command,
+    const command = blockLockHolderOnceCommand(output, crashMarker);
+    const crashed = spawn(process.execPath, [script, '--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      cwd: join(import.meta.dirname, '..'),
+      env: { ...process.env, BIAO_PM_AGENT_CMD: command },
+      stdio: 'ignore',
     });
-    expect(crashed.code).not.toBe(0);
-    expect(existsSync(crashMarker)).toBe(true);
-
-    const recovered = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
-      BIAO_PM_AGENT_CMD: command,
+    const crashedClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      crashed.once('error', reject);
+      crashed.once('close', (code, signal) => resolve({ code, signal }));
     });
-    expect(recovered.code).toBe(0);
-    expect(readRecords(output)).toHaveLength(2);
-    expect(paths).toEqual([
-      'GET /intake?consumer=pm-a',
-      'GET /intake?consumer=pm-a',
-    ]);
+    let agentPid: number | undefined;
+    try {
+      await waitForFile(crashMarker);
+      agentPid = Number(readFileSync(crashMarker, 'utf8'));
+      expect(Number.isInteger(agentPid) && agentPid > 1).toBe(true);
+
+      crashed.kill('SIGKILL');
+      const crashedResult = await crashedClosed;
+      expect(crashedResult.code).not.toBe(0);
+      expect(crashedResult.signal).toBe('SIGKILL');
+
+      // PM Agent 被内核终止后，命令子进程可能成为孤儿；它不持锁，但测试必须回收它。
+      try { process.kill(agentPid!, 'SIGKILL'); } catch { /* 已退出 */ }
+
+      const recovered = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+        BIAO_PM_AGENT_CMD: command,
+      });
+      expect(recovered.code).toBe(0);
+      expect(readRecords(output)).toHaveLength(2);
+      expect(paths).toEqual([
+        'GET /intake?consumer=pm-a',
+        'GET /intake?consumer=pm-a',
+      ]);
+    } finally {
+      if (crashed.exitCode === null && crashed.signalCode === null) crashed.kill('SIGKILL');
+      if (agentPid) {
+        try { process.kill(agentPid, 'SIGKILL'); } catch { /* 已退出 */ }
+      }
+    }
   });
 });
