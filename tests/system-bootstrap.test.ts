@@ -105,6 +105,14 @@ describe('无 Node/Redis 时的仓库首入口', () => {
     expect(() => readFileSync(fake.log, 'utf8')).toThrow();
   });
 
+  it('拒绝超出当前 SQLite 驱动兼容范围的未来 Node 主版本', () => {
+    const fake = fakeEnvironment({ node: true, nodeVersion: '27.0.0', redis: true, redisUp: true });
+    const result = spawnSync('/bin/sh', [script, '--check'], { env: fake.env, encoding: 'utf8' });
+
+    expect(result.status).toBe(2);
+    expect(`${result.stdout}${result.stderr}`).toContain('Node.js 20.19+ / 22.12-26.x');
+  });
+
   it('--check 是公开的严格只读入口，依赖齐全也不进入 Node bootstrap', () => {
     const fake = fakeEnvironment({ node: true, redis: true, redisUp: true });
     const result = spawnSync('/bin/sh', [script, '--check', '--workspace', '/must-not-be-written'], {

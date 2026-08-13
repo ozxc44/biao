@@ -87,18 +87,20 @@ Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网�
 
 ## 系统要求
 
-- Node.js 20.19+ 或 22.12+
+- Node.js 20.19+，或 22.12 至 26.x（当前原生 SQLite 驱动的明确兼容范围）
 - Redis
 - 内置 Worker：Codex Worker 需已安装并登录 `codex`；Kimi Worker 需已安装并登录 `kimi`
 - 其他 Agent（Claude Code、ZCode、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
 
-`bootstrap.sh` 会先检测 Node.js、npm、Redis 命令和 Redis 连通性。默认只检测，不修改系统；缺少依赖时会以退出码 `2` 停止。只有显式加 `--yes`，它才会调用 macOS Homebrew 或 Linux 的 apt、dnf、yum 安装缺失依赖；其中 Linux 可能要求管理员权限。本机 Redis 不可用时才会尝试启动本机服务，远程 Redis 只做连通性检查，绝不尝试远程安装或启动。若包管理器不可用、安装后的 Node.js 低于 20.19/22.12，或 Redis 仍无法连接，脚本会停止并说明原因。
+`bootstrap.sh` 会先检测 Node.js、npm、Redis 命令和 Redis 连通性。默认只检测，不修改系统；缺少依赖时会以退出码 `2` 停止。只有显式加 `--yes`，它才会调用 macOS Homebrew 或 Linux 的 apt、dnf、yum 安装缺失依赖；其中 Linux 可能要求管理员权限。本机 Redis 不可用时才会尝试启动本机服务，远程 Redis 只做连通性检查，绝不尝试远程安装或启动。若包管理器不可用、安装后的 Node.js 不在 20.19+ 或 22.12-26.x 范围内，或 Redis 仍无法连接，脚本会停止并说明原因。
 
 ## 开箱即用
 
 Biao 支持两种明确布局：从 Git clone 的**源码布局**，以及通过 npm 安装受信任 tarball 的**预构建布局**。不要混用两套命令，也不要直接解压 tarball 代替 `npm install`。
 
 ### 源码 clone
+
+当前仓库为私有分发；执行以下命令前，需要先获得仓库权限，并在本机完成 GitHub 登录或配置有权访问该仓库的 Git 凭据。
 
 Agent 或开发者从 Git 获取仓库后，只需要执行一次 bootstrap：
 

@@ -101,8 +101,8 @@ node_is_ready() {
   IFS=$OLD_IFS
   NODE_MAJOR=${1:-0}
   NODE_MINOR=${2:-0}
-  [ "$NODE_MAJOR" -gt 22 ] ||
-    { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -ge 12 ]; } ||
+  { [ "$NODE_MAJOR" -ge 22 ] && [ "$NODE_MAJOR" -le 26 ] &&
+    { [ "$NODE_MAJOR" -gt 22 ] || [ "$NODE_MINOR" -ge 12 ]; }; } ||
     { [ "$NODE_MAJOR" -eq 20 ] && [ "$NODE_MINOR" -ge 19 ]; }
 }
 
@@ -123,10 +123,10 @@ REDIS_WAS_MISSING=0
 REDIS_WAS_DOWN=0
 
 if node_is_ready; then
-  echo "[ok] Node.js 20.19+ / 22.12+"
+  echo "[ok] Node.js 20.19+ / 22.12-26.x"
 else
   NODE_WAS_MISSING=1
-  echo "[missing] Node.js 20.19+ / 22.12+（同时需要 npm）"
+  echo "[missing] Node.js 20.19+ / 22.12-26.x（同时需要 npm）"
 fi
 
 if redis_tools_are_ready; then
@@ -199,7 +199,7 @@ install_linux_node() {
   elif command -v brew >/dev/null 2>&1; then
     brew install node
   else
-    echo "未找到受支持的包管理器（apt、dnf、yum 或 Homebrew），请手动安装 Node.js 20.19+ / 22.12+。" >&2
+    echo "未找到受支持的包管理器（apt、dnf、yum 或 Homebrew），请手动安装 Node.js 20.19+ / 22.12-26.x。" >&2
     exit 1
   fi
 }
@@ -225,16 +225,16 @@ if [ "$NODE_WAS_MISSING" -eq 1 ]; then
     Darwin) install_with_brew node ;;
     Linux) install_linux_node ;;
     *)
-      echo "当前系统 $OS_NAME 不支持自动安装 Node.js；请手动安装 Node.js 20.19+ / 22.12+。" >&2
+      echo "当前系统 $OS_NAME 不支持自动安装 Node.js；请手动安装 Node.js 20.19+ / 22.12-26.x。" >&2
       exit 1
       ;;
   esac
   hash -r 2>/dev/null || true
   if ! node_is_ready; then
-    echo "安装后仍未检测到 Node.js 20.19+ / 22.12+ 和 npm。系统包版本可能过旧，请升级后重试。" >&2
+    echo "安装后仍未检测到 Node.js 20.19+ / 22.12-26.x 和 npm。系统包版本可能过旧或过新，请改用受支持版本后重试。" >&2
     exit 1
   fi
-  echo "[installed] Node.js 20.19+ / 22.12+"
+  echo "[installed] Node.js 20.19+ / 22.12-26.x"
 fi
 
 if [ "$REDIS_WAS_MISSING" -eq 1 ] && [ "$REDIS_IS_LOCAL" -eq 0 ]; then

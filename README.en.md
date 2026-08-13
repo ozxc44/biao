@@ -84,18 +84,20 @@ Biao runs with Node.js, Redis, and SQLite. Bootstrap detects dependencies, insta
 
 ## Requirements
 
-- Node.js 20.19+ or 22.12+
+- Node.js 20.19+, or 22.12 through 26.x (the declared compatibility range of the native SQLite driver)
 - Redis
 - Built-in Workers: authenticated `codex` for Codex; authenticated `kimi` for Kimi
 - Other Agents, including Claude Code, ZCode, and internal CLIs: connect through the generic CLI Worker or HTTP API
 
-`bootstrap.sh` detects Node.js, npm, the Redis command, and Redis connectivity before changing anything. Without `--yes`, missing dependencies stop bootstrap with exit code `2`. With `--yes`, bootstrap may install them through Homebrew on macOS or apt, dnf, or yum on Linux. It only attempts to start a local Redis service; a remote `--redis-url` is connectivity-checked and is never installed or started remotely.
+`bootstrap.sh` detects Node.js, npm, the Redis command, and Redis connectivity before changing anything. Without `--yes`, missing dependencies stop bootstrap with exit code `2`. With `--yes`, bootstrap may install them through Homebrew on macOS or apt, dnf, or yum on Linux. It only attempts to start a local Redis service; a remote `--redis-url` is connectivity-checked and is never installed or started remotely. If a Linux package source installs an unsupported Node version, or Redis remains unreachable, bootstrap fails closed and explains what to correct.
 
 ## First-run bootstrap
 
 Biao supports a **source layout** from Git and a **prebuilt layout** installed from a trusted npm tarball. Do not mix them or unpack a tarball in place of `npm install`.
 
 ### Source clone
+
+This repository is currently distributed privately. Obtain repository access and authenticate GitHub (or configure Git credentials with access) before running the clone command.
 
 ```bash
 git clone https://github.com/ozxc44/biao.git

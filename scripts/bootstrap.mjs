@@ -601,11 +601,11 @@ export function bootstrap(options) {
     runtimeWrapper(`redis_probe_url=$BIAO_REDIS_URL
 unset BIAO_API_TOKEN BIAO_BOOTSTRAP_TOKEN BIAO_REDIS_URL
 failed=0
-if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=12)||(a===20&&b>=19)?0:1)'; then
-  echo "[ok] Node.js 20.19+ / 22.12+: $(node --version)"
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(((a>=22&&a<=26)&&(a>22||b>=12))||(a===20&&b>=19)?0:1)'; then
+  echo "[ok] Node.js 20.19+ / 22.12-26.x: $(node --version)"
   echo "[ok] npm: $(command -v npm)"
 else
-  echo "[missing] Node.js 20.19+ / 22.12+ 和 npm" >&2
+  echo "[missing] Node.js 20.19+ / 22.12-26.x 和 npm" >&2
   failed=1
 fi
 if command -v redis-cli >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then

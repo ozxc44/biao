@@ -64,7 +64,7 @@ describe('release configuration', () => {
       dependencies?: Record<string, string>;
       engines?: { node?: string };
     };
-    expect(packageJson.engines?.node).toContain('20.19.0');
+    expect(packageJson.engines?.node).toBe('^20.19.0 || >=22.12.0 <27');
     expect(packageJson.dependencies?.['better-sqlite3']).toBe('^12.6.2');
   });
 
