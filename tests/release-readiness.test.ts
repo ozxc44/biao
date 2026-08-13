@@ -58,6 +58,22 @@ describe('release configuration', () => {
     expect(config).toMatch(/singleFork:\s*true/);
   });
 
+  it('builds the server before tests that launch packaged CLI entrypoints', () => {
+    const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+      scripts?: Record<string, string>;
+    };
+    expect(packageJson.scripts?.pretest).toBe('npm run build:server');
+
+    const workflow = YAML.parse(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
+      jobs?: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+    };
+    const portableSteps = workflow.jobs?.node22?.steps ?? [];
+    const buildIndex = portableSteps.findIndex((step) => step.run === 'npm run build:server');
+    const testIndex = portableSteps.findIndex((step) => step.name === 'Test server without Redis integration suites');
+    expect(buildIndex).toBeGreaterThan(-1);
+    expect(testIndex).toBeGreaterThan(buildIndex);
+  });
+
   it('keeps full Redis tests on the primary Node job and runs portable server/package gates on Node 22', () => {
     const workflow = YAML.parse(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
       jobs?: Record<string, {
