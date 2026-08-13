@@ -62,7 +62,7 @@ jobs:
           npm --prefix web audit --workspaces=false --audit-level=high
 
       - name: Test server and CLI
-        run: npm test
+        run: npm test -- --reporter=verbose
 
       - name: Test web console
         run: npm run test:web
