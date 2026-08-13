@@ -138,11 +138,20 @@ Lease 失效或 `CLAIM_TOKEN_INVALID` 后不得继续代表旧任务写入或 re
 
 产品范围、发布策略、不可逆选择等不能自行决定的事项，必须通过 Biao Question 发给该 Plan 的 PM。内置 Worker 的执行子进程不会继承 Biao 的控制面凭据，因此最稳妥的方式是在 stdout 单独输出一行：
 
+当前 Question API 与 CLI 的固定映射如下；`biao` 表示包提供的 CLI，bootstrap 环境中可通过生成的 `.biao/pm` wrapper 调用同一命令组。
+
+| 角色 | HTTP API | CLI | 作用 |
+| --- | --- | --- | --- |
+| Worker | `POST /question` | `biao question ask` | 创建问题并带上当前任务、claim token 与可选 checkpoint。 |
+| PM | `GET /questions` | `biao question list` | 列出待处理 Question 的最小路由信息。 |
+| PM | `GET /question/:question_id` | `biao question get` | 读取问题正文与 checkpoint。 |
+| PM | `POST /question/:question_id/answer` | `biao question answer` | 记录 PM 答案并允许任务重新入队。 |
+
 ```text
 BIAO_QUESTION: {"body":"是否只发布 A 模块？","checkpoint":"测试已通过，尚未创建发布包"}
 ```
 
-运行层会原子保存 Question、释放当前 lease/ownership、将任务转为等待 PM 答复。PM 从平台读取和回答后，任务回到 `pending`；后续 Worker 必须 fresh claim，才能拿到新的 token 与 `question_answer` / checkpoint。
+运行层会原子保存 Question、释放 claim/ownership，并使旧 claim token 失效。PM 从平台读取和回答后，任务重新进入 `pending`；后续 Worker 必须 fresh claim，取得新的 claim token，才能拿到 `question_answer` / checkpoint 并恢复执行。
 
 直接 API Worker 可改用：
 
@@ -189,7 +198,7 @@ curl -X POST http://127.0.0.1:7331/report \
 - `acceptance` 任务还必须有至少一项通过的 Verify、可读的 `result_path` 和明确的通过/不通过结论；
 - acceptance 不能由执行被验收任务的同一 `agent_id` 完成。
 
-`done` 只是把产物交给 PM Review，不是项目完成。失败或被拒绝后的下一步由 repair 闭环处理，见 [无人盯盘的闭环](autonomous-closure.md)。
+`done` 只是交付状态，不是项目完成状态。依赖放行和 Plan 完成必须以 `pm_review_status=accepted` 为门槛；验收必须由不同于实现 Worker 的独立 Agent 执行并提交可重现证据。失败或被拒绝后的下一步由 repair 闭环处理，见 [无人盯盘的闭环](autonomous-closure.md)。
 
 ### 6. 正常退出时显式离线
 

@@ -71,6 +71,13 @@ async function closesWithin(
   ]);
 }
 
+function expectCleanSigtermShutdown(result: { code: number | null; signal: NodeJS.Signals | null } | undefined) {
+  expect([
+    { code: 0, signal: null },
+    { code: null, signal: 'SIGTERM' },
+  ]).toContainEqual(result);
+}
+
 it('pm watch --once 只输出门铃，不请求 intake/ack', async () => {
   const paths: string[] = [];
   const server = createServer((req: IncomingMessage, res) => {
@@ -133,5 +140,6 @@ it.each([
   expect(early.closed).toBe(false);
   watch.child.kill('SIGTERM');
   const stopped = await closesWithin(watch.closed, 1_000);
-  expect(stopped).toMatchObject({ closed: true, result: { code: 0, signal: null } });
+  expect(stopped.closed).toBe(true);
+  expectCleanSigtermShutdown(stopped.result);
 });

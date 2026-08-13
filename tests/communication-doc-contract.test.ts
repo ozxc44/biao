@@ -1,12 +1,20 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const repositoryRoot = join(import.meta.dirname, '..', '..', '..');
-const communicationDocPath = join(repositoryRoot, 'docs', 'biao', '15-pm-worker-communication.md');
+const packageRoot = join(import.meta.dirname, '..');
+const communicationDocPath = join(packageRoot, 'docs', 'worker-integration.md');
 const communicationDoc = readFileSync(communicationDocPath, 'utf8');
 
 describe('PM/Worker 通信定稿语义', () => {
+  it('契约文档位于可独立发布的 Biao 包内', () => {
+    const packagedRelativePath = relative(packageRoot, communicationDocPath);
+
+    expect(isAbsolute(packagedRelativePath)).toBe(false);
+    expect(packagedRelativePath).not.toMatch(/^\.\.(?:[/\\]|$)/);
+    expect(packagedRelativePath).toBe(join('docs', 'worker-integration.md'));
+  });
+
   it('只引用当前 Question API 与 CLI', () => {
     expect(communicationDoc).toContain('`POST /question`');
     expect(communicationDoc).toContain('`GET /questions`');
