@@ -15,6 +15,7 @@ import {
   agentRegister,
   claim,
   dbRestore,
+  getDbStatus,
   isBiaoNamespaceEmpty,
   reconcileResolutionBacklog,
   releaseRestoreLock,
@@ -134,6 +135,18 @@ afterEach(() => {
 afterAll(() => redis.disconnect());
 
 describe('database restore maintenance gate', () => {
+  it('db status exposes restorable and excluded audit counts', async () => {
+    const status = await getDbStatus(redis);
+
+    expect(status.data).toMatchObject({
+      restore_projection: {
+        restorable_plans: 0,
+        restorable_tasks: 0,
+        excluded: { plan_count: 0, task_count: 0, by_reason: {} },
+      },
+    });
+  });
+
   it('fails closed when an in-flight mutation permit entered first', async () => {
     await redis.zadd(WRITER_PERMITS_KEY, Date.now() + 60_000, 'writer-before-restore');
 
@@ -195,7 +208,12 @@ describe('database restore maintenance gate', () => {
   });
 
   it.each([
-    ['/claim', { agent_id: 'worker-during-restore', blocking: false }],
+    ['/claim', {
+      agent_id: 'worker-during-restore',
+      registration_id: 'restore_registration_0123456789',
+      claim_request_id: 'restore_claim_request_0123456789',
+      blocking: false,
+    }],
     ['/report', { task_id: 'task-during-restore', agent_id: 'worker-during-restore', claim_token: 'token', status: 'failed' }],
     ['/reconcile', {}],
   ])('rejects mutation %s when restore entered first', async (url, payload) => {
@@ -401,7 +419,7 @@ describe('database restore maintenance gate', () => {
   });
 
   it('returns a stable error and releases its own lock when restore throws', async () => {
-    store.getAllTasks = () => [{ task_id: 'invalid-status', status: 'mystery' }] as never;
+    store.getRestorableTasks = () => [{ task_id: 'invalid-status', status: 'mystery' }] as never;
 
     const response = await post('/db/restore');
 
@@ -585,7 +603,9 @@ describe('database restore maintenance gate', () => {
     const startupPath = join(startupDir, 'biao.sqlite');
     const startupStore = new SqliteStore(startupPath);
     seedPersistedRunningTask();
-    startupStore.upsertPlan(store.getAllPlans()[0]);
+    // 让无效状态夹具位于测试期显式 workspace 内且路径真实存在；否则恢复
+    // 边界会先按“workspace 外”保留为审计行，测试不到状态校验门控。
+    startupStore.upsertPlan({ ...store.getAllPlans()[0], project_path: startupDir });
     startupStore.upsertTask({ ...store.getAllTasks()[0], status: 'mystery' });
     startupStore.close();
 
@@ -606,5 +626,57 @@ describe('database restore maintenance gate', () => {
     }
 
     expect(startupError).toMatchObject({ code: 'SQLITE_TASK_STATUS_INVALID' });
+  });
+
+  it('automatically restores an agent-only SQLite epoch before opening the service', async () => {
+    const startupDir = mkdtempSync(join(tmpdir(), 'biao-startup-agent-only-'));
+    const startupPath = join(startupDir, 'biao.sqlite');
+    const startupStore = new SqliteStore(startupPath);
+    const registrationId = 'agent_only_registration_0123456789';
+    startupStore.registerAgentEpoch({
+      agent_id: 'agent-only-worker',
+      registration_id: registrationId,
+      registration_source: 'client',
+      agent_type: 'cli',
+      capabilities: '["code"]',
+      endpoint: '',
+      projects: '[]',
+      registered_at: '1700000000000',
+    });
+    startupStore.close();
+
+    let started: Awaited<ReturnType<typeof startServer>> | undefined;
+    try {
+      started = await startServer({
+        port: 0,
+        redisUrl: REDIS_URL,
+        sqlitePath: startupPath,
+        host: '127.0.0.1',
+      });
+
+      expect(await redis.hgetall(keys.hash.agent('agent-only-worker'))).toMatchObject({
+        registration_id: registrationId,
+        registration_generation: '1',
+        status: 'offline',
+      });
+
+      const retry = await agentRegister(
+        redis,
+        'agent-only-worker',
+        'cli',
+        ['code'],
+        undefined,
+        undefined,
+        registrationId,
+      );
+      expect(retry).toMatchObject({
+        ok: true,
+        data: { registration_id: registrationId, registration_generation: 1 },
+      });
+      expect(await redis.hget(keys.hash.agent('agent-only-worker'), 'status')).toBe('offline');
+    } finally {
+      if (started) await started.close();
+      rmSync(startupDir, { recursive: true, force: true });
+    }
   });
 });

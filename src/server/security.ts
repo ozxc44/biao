@@ -9,7 +9,7 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs';
-import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export interface WorkspacePathDeniedError extends Error {
   code: 'WORKSPACE_PATH_DENIED';
@@ -19,6 +19,40 @@ function workspacePathDenied(message: string): WorkspacePathDeniedError {
   const error = new Error(message) as WorkspacePathDeniedError;
   error.code = 'WORKSPACE_PATH_DENIED';
   return error;
+}
+
+/**
+ * Canonicalize the deepest existing ancestor, then append any not-yet-created tail.
+ * `lstat` deliberately treats a broken symlink as an existing entry so `realpath`
+ * fails closed instead of accepting a path whose target could appear later.
+ */
+function canonicalPotentialPath(input: string): string {
+  let cursor = resolve(input);
+  const missing: string[] = [];
+
+  for (;;) {
+    try {
+      lstatSync(cursor);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        throw workspacePathDenied(`工作区路径无法检查：${cursor}`);
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) {
+        throw workspacePathDenied(`工作区路径没有可解析的祖先：${input}`);
+      }
+      missing.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
+
+  try {
+    return resolve(realpathSync(cursor), ...missing);
+  } catch {
+    throw workspacePathDenied(`工作区路径包含无法解析的符号链接：${cursor}`);
+  }
 }
 
 /** Parse the platform-delimited workspace allowlist into canonical absolute paths. */
@@ -51,9 +85,11 @@ export function resolveAndValidateWorkspacePath(input: string, roots: string[]):
   const candidate = resolve(input.trim());
   if (roots.length === 0) return candidate;
 
+  const canonicalCandidate = canonicalPotentialPath(candidate);
+
   const allowed = roots.some((rootInput) => {
-    const root = resolve(rootInput);
-    const child = relative(root, candidate);
+    const root = canonicalPotentialPath(rootInput);
+    const child = relative(root, canonicalCandidate);
     return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child));
   });
 

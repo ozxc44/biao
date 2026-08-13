@@ -16,6 +16,8 @@ export const keys = {
     plan: (planId: string) => `${PREFIX}:hash:plan:${planId}`,
     fileOwnership: `${PREFIX}:hash:file_ownership`,
     agent: (agentId: string) => `${PREFIX}:hash:agent:${agentId}`,
+    /** claim 请求的短期单飞 reservation；防相同 request 并发穿过 replay 窗口。 */
+    claimReservation: (agentId: string) => `${PREFIX}:hash:claim_reservation:${agentId}`,
     /** 单个 Question 的状态机真相源（question_id → 全字段） */
     question: (questionId: string) => `${PREFIX}:hash:question:${questionId}`,
   },
@@ -101,6 +103,45 @@ export const keys = {
   acceptanceReady: {
     /** 已发出过 acceptance_ready 的 acceptance task_id 集合（SET，幂等） */
     fired: `${PREFIX}:set:acceptance_ready_fired`,
+  },
+  /**
+   * 运行态异常补偿的耐久候选投影。
+   *
+   * 正常共享 Supervisor 只读取 pending，工作量与当前异常链数量相关，不再与历史
+   * done/failed 总量相关。所有可能需要补偿的状态转换必须在同一 Redis 原子边界内
+   * ZADD；backfillReady 缺失时才从历史状态安全回建一次。
+   */
+  runtimeReconcile: {
+    pending: `${PREFIX}:zset:runtime_reconcile_pending`,
+    backfillReady: `${PREFIX}:string:runtime_reconcile_backfill_ready:v1`,
+  },
+  /**
+   * Plan/status 的物化统计投影。
+   *
+   * `/plans` 和 `/status` 是低频信息、但会被 PM/Supervisor 长期轮询。它们不能为了
+   * 统计已闭合历史而每轮扫描全部 task hash。升级时 ready 缺失只允许一次全量
+   * backfill；之后状态转换把对应 plan 放入 dirtyPlans，读取端只重建 dirty/当前 plan。
+   */
+  planStatusProjection: {
+    ready: `${PREFIX}:string:plan_status_projection_ready:v1`,
+    /** 首次 backfill 单写者锁；防并发首读用旧快照覆盖已刷新的 aggregate。 */
+    backfillLock: `${PREFIX}:string:lock:plan_status_projection_backfill:v1`,
+    /** 计划注册表；避免 SCAN MATCH plan 在万级 task keyspace 上仍遍历全库。 */
+    planIds: `${PREFIX}:set:plan_status_projection_plans:v1`,
+    /** Agent 注册表；避免 `/status` 的 MATCH 扫描穿过全部 task key。 */
+    agentIds: `${PREFIX}:set:plan_status_projection_agents:v1`,
+    /** 空注册表也需要 durable ready，不能用 Redis 不存在的空 SET 表示完成。 */
+    agentIdsReady: `${PREFIX}:string:plan_status_projection_agents_ready:v1`,
+    dirtyPlans: `${PREFIX}:set:plan_status_projection_dirty:v1`,
+    revisionByPlan: `${PREFIX}:hash:plan_status_projection_revision:v1`,
+    taskIdsByPlan: (planId: string) => `${PREFIX}:set:plan_status_projection_tasks:${planId}`,
+    aggregateByPlan: (planId: string) => `${PREFIX}:hash:plan_status_projection:${planId}`,
+  },
+  /** PM intake 当前仍需人工注意的 failed 候选；resolved/repairing 历史不常驻轮询。 */
+  intakeActionableFailed: {
+    pending: `${PREFIX}:zset:intake_actionable_failed:v1`,
+    ready: `${PREFIX}:string:intake_actionable_failed_ready:v1`,
+    backfillLock: `${PREFIX}:string:lock:intake_actionable_failed_backfill:v1`,
   },
   /** 按 task_id 索引其当前 open Question（O(1) 查"该任务是否有未回答提问"） */
   question: {

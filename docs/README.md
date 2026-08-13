@@ -5,6 +5,8 @@ README 说明产品、安装和最短路径；以下文档固定各角色的可�
 - [Worker 接入契约](worker-integration.md)：内置、CLI 与 HTTP Worker 的领取、ownership、Question、验证和上报协议。
 - [无人盯盘的闭环](autonomous-closure.md)：交互式 PM、外部 PM Agent 唤醒器、共享 Supervisor、失败/拒绝/验收失败的 repair 链与暂停条件。
 
-所有示例都假定已在仓库根目录完成 bootstrap，并优先使用 bootstrap 生成的 `.biao/` 启动器。它们不要求系统全局安装 `biao` 命令。
+所有示例都假定已完成 bootstrap，并优先使用 bootstrap 生成的 `.biao/` 启动器。源码 clone 使用仓库根目录的 `./bootstrap.sh`；受信任 npm tarball 安装后，在消费项目目录运行 `./node_modules/.bin/biao-bootstrap`，生成的启动器和可变数据默认位于消费项目的 `./.biao/`，代码与静态资源仍从安装包绝对路径读取。也可用 `--runtime-dir` 指定 node_modules 外的固定目录。两种布局都不要求系统全局安装 `biao` 命令。
+
+状态阅读必须区分当前待处理与历史审计：`attention` 驱动当下动作，`history` 与兼容的原始计数用于追溯；Agent 正常退出会显式离线，SQLite restore 排除项仍保留审计而不会被悄悄删除。
 
 PM 的新会话入口是 `.biao/pm-start --once`；若由外部 Agent 被动处理最小 PM 门铃，使用显式 opt-in 的 `.biao/pm-agent --once`，并先阅读生成的 `.biao/PM_AGENT.md`。后者不自动安装定时器、不传递 Token，也不自动 review、answer 或 ack。

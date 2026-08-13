@@ -30,6 +30,8 @@ export function getStatusLabel(status: string, t: TFunction): string {
 }
 
 export function getGroupLabel(group: BoardGroupKey, t: TFunction): string {
+  if (group === 'rejected') return t('group.rejected');
+  if (group === 'failed') return t('group.failed');
   return t(`status.${group}` as TranslationKey);
 }
 

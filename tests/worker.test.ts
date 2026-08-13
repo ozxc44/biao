@@ -13,7 +13,7 @@ import {
   runWorkerLoop,
   extractQuestionMarker,
 } from '../src/worker/base.js';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ClaimedTask, VerifyCommand } from '../src/types/index.js';
@@ -201,6 +201,61 @@ describe('writeResult', () => {
 });
 
 describe('BiaoClient', () => {
+  it('注册重试复用同一高熵 epoch，后续心跳与离线都携带它', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (bodies.length === 1) throw transientFetchError();
+      if (bodies.length === 2) {
+        return new Response(JSON.stringify({
+          ok: true,
+          data: { agent_id: 'epoch-client', registration_id: body.registration_id },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ ok: true, data: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new BiaoClient('http://biao.test', 'epoch-client');
+    await expect(client.register('cli', ['code'])).resolves.toMatchObject({ ok: true });
+    await client.claim({ blocking: false });
+    await client.heartbeat('task-1');
+    await client.offline('worker_exit');
+
+    const registrationIds = bodies.map((body) => body.registration_id);
+    expect(registrationIds).toHaveLength(5);
+    expect(registrationIds.every((id) => id === registrationIds[0])).toBe(true);
+    expect(registrationIds[0]).toMatch(/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/);
+    expect(bodies[0]).toMatchObject({ agent_id: 'epoch-client', agent_type: 'cli' });
+    expect(bodies[2]).toMatchObject({ agent_id: 'epoch-client', blocking: false });
+    expect(bodies[3]).toMatchObject({ agent_id: 'epoch-client', current_task: 'task-1' });
+    expect(bodies[4]).toMatchObject({ agent_id: 'epoch-client', reason: 'worker_exit' });
+  });
+
+  it('uses an explicit offline endpoint instead of overloading heartbeat', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, data: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new BiaoClient('http://biao.test', 'worker-offline');
+    await client.offline('worker_exit');
+
+    expect(fetchMock.mock.calls[0][0]).toBe('http://biao.test/agent/offline');
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({
+      agent_id: 'worker-offline',
+      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
+      reason: 'worker_exit',
+    });
+  });
+
   it('遇到一次 ECONNRESET 后重试并返回服务响应', async () => {
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(transientFetchError())
@@ -387,6 +442,119 @@ describe('runWorkerLoop 常驻生命周期', () => {
 
     expect(claimCount).toBeGreaterThanOrEqual(2);
     expect(client.heartbeat).toHaveBeenCalled();
+  });
+
+  it('standalone Worker normal exit explicitly goes offline', async () => {
+    const offline = vi.fn(async () => ({ ok: true, data: {} }));
+    const client = {
+      register: vi.fn(async () => ({ ok: true, data: {} })),
+      heartbeat: vi.fn(async () => ({ ok: true, data: {} })),
+      claim: vi.fn(async () => ({ ok: true, data: null })),
+      offline,
+    } as unknown as BiaoClient;
+
+    await runWorkerLoop({
+      agentId: 'standalone-offline', agentType: 'cli', maxTasks: 1, client,
+      execute: async () => { throw new Error('should not execute'); },
+    });
+
+    expect(offline).toHaveBeenCalledOnce();
+    expect(offline).toHaveBeenCalledWith('worker_exit');
+  });
+
+  it('abort 执行不写 result、不 report 业务终态，等 execute close 后才 offline 且不清空 current task', async () => {
+    const task = fakeTask();
+    const controller = new AbortController();
+    let executing = false;
+    let closeExecution!: () => void;
+    const executionClosed = new Promise<void>((resolve) => { closeExecution = resolve; });
+    const order: string[] = [];
+    const report = vi.fn(async () => ({ ok: true, data: {} }));
+    const heartbeat = vi.fn(async (currentTask?: string) => {
+      order.push(`heartbeat:${currentTask ?? ''}`);
+      return { ok: true, data: {} };
+    });
+    const offline = vi.fn(async () => {
+      order.push('offline');
+      return { ok: true, data: {} };
+    });
+    const client = {
+      register: vi.fn(async () => ({ ok: true, data: {} })),
+      heartbeat,
+      claim: vi.fn(async () => ({ ok: true, data: task })),
+      getTask: vi.fn(async () => ({ ok: true, data: { status: 'running', claimed_by: 'abort-worker' } })),
+      renewLease: vi.fn(async () => ({ ok: true, data: {} })),
+      report,
+      offline,
+    } as unknown as BiaoClient;
+    const running = runWorkerLoop({
+      agentId: 'abort-worker', agentType: 'cli', maxTasks: 1, signal: controller.signal, client,
+      execute: async (_task, _project, signal) => {
+        executing = true;
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', resolve, { once: true }));
+        await executionClosed;
+        order.push('execute-close');
+        return {
+          run: { exitCode: 130, stdout: '', stderr: '', durationMs: 10, timedOut: false, aborted: true },
+          changedFiles: [], backend: 'test', model: 'test',
+        };
+      },
+    });
+
+    while (!executing) await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(offline).not.toHaveBeenCalled();
+    closeExecution();
+    await running;
+
+    expect(report).not.toHaveBeenCalled();
+    expect(existsSync(join(tmpDir, 'work', task.task_id, 'result.md'))).toBe(false);
+    expect(existsSync(join(tmpDir, 'work', task.task_id, 'result.json'))).toBe(false);
+    expect(offline).toHaveBeenCalledOnce();
+    expect(offline).toHaveBeenCalledWith('worker_signal');
+    expect(order.indexOf('offline')).toBeGreaterThan(order.indexOf('execute-close'));
+    const lastTaskHeartbeat = order.lastIndexOf(`heartbeat:${task.task_id}`);
+    expect(lastTaskHeartbeat).toBeGreaterThanOrEqual(0);
+    expect(order.slice(lastTaskHeartbeat + 1)).not.toContain('heartbeat:');
+  });
+
+  it('abort 后 execute 抛错也不得误报 failed，保留 running 等 lease 回收', async () => {
+    const task = fakeTask();
+    const controller = new AbortController();
+    let executing = false;
+    const report = vi.fn(async () => ({ ok: true, data: {} }));
+    const heartbeat = vi.fn(async () => ({ ok: true, data: {} }));
+    const offline = vi.fn(async () => ({ ok: true, data: {} }));
+    const client = {
+      register: vi.fn(async () => ({ ok: true, data: {} })),
+      heartbeat,
+      claim: vi.fn(async () => ({ ok: true, data: task })),
+      getTask: vi.fn(async () => ({ ok: true, data: { status: 'running', claimed_by: 'abort-throw-worker' } })),
+      renewLease: vi.fn(async () => ({ ok: true, data: {} })),
+      report,
+      offline,
+    } as unknown as BiaoClient;
+
+    const running = runWorkerLoop({
+      agentId: 'abort-throw-worker', agentType: 'cli', maxTasks: 1, signal: controller.signal, client,
+      execute: async (_task, _project, signal) => {
+        executing = true;
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', resolve, { once: true }));
+        throw new Error('child closed with abort error');
+      },
+    });
+
+    while (!executing) await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    await running;
+
+    expect(report).not.toHaveBeenCalled();
+    expect(existsSync(join(tmpDir, 'work', task.task_id, 'result.md'))).toBe(false);
+    expect(existsSync(join(tmpDir, 'work', task.task_id, 'result.json'))).toBe(false);
+    expect(offline).toHaveBeenCalledOnce();
+    expect(offline).toHaveBeenCalledWith('worker_signal');
+    expect(heartbeat).toHaveBeenLastCalledWith(task.task_id);
   });
 
   it('执行任务前后更新 heartbeat 的 current_task', async () => {
@@ -715,6 +883,24 @@ describe('runWorkerLoop 常驻生命周期', () => {
 });
 
 describe('runAgentCli', () => {
+  it('POSIX 使用独立进程组，Windows 使用 taskkill /T 回收子孙进程', async () => {
+    const workerBase = await import('../src/worker/base.js') as Record<string, unknown>;
+    const plan = workerBase.agentTreeTerminationPlan as
+      | ((platform: NodeJS.Platform, pid: number, signal: NodeJS.Signals) => unknown)
+      | undefined;
+
+    expect(typeof plan).toBe('function');
+    expect(plan?.('darwin', 4321, 'SIGTERM')).toEqual({
+      kind: 'process_group', pid: -4321, signal: 'SIGTERM',
+    });
+    expect(plan?.('win32', 4321, 'SIGTERM')).toEqual({
+      kind: 'taskkill', command: 'taskkill.exe', args: ['/PID', '4321', '/T'],
+    });
+    expect(plan?.('win32', 4321, 'SIGKILL')).toEqual({
+      kind: 'taskkill', command: 'taskkill.exe', args: ['/PID', '4321', '/T', '/F'],
+    });
+  });
+
   it('执行成功命令', async () => {
     const r = await runAgentCli('echo', ['hello'], tmpDir, 10);
     expect(r.exitCode).toBe(0);
@@ -750,6 +936,61 @@ describe('runAgentCli', () => {
     expect(Number.isSafeInteger(grandchildPid)).toBe(true);
     expect(() => process.kill(grandchildPid, 0)).toThrow();
   }, 10_000);
+
+  it.skipIf(process.platform === 'win32')('abort 先 SIGTERM 再强制回收 Agent 进程树，close 后不能 late-write', async () => {
+    const readyPath = join(tmpDir, 'abort-ready');
+    const termPath = join(tmpDir, 'abort-term');
+    const latePath = join(tmpDir, 'abort-late');
+    const grandchildLatePath = join(tmpDir, 'abort-grandchild-late');
+    const pidPath = join(tmpDir, 'abort-pids.json');
+    const grandchildScript = `
+      const { writeFileSync } = require('node:fs');
+      const late = ${JSON.stringify(grandchildLatePath)};
+      process.on('SIGTERM', () => setTimeout(() => writeFileSync(late, 'late'), 1500));
+      setTimeout(() => { writeFileSync(late, 'natural-late'); process.exit(0); }, 2500);
+      setInterval(() => {}, 1000);
+    `;
+    const parentScript = `
+      const { spawn } = require('node:child_process');
+      const { writeFileSync } = require('node:fs');
+      const grandchild = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });
+      process.on('SIGTERM', () => {
+        writeFileSync(${JSON.stringify(termPath)}, 'term');
+        setTimeout(() => writeFileSync(${JSON.stringify(latePath)}, 'late'), 1500);
+      });
+      writeFileSync(${JSON.stringify(pidPath)}, JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }));
+      writeFileSync(${JSON.stringify(readyPath)}, 'ready');
+      setTimeout(() => { writeFileSync(${JSON.stringify(latePath)}, 'natural-late'); process.exit(0); }, 2500);
+      setInterval(() => {}, 1000);
+    `;
+    const controller = new AbortController();
+    const running = runAgentCli(
+      process.execPath,
+      ['-e', parentScript],
+      tmpDir,
+      20,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(readyPath) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(existsSync(readyPath)).toBe(true);
+    controller.abort();
+
+    const result = await running;
+    const pids = JSON.parse(readFileSync(pidPath, 'utf8')) as { parent: number; grandchild: number };
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    expect(result).toMatchObject({ exitCode: 130, timedOut: false, aborted: true });
+    expect(existsSync(termPath)).toBe(true);
+    expect(existsSync(latePath)).toBe(false);
+    expect(existsSync(grandchildLatePath)).toBe(false);
+    expect(() => process.kill(pids.parent, 0)).toThrow();
+    expect(() => process.kill(pids.grandchild, 0)).toThrow();
+  }, 8_000);
 
   it('不存在的命令', async () => {
     const r = await runAgentCli('nonexistent-command-xyz', [], tmpDir, 5);

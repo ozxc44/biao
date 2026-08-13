@@ -12,12 +12,12 @@
  * 这个 worker 让外部任意程序/脚本/人工充当 agent。
  */
 
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runWorkerLoop, runAgentCli, type WorkerConfig } from './base.js';
 import type { ClaimedTask } from '../types/index.js';
 import { buildQuestionResumeContext } from '../communication/question-context.js';
+import { atomicWriteWorkerArtifact, secureTaskWorkDir } from './artifact-security.js';
 
 export interface CliWorkerOptions extends Partial<WorkerConfig> {
   execCmd?: string;
@@ -53,12 +53,10 @@ export function createCliWorkerConfig(overrides: CliWorkerOptions = {}): WorkerC
     preclaimedTask: overrides.preclaimedTask,
     skipRegistration: overrides.skipRegistration,
     heartbeatWhenIdle: overrides.heartbeatWhenIdle,
-    async execute(task: ClaimedTask, projectPath: string) {
+    async execute(task: ClaimedTask, projectPath: string, signal?: AbortSignal) {
       // 把 goal_md 写到 work 目录
-      const workDir = join(projectPath, 'work', task.task_id);
-      mkdirSync(workDir, { recursive: true });
-      const goalMdPath = join(workDir, 'goal.md');
-      writeFileSync(goalMdPath, buildCliGoal(task));
+      const workDir = secureTaskWorkDir(projectPath, task.task_id);
+      const goalMdPath = atomicWriteWorkerArtifact(workDir, 'goal.md', buildCliGoal(task));
 
       // 拆分 execCmd 为 command + args（支持简单空格分隔）
       const parts = execCmd.split(/\s+/);
@@ -69,7 +67,15 @@ export function createCliWorkerConfig(overrides: CliWorkerOptions = {}): WorkerC
 
       console.log(`[cli-worker] 执行：${command} ${args.join(' ')}`);
 
-      const run = await runAgentCli(command, args, projectPath, task.timeout_seconds ?? 1800);
+      const run = await runAgentCli(
+        command,
+        args,
+        projectPath,
+        task.timeout_seconds ?? 1800,
+        undefined,
+        undefined,
+        signal,
+      );
 
       // 改动文件：从 git diff 解析
       const changedFiles = await getChangedFiles(projectPath).catch(() => []);

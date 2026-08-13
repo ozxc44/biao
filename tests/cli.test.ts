@@ -121,7 +121,7 @@ verify: []
     const url = await mockService({
       ok: true,
       data: {
-        total: 4,
+        total: 5,
         tasks: [
           {
             task_id: 'source-failed', title: '原任务', type: 'code', phase: 'impl', status: 'failed',
@@ -140,6 +140,10 @@ verify: []
             task_id: 'manual-decision', title: '达到修复上限', type: 'code', phase: 'impl', status: 'failed',
             assignee: 'auto', priority: 5, resolution_status: 'needs_pm_decision',
           },
+          {
+            task_id: 'legacy-failed', title: '升级前遗留失败', type: 'code', phase: 'impl', status: 'failed',
+            assignee: 'auto', priority: 5, failure_reason: 'old worker stopped',
+          },
         ],
       },
     });
@@ -152,7 +156,104 @@ verify: []
     expect(stdout).toContain('修复待验收 ← source-failed');
     expect(stdout).toContain('待 PM 验收');
     expect(stdout).toContain('需 PM 决策');
+    expect(stdout).toContain('遗留失败，先 watchdog --auto-fix');
+    expect(stdout).toContain('biao watchdog --auto-fix');
     expect(stdout).toContain('不要手动 reset 原任务');
+  });
+
+  it('review list 真正列出待验收 task id，并把 plan 过滤传给服务端', async () => {
+    let requestedUrl = '';
+    const server = createServer((req, res) => {
+      requestedUrl = req.url ?? '';
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        ok: true,
+        data: {
+          total: 1,
+          tasks: [
+            {
+              task_id: 'review-pending-1', plan_id: 'plan-a', title: '待验收实现', type: 'code',
+              phase: 'impl', status: 'done', assignee: 'auto', priority: 5,
+            },
+          ],
+        },
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('mock service 未监听');
+
+    const { stdout } = await runCli(['review', 'list', '--plan', 'plan-a'], {
+      BIAO_URL: `http://127.0.0.1:${address.port}`,
+    });
+
+    expect(requestedUrl).toBe('/reviews/pending?plan_id=plan-a');
+    expect(stdout).toContain('待验收 1 项');
+    expect(stdout).toContain('review-pending-1');
+    expect(stdout).toContain('待验收实现');
+    expect(stdout).toContain('biao review <task_id>');
+  });
+
+  it('review list --json 只输出可逐项处理的 pending review 合同', async () => {
+    const url = await mockService({
+      ok: true,
+      data: {
+        total: 1,
+        tasks: [
+          {
+            task_id: 'json-pending', plan_id: 'plan-json', title: 'JSON 待验收', type: 'code',
+            phase: 'impl', status: 'done', assignee: 'auto', priority: 5,
+          },
+        ],
+      },
+    });
+
+    const { stdout } = await runCli(['review', 'list', '--json'], { BIAO_URL: url });
+    expect(JSON.parse(stdout)).toEqual({
+      ok: true,
+      data: {
+        total: 1,
+        tasks: [expect.objectContaining({ task_id: 'json-pending', plan_id: 'plan-json' })],
+      },
+    });
+  });
+
+  it('review list 兼容服务升级前返回的空白 review 状态', async () => {
+    const url = await mockService({
+      ok: true,
+      data: {
+        total: 1,
+        tasks: [{
+          task_id: 'whitespace-pending', plan_id: 'legacy-plan', title: '旧库待验收', type: 'code',
+          phase: 'impl', status: 'done', assignee: 'auto', priority: 5, pm_review_status: '   ',
+        }],
+      },
+    });
+
+    const { stdout } = await runCli(['review', 'list', '--json'], { BIAO_URL: url });
+    expect(JSON.parse(stdout)).toEqual({
+      ok: true,
+      data: {
+        total: 1,
+        tasks: [expect.objectContaining({ task_id: 'whitespace-pending' })],
+      },
+    });
+  });
+
+  it('review list 不把畸形成功响应改写成空列表成功', async () => {
+    const url = await mockService({ ok: true, data: null });
+    await expect(runCli(['review', 'list', '--json'], { BIAO_URL: url })).rejects.toMatchObject({
+      code: 1,
+      stdout: expect.stringContaining('"ok": false'),
+    });
+  });
+
+  it('review list 在请求前拒绝缺值和未知参数', async () => {
+    await expect(runCli(['review', 'list', '--plan'], { BIAO_URL: 'http://127.0.0.1:1' }))
+      .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('参数缺少值：--plan') });
+    await expect(runCli(['review', 'list', '--unknown'], { BIAO_URL: 'http://127.0.0.1:1' }))
+      .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('未知参数：--unknown') });
   });
 
   it('review reject 将受控 repair ownership JSON 原样传给平台', async () => {

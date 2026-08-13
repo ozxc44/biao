@@ -3,13 +3,16 @@
  * 不调真实 agent CLI，直接 echo 产出 result.md
  */
 
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createWorkerProgressTracker } from './base.js';
 import type { ClaimedTask } from '../types/index.js';
+import { atomicWriteWorkerArtifact, secureTaskWorkDir } from './artifact-security.js';
 
 const BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
 const AGENT_ID = process.env.BIAO_AGENT_ID ?? 'mock-1';
+let registrationId = '';
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(`${BIAO_URL}${path}`, {
@@ -20,9 +23,17 @@ async function api(path: string, init?: RequestInit): Promise<any> {
 }
 
 async function register(): Promise<void> {
-  await api('/register', {
+  const registered = await api('/register', {
     method: 'POST',
     body: JSON.stringify({ agent_id: AGENT_ID, agent_type: 'mock', capabilities: ['code', 'review', 'research', 'docs'] }),
+  });
+  if (!registered?.ok || !registered.data?.registration_id) {
+    throw new Error(`register failed: ${registered?.error?.code ?? 'MISSING_REGISTRATION_ID'}`);
+  }
+  registrationId = registered.data.registration_id;
+  await api('/heartbeat', {
+    method: 'POST',
+    body: JSON.stringify({ agent_id: AGENT_ID, registration_id: registrationId, current_task: '' }),
   });
   console.log(`[mock-worker] 注册为 ${AGENT_ID}`);
 }
@@ -31,7 +42,12 @@ async function runOneTask(): Promise<boolean> {
   // claim
   const claimRes = await api('/claim', {
     method: 'POST',
-    body: JSON.stringify({ agent_id: AGENT_ID, blocking: false }),
+    body: JSON.stringify({
+      agent_id: AGENT_ID,
+      registration_id: registrationId,
+      claim_request_id: `claim_${randomUUID().replaceAll('-', '')}`,
+      blocking: false,
+    }),
   });
   if (!claimRes.ok || !claimRes.data) {
     return false; // 无任务
@@ -41,8 +57,7 @@ async function runOneTask(): Promise<boolean> {
   console.log(`[mock-worker] 领取任务：${task.task_id} (${task.title})`);
 
   const projectPath = task.project_path || process.cwd();
-  const workDir = join(projectPath, 'work', task.task_id);
-  mkdirSync(workDir, { recursive: true });
+  const workDir = secureTaskWorkDir(projectPath, task.task_id);
   const progress = createWorkerProgressTracker(workDir, task, AGENT_ID);
 
   try {
@@ -76,8 +91,7 @@ ${(task.verify ?? []).map((v: any) => `- ${v.cmd}: SKIPPED (mock)`).join('\n') |
 ## 残留风险
 - 本结果由 mock worker 产出，仅用于端到端验证
 `;
-  const resultMdPath = join(workDir, 'result.md');
-  writeFileSync(resultMdPath, resultMd);
+  const resultMdPath = atomicWriteWorkerArtifact(workDir, 'result.md', resultMd);
 
   const resultJson = {
     status: 'success',
@@ -89,8 +103,11 @@ ${(task.verify ?? []).map((v: any) => `- ${v.cmd}: SKIPPED (mock)`).join('\n') |
     changed_files: [],
     duration_seconds: 0.1,
   };
-  const resultJsonPath = join(workDir, 'result.json');
-  writeFileSync(resultJsonPath, JSON.stringify(resultJson, null, 2));
+  const resultJsonPath = atomicWriteWorkerArtifact(
+    workDir,
+    'result.json',
+    JSON.stringify(resultJson, null, 2),
+  );
 
   // report
   progress.advance('reporting', {
@@ -145,15 +162,22 @@ async function main() {
   await register();
 
   let count = 0;
-  // 循环消费，直到无任务或达到上限
-  while (maxTasks === 0 || count < maxTasks) {
-    const got = await runOneTask();
-    if (got) {
-      count++;
-    } else {
-      console.log(`[mock-worker] 无更多任务，退出（共完成 ${count} 个）`);
-      break;
+  try {
+    // 循环消费，直到无任务或达到上限
+    while (maxTasks === 0 || count < maxTasks) {
+      const got = await runOneTask();
+      if (got) {
+        count++;
+      } else {
+        console.log(`[mock-worker] 无更多任务，退出（共完成 ${count} 个）`);
+        break;
+      }
     }
+  } finally {
+    await api('/agent/offline', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: AGENT_ID, registration_id: registrationId, reason: 'worker_exit' }),
+    });
   }
   console.log(`[mock-worker] 总计完成 ${count} 个任务`);
 }

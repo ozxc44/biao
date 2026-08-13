@@ -8,18 +8,13 @@
  */
 
 import {
-  chmodSync,
-  writeFileSync,
-  mkdirSync,
-  unlinkSync,
   readdirSync,
   statSync,
   readFileSync,
   existsSync,
-  renameSync,
 } from 'node:fs';
 import { join, isAbsolute, relative, resolve, sep } from 'node:path';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, spawnSync, execSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   ClaimRequest,
@@ -27,6 +22,17 @@ import type {
   VerifyCommand,
   VerifyResult,
 } from '../types/index.js';
+import {
+  assertSecureTaskArtifactContext,
+  atomicWriteWorkerArtifact,
+  isWorkerArtifactPathDenied,
+  readWorkerArtifact,
+  registeredWorkerArtifactContext,
+  releaseWorkerArtifactContext,
+  secureStandaloneClaimRecoveryContext,
+  unlinkWorkerArtifact,
+  type WorkerArtifactContext,
+} from './artifact-security.js';
 
 const DEFAULT_BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
 const API_MAX_ATTEMPTS = 3;
@@ -67,6 +73,13 @@ function waitForApiRetry(attempt: number): Promise<void> {
 
 /** Biao SDK：封装 6 个接口 */
 export class BiaoClient {
+  /**
+   * 一个 BiaoClient 实例就是一个 Agent 生命周期。由客户端先生成 epoch，
+   * 使 `/register` 的网络重试复用同一个幂等键；服务端返回后，后续
+   * heartbeat/offline 也始终携带这个不可猜的 fencing token。
+   */
+  private readonly registrationId = `reg_${randomUUID().replaceAll('-', '')}`;
+
   constructor(
     public readonly url: string,
     public readonly agentId: string,
@@ -115,19 +128,52 @@ export class BiaoClient {
   async register(agentType: string, capabilities: string[], endpoint?: string, projects?: string[]): Promise<any> {
     return this.api('/register', {
       method: 'POST',
-      body: JSON.stringify({ agent_id: this.agentId, agent_type: agentType, capabilities, endpoint, projects }),
+      body: JSON.stringify({
+        agent_id: this.agentId,
+        agent_type: agentType,
+        capabilities,
+        endpoint,
+        projects,
+        registration_id: this.registrationId,
+      }),
     });
   }
 
   async heartbeat(currentTask?: string): Promise<any> {
     return this.api('/heartbeat', {
       method: 'POST',
-      body: JSON.stringify({ agent_id: this.agentId, current_task: currentTask }),
+      body: JSON.stringify({
+        agent_id: this.agentId,
+        registration_id: this.registrationId,
+        current_task: currentTask,
+      }),
     });
   }
 
-  async claim(req: Omit<ClaimRequest, 'agent_id'>): Promise<{ ok: boolean; data: ClaimedTask | null }> {
-    return this.api('/claim', { method: 'POST', body: JSON.stringify({ ...req, agent_id: this.agentId }) });
+  async offline(
+    reason: 'worker_exit' | 'worker_signal' | 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit',
+  ): Promise<any> {
+    return this.api('/agent/offline', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: this.agentId, registration_id: this.registrationId, reason }),
+    });
+  }
+
+  async claim(
+    req: Omit<ClaimRequest, 'agent_id' | 'registration_id' | 'claim_request_id'>,
+  ): Promise<{ ok: boolean; data: ClaimedTask | null }> {
+    // 每次业务 claim 产生新 ID，api() 内的传输/5xx 重试复用同一 body。
+    // 服务端因此可在“已提交但响应丢失”时重放原 claim token。
+    const claimRequestId = `claim_${randomUUID().replaceAll('-', '')}`;
+    return this.api('/claim', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...req,
+        agent_id: this.agentId,
+        registration_id: this.registrationId,
+        claim_request_id: claimRequestId,
+      }),
+    });
   }
 
   async report(
@@ -497,7 +543,36 @@ export interface AgentRunResult {
   stderr: string;
   durationMs: number;
   timedOut: boolean;
+  /** 外层 Worker/Supervisor 显式停止，不应作为业务失败交付。 */
+  aborted?: boolean;
 }
+
+export type AgentTreeTerminationPlan =
+  | { kind: 'process_group'; pid: number; signal: NodeJS.Signals }
+  | { kind: 'taskkill'; command: 'taskkill.exe'; args: string[] };
+
+/**
+ * 进程树终止的跨平台契约。POSIX 子进程由 runAgentCli 以 detached 组 leader
+ * 启动，因此负 pid 只会命中 Agent 自己的进程组，不会触及 Worker 父进程。
+ * Windows 没有等价的负 pid 语义，使用系统 taskkill /T；SIGKILL 阶段增加 /F。
+ */
+export function agentTreeTerminationPlan(
+  platform: NodeJS.Platform,
+  pid: number,
+  signal: NodeJS.Signals,
+): AgentTreeTerminationPlan {
+  if (platform === 'win32') {
+    return {
+      kind: 'taskkill',
+      command: 'taskkill.exe',
+      args: ['/PID', String(pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])],
+    };
+  }
+  return { kind: 'process_group', pid: -pid, signal };
+}
+
+const AGENT_ABORT_KILL_GRACE_MS = 1_000;
+const AGENT_TIMEOUT_KILL_GRACE_MS = 5_000;
 
 export function runAgentCli(
   command: string,
@@ -506,7 +581,18 @@ export function runAgentCli(
   timeoutSeconds: number,
   env?: Record<string, string>,
   stdinInput?: string,
+  signal?: AbortSignal,
 ): Promise<AgentRunResult> {
+  if (signal?.aborted) {
+    return Promise.resolve({
+      exitCode: 130,
+      stdout: '',
+      stderr: '',
+      durationMs: 0,
+      timedOut: false,
+      aborted: true,
+    });
+  }
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const childEnv = sanitizedChildEnv(env);
@@ -531,12 +617,26 @@ export function runAgentCli(
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let aborted = false;
+    let settled = false;
+    let terminationReason: 'timeout' | 'abort' | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let timeoutTimer: NodeJS.Timeout | undefined;
 
     const signalAgentTree = (signal: NodeJS.Signals): void => {
       try {
-        if (useProcessGroup && child.pid) process.kill(-child.pid, signal);
-        else child.kill(signal);
+        if (!child.pid) return;
+        const plan = agentTreeTerminationPlan(process.platform, child.pid, signal);
+        if (plan.kind === 'process_group') {
+          process.kill(plan.pid, plan.signal);
+        } else {
+          const outcome = spawnSync(plan.command, plan.args, {
+            windowsHide: true,
+            stdio: 'ignore',
+          });
+          // taskkill.exe 是 Windows 标配；若运行环境损坏，至少回退终止直接子进程。
+          if (outcome.error) child.kill(signal);
+        }
       } catch (error) {
         // 进程可能恰好在检查与发送之间退出；其余信号失败仍写进 stderr 供结果审计。
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
@@ -546,19 +646,31 @@ export function runAgentCli(
     };
 
     const clearTimers = (): void => {
-      clearTimeout(timer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      signal?.removeEventListener('abort', onAbort);
     };
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const beginTermination = (reason: 'timeout' | 'abort'): void => {
+      if (terminationReason || child.exitCode !== null || child.signalCode !== null) return;
+      terminationReason = reason;
+      timedOut = reason === 'timeout';
+      aborted = reason === 'abort';
+      if (reason === 'abort' && timeoutTimer) clearTimeout(timeoutTimer);
       signalAgentTree('SIGTERM');
       forceKillTimer = setTimeout(() => {
         // child.killed 仅表示“信号发送成功”，不表示进程已经退出。必须读取真实
         // 退出状态，否则忽略 SIGTERM 的 Agent 会永久占住 Worker slot/lease。
         if (child.exitCode === null && child.signalCode === null) signalAgentTree('SIGKILL');
-      }, 5000);
-    }, timeoutSeconds * 1000);
+      }, reason === 'abort' ? AGENT_ABORT_KILL_GRACE_MS : AGENT_TIMEOUT_KILL_GRACE_MS);
+      forceKillTimer.unref();
+    };
+    const onAbort = () => beginTermination('abort');
+
+    timeoutTimer = setTimeout(() => beginTermination('timeout'), timeoutSeconds * 1000);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    // 覆盖 pre-check 与 listener 安装之间的竞态窗口。
+    if (signal?.aborted) onAbort();
 
     child.stdout?.on('data', (d) => {
       stdout += d.toString();
@@ -570,23 +682,31 @@ export function runAgentCli(
     });
 
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearTimers();
       resolve({
-        exitCode: code ?? (timedOut ? 124 : 1),
+        // 保持旧 timeout 契约：进程若在 SIGTERM 后自行退出，保留它的真实 code；
+        // 只有被信号终止导致 code=null 时才投影为 124。abort 则是独立的生命周期码 130。
+        exitCode: aborted ? 130 : (code ?? (timedOut ? 124 : 1)),
         stdout,
         stderr,
         durationMs: Date.now() - startedAt,
         timedOut,
+        aborted,
       });
     });
     child.on('error', () => {
+      if (settled) return;
+      settled = true;
       clearTimers();
       resolve({
-        exitCode: 127,
+        exitCode: aborted ? 130 : 127,
         stdout,
         stderr: stderr + '\n[spawn error]',
         durationMs: Date.now() - startedAt,
         timedOut: false,
+        aborted,
       });
     });
   });
@@ -603,7 +723,7 @@ export function writeResult(
   model: string,
   changedFiles: string[],
 ): { resultMdPath: string; resultJsonPath: string } {
-  mkdirSync(workDir, { recursive: true });
+  const artifactContext = assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path);
 
   const passedCount = verifyResults.filter((v) => v.passed).length;
   const failedCount = verifyResults.length - passedCount;
@@ -647,13 +767,15 @@ ${failedCount > 0 ? `## 失败详情\n${verifyResults.filter((v) => !v.passed).m
     stderr_tail: agentRun.stderr.slice(-2000),
   };
 
+  atomicWriteWorkerArtifact(artifactContext, 'result.md', resultMd);
+  atomicWriteWorkerArtifact(
+    artifactContext,
+    'result.json',
+    JSON.stringify(resultJson, null, 2),
+  );
+  // 保持既有 report 契约：返回 task.project_path 体系下的路径；写入本身使用规范目录。
   const resultMdPath = join(workDir, 'result.md');
   const resultJsonPath = join(workDir, 'result.json');
-  writeFileSync(resultMdPath, resultMd, { mode: 0o600 });
-  writeFileSync(resultJsonPath, JSON.stringify(resultJson, null, 2), { mode: 0o600 });
-  // mode 只在新建时生效；覆盖旧版本留下的 0644 文件后仍需主动收紧。
-  chmodSync(resultMdPath, 0o600);
-  chmodSync(resultJsonPath, 0o600);
 
   return { resultMdPath, resultJsonPath };
 }
@@ -670,26 +792,29 @@ export interface ClaimFile {
 }
 
 export function writeClaimFile(workDir: string, task: ClaimedTask, agentId: string): string {
-  mkdirSync(workDir, { recursive: true });
-  const p = join(workDir, '.claim.json');
+  const expectedTaskWorkDir = resolve(task.project_path || process.cwd(), 'work', task.task_id);
+  // 正式 Worker 只能走 project/work/task 绑定；旧 crash-recovery 测试所需的独立
+  // 临时目录由专用能力承接，不再向任意 artifact API 暴露 allowStandalone。
+  const artifactContext = resolve(workDir) === expectedTaskWorkDir
+    ? assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path)
+    : secureStandaloneClaimRecoveryContext(workDir);
   const data: ClaimFile = {
     task_id: task.task_id,
     claim_fingerprint: createHash('sha256').update(task.claim_token).digest('hex').slice(0, 16),
     agent_id: agentId,
     claimed_at: Date.now(),
   };
-  writeFileSync(p, JSON.stringify(data, null, 2), { mode: 0o600 });
-  // mode 只影响新建文件；升级覆盖旧版 0644 文件时必须显式收紧权限。
-  chmodSync(p, 0o600);
-  return p;
+  return atomicWriteWorkerArtifact(artifactContext, '.claim.json', JSON.stringify(data, null, 2));
 }
 
-export function clearClaimFile(workDir: string): void {
-  try {
-    unlinkSync(join(workDir, '.claim.json'));
-  } catch {
-    // 不存在则忽略
-  }
+export function clearClaimFile(workDir: string, task?: ClaimedTask): void {
+  const artifactContext = registeredWorkerArtifactContext(
+    workDir,
+    task?.task_id,
+    task?.project_path,
+  );
+  // unlinkWorkerArtifact 自身忽略 ENOENT；身份不可信必须向上传播，不能静默吞掉。
+  unlinkWorkerArtifact(artifactContext, '.claim.json');
 }
 
 /**
@@ -759,33 +884,20 @@ function progressStatus(stage: WorkerProgressStage): WorkerProgressFile['status'
 }
 
 /** 同目录临时文件 + rename，保证读者只会看到完整 JSON；最终文件始终收紧为 0600。 */
-function persistWorkerProgress(workDir: string, value: WorkerProgressFile): void {
-  mkdirSync(workDir, { recursive: true });
-  const target = join(workDir, '.progress.json');
-  const temporary = `${target}.tmp-${process.pid}-${randomUUID()}`;
-  try {
-    writeFileSync(temporary, JSON.stringify(value, null, 2), { flag: 'wx', mode: 0o600 });
-    chmodSync(temporary, 0o600);
-    renameSync(temporary, target);
-    // rename 覆盖旧版宽权限文件时，以临时 inode 的权限为准；显式 chmod 作为平台兜底。
-    chmodSync(target, 0o600);
-  } finally {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      // rename 成功后临时路径已不存在；失败残留则尽力清理。
-    }
-  }
+function persistWorkerProgress(context: WorkerArtifactContext, value: WorkerProgressFile): void {
+  atomicWriteWorkerArtifact(context, '.progress.json', JSON.stringify(value, null, 2));
 }
 
 export class WorkerProgressTracker {
   private readonly value: WorkerProgressFile;
+  private readonly artifactContext: WorkerArtifactContext;
 
   constructor(
-    private readonly workDir: string,
+    workDir: string,
     task: ClaimedTask,
     agentId: string,
   ) {
+    this.artifactContext = assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path);
     const now = new Date().toISOString();
     this.value = {
       schema_version: 1,
@@ -799,7 +911,7 @@ export class WorkerProgressTracker {
       artifacts: { result_md: false, result_json: false },
       history: [{ stage: 'claimed', at: now }],
     };
-    persistWorkerProgress(this.workDir, this.value);
+    persistWorkerProgress(this.artifactContext, this.value);
   }
 
   get stage(): WorkerProgressStage {
@@ -825,7 +937,7 @@ export class WorkerProgressTracker {
     }
     if (update.failureReason !== undefined) this.value.failure_reason = update.failureReason;
     this.value.history.push({ stage, at: now });
-    persistWorkerProgress(this.workDir, this.value);
+    persistWorkerProgress(this.artifactContext, this.value);
   }
 }
 
@@ -1069,7 +1181,7 @@ export interface WorkerConfig {
   /** 按项目过滤（只领该项目的任务）；undefined = 不过滤 */
   preferredProject?: string;
   /** 执行函数：task → (agentRun, changedFiles)，可通过 question 交回 PM 决策。 */
-  execute: (task: ClaimedTask, projectPath: string) => Promise<{
+  execute: (task: ClaimedTask, projectPath: string, signal?: AbortSignal) => Promise<{
     run: AgentRunResult;
     changedFiles: string[];
     backend: string;
@@ -1087,6 +1199,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   const heartbeatWhenIdle = cfg.heartbeatWhenIdle ?? true;
 
   // 注册
+  let ownsRegistration = false;
   if (!cfg.skipRegistration) {
     const registered = await client.register(
       cfg.agentType,
@@ -1097,6 +1210,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
     if (registered?.ok === false) {
       throw new Error(`worker 注册失败：${registered.error?.code ?? 'UNKNOWN'} ${registered.error?.message ?? ''}`.trim());
     }
+    ownsRegistration = true;
     console.log(`[worker:${cfg.agentId}] 注册为 ${cfg.agentType}${cfg.preferredProject ? `（项目: ${cfg.preferredProject}）` : ''}`);
   }
 
@@ -1104,6 +1218,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   let currentTask: string | undefined;
   let heartbeatInFlight = false;
   const sendHeartbeat = async () => {
+    if (cfg.signal?.aborted) return;
     if (!heartbeatWhenIdle && !currentTask) return;
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
@@ -1146,6 +1261,8 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
     console.log(`[worker:${cfg.agentId}] 领取任务：${task.task_id}（${task.title}）`);
 
     let renewTimer: NodeJS.Timeout | undefined;
+    let stopRenewingOnAbort: (() => void) | undefined;
+    let preserveRunningProjectionOnAbort = false;
     // catch 路径也需要在 failed report 成功后清理 claim，因此不能只在 try 作用域内声明。
     const workDir = join(task.project_path || process.cwd(), 'work', task.task_id);
     let progress: WorkerProgressTracker | undefined;
@@ -1179,7 +1296,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           cfg.ownershipConflictMode ?? 'wait',
         );
         if (!canProceed) {
-          if (cfg.ownershipConflictMode === 'block') clearClaimFile(workDir);
+          if (cfg.ownershipConflictMode === 'block') clearClaimFile(workDir, task);
           conflictAborted = true;
           break; // 某个 glob 超时放弃，跳过整个任务
         }
@@ -1210,7 +1327,15 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       // lease 续租：execute 前启动定时器，每 timeout/3 秒续一次，避免长任务 lease 过期被回收
       const leaseTimeout = task.timeout_seconds ?? 1800;
       const renewIntervalMs = (leaseTimeout * 1000) / 3;
+      const stopLeaseRenewal = () => {
+        if (renewTimer) clearInterval(renewTimer);
+        renewTimer = undefined;
+      };
       renewTimer = setInterval(async () => {
+        if (cfg.signal?.aborted) {
+          stopLeaseRenewal();
+          return;
+        }
         try {
           const r = await client.renewLease(task.task_id, task.claim_token);
           if (!r.ok) {
@@ -1225,14 +1350,25 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           console.warn(`[worker:${cfg.agentId}]   ⚠ 续租异常：${(e as Error).message}`);
         }
       }, renewIntervalMs);
+      stopRenewingOnAbort = stopLeaseRenewal;
+      if (cfg.signal?.aborted) stopLeaseRenewal();
+      else cfg.signal?.addEventListener('abort', stopLeaseRenewal, { once: true });
 
       // 执行
-      const execution = await cfg.execute(task, projectPath);
+      const execution = await cfg.execute(task, projectPath, cfg.signal);
       const { run, changedFiles, backend, model } = execution;
       console.log(`[worker:${cfg.agentId}]   执行完成 exit=${run.exitCode}${run.timedOut ? '（超时）' : ''}`);
 
       // 续租定时器已在 execute 前启动，这里清除（execute 完成，不再需要续租）
       clearInterval(renewTimer);
+      if (run.aborted || cfg.signal?.aborted) {
+        // 停止是 Worker/Supervisor 生命周期事件，不是业务交付。不写 result、不 verify/report、
+        // 不清 claim/current_task；只有等真实 Agent 子进程 close 后才能走 finally/offline，
+        // 使 lease 按原有语义过期并由 lazyReclaim 安全计数、续跑或进入 repair。
+        preserveRunningProjectionOnAbort = true;
+        console.log(`[worker:${cfg.agentId}]   已停止执行；保留 running/claim 审计，等待 lease 安全回收`);
+        break;
+      }
       const question = execution.question ?? extractQuestionMarker(run.stdout);
       if (question) {
         const asked = await client.createQuestion(task.task_id, task.claim_token, question.body, question.checkpoint);
@@ -1241,7 +1377,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
         }
         console.log(`[worker:${cfg.agentId}]   已通过平台提交 Question ${asked.data?.question_id ?? ''}，当前 slot 将继续领取其他任务`);
         advanceWorkerProgress(progress, 'blocked', { failureReason: 'waiting_pm_reply' });
-        clearClaimFile(workDir);
+        clearClaimFile(workDir, task);
         count++;
         continue;
       }
@@ -1268,9 +1404,10 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
         console.log(`[worker:${cfg.agentId}]   worker 不应直接改 plan MD，应通过 question 机制问 PM。违规已记录到 report。`);
         // 把 violations 写入 result.json（供 PM review 时看到）
         try {
-          const rj = JSON.parse(readFileSync(resultJsonPath, 'utf8'));
+          const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, task.project_path);
+          const rj = JSON.parse(readWorkerArtifact(artifactContext, 'result.json'));
           rj.plan_md_violations = planMdViolations;
-          writeFileSync(resultJsonPath, JSON.stringify(rj, null, 2));
+          atomicWriteWorkerArtifact(artifactContext, 'result.json', JSON.stringify(rj, null, 2));
         } catch {
           // result.json 读写失败不阻塞 report
         }
@@ -1309,7 +1446,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           failureReason: status === 'failed' ? 'execution_or_verification_failed' : undefined,
         });
         logReportLifecycle(cfg.agentId, task.task_id, status, reportDelivery.response);
-        clearClaimFile(workDir); // report 成功，本地凭证使命完成
+        clearClaimFile(workDir, task); // report 成功，本地凭证使命完成
       } else if (reportDelivery.state === 'confirmed_after_uncertain_response') {
         advanceWorkerProgress(progress, status === 'done' ? 'finished' : 'failed', {
           artifactsWritten: true,
@@ -1318,7 +1455,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           failureReason: status === 'failed' ? 'execution_or_verification_failed' : undefined,
         });
         console.warn(`[worker:${cfg.agentId}]   ⚠ report 响应中断，但平台已确认 task=${status}；不补报 failed。`);
-        clearClaimFile(workDir);
+        clearClaimFile(workDir, task);
       } else if (reportDelivery.state === 'unknown') {
         advanceWorkerProgress(progress, 'reporting', {
           artifactsWritten: true,
@@ -1370,6 +1507,22 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       }
       count++;
     } catch (e) {
+      if (isWorkerArtifactPathDenied(e)) {
+        // 本地 work/result 路径不可信不是任务执行失败。不得 report failed 或清空
+        // current_task；让平台按原 lease/offline 语义安全回收，再由 fresh claim 重试。
+        preserveRunningProjectionOnAbort = true;
+        console.error(`[worker:${cfg.agentId}]   本地产物路径被拒绝：${(e as Error).message}`);
+        throw e;
+      }
+      if (cfg.signal?.aborted) {
+        // 自定义 execute 可能以 AbortError/其它异常表示子进程已关闭。
+        // 显式停止仍然是生命周期事件，绝不得落入通用 failed report 路径。
+        preserveRunningProjectionOnAbort = true;
+        console.log(
+          `[worker:${cfg.agentId}]   执行器已因停止信号关闭；保留 running/claim 审计，等待 lease 安全回收`,
+        );
+        break;
+      }
       console.error(`[worker:${cfg.agentId}]   任务异常：`, e);
       if (renewTimer) clearInterval(renewTimer); // 异常路径也清续租定时器
       // 尝试 report failed；异常路径也必须把自动修复/PM 决策交接打印出来，
@@ -1392,7 +1545,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
             failureReason: 'worker_exception',
           });
           logReportLifecycle(cfg.agentId, task.task_id, 'failed', failedReport);
-          clearClaimFile(workDir);
+          clearClaimFile(workDir, task);
         } else {
           advanceWorkerProgress(progress, 'failed', {
             artifactsWritten: resultArtifactsWritten,
@@ -1413,13 +1566,27 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       }
       count++;
     } finally {
+      if (stopRenewingOnAbort) cfg.signal?.removeEventListener('abort', stopRenewingOnAbort);
       if (renewTimer) clearInterval(renewTimer);
-      currentTask = undefined;
-      await sendHeartbeat();
+      if (!preserveRunningProjectionOnAbort) {
+        currentTask = undefined;
+        await sendHeartbeat();
+      }
+      releaseWorkerArtifactContext(workDir, task.task_id, task.project_path);
     }
   }
   } finally {
     clearInterval(heartbeatTimer);
+    if (ownsRegistration && typeof client.offline === 'function') {
+      try {
+        const offline = await client.offline(cfg.signal?.aborted ? 'worker_signal' : 'worker_exit');
+        if (offline?.ok === false) {
+          console.warn(`[worker:${cfg.agentId}] 离线登记失败：${offline.error?.code ?? 'UNKNOWN'}`);
+        }
+      } catch (error) {
+        console.warn(`[worker:${cfg.agentId}] 离线登记异常：${(error as Error).message}`);
+      }
+    }
   }
   console.log(`[worker:${cfg.agentId}] 总计完成 ${count} 个任务`);
 }

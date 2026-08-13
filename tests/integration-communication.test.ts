@@ -165,12 +165,15 @@ describe('Worker → PM Question + 被动门铃闭环', () => {
     expect(created.status).toBe(200);
     expect(created.body).toMatchObject({ ok: true, data: { plan_id: planId, task_count: 2 } });
 
-    expect((await post('/register', {
+    const registrationA = await post<{ registration_id: string }>('/register', {
       agent_id: 'question-worker-a', agent_type: 'cli', capabilities: ['code'], projects: [projectDir],
-    })).body.ok).toBe(true);
+    });
+    expect(registrationA.body.ok).toBe(true);
 
     const claimed = await post<Record<string, unknown>>('/claim', {
-      agent_id: 'question-worker-a', blocking: false, preferred_project: projectDir,
+      agent_id: 'question-worker-a', registration_id: registrationA.body.data!.registration_id,
+      claim_request_id: 'claim_question_worker_a_001',
+      blocking: false, preferred_project: projectDir,
     });
     expect(claimed.body.ok).toBe(true);
     const task = claimed.body.data! as {
@@ -308,11 +311,14 @@ describe('Worker → PM Question + 被动门铃闭环', () => {
       expect.objectContaining({ event_id: bell!.event_id }),
     ]));
 
-    expect((await post('/register', {
+    const registrationB = await post<{ registration_id: string }>('/register', {
       agent_id: 'question-worker-b', agent_type: 'cli', capabilities: ['code'], projects: [projectDir],
-    })).body.ok).toBe(true);
+    });
+    expect(registrationB.body.ok).toBe(true);
     const reclaimed = await post<Record<string, unknown>>('/claim', {
-      agent_id: 'question-worker-b', blocking: false, preferred_project: projectDir,
+      agent_id: 'question-worker-b', registration_id: registrationB.body.data!.registration_id,
+      claim_request_id: 'claim_question_worker_b_001',
+      blocking: false, preferred_project: projectDir,
     });
     expect(reclaimed.body.ok).toBe(true);
     const freshTask = reclaimed.body.data! as {
@@ -371,15 +377,20 @@ describe('文件/依赖等待的事件驱动恢复', () => {
     expect(submitted.body).toMatchObject({ ok: true, data: { plan_id: planId, task_count: 9 } });
 
     type Claimed = { task_id: string; claim_token: string };
+    const registrationIds = new Map<string, string>();
     const registerAndClaim = async (agentId: string, expectedTaskId: string): Promise<Claimed> => {
-      expect((await post('/register', {
+      const registered = await post<{ registration_id: string }>('/register', {
         agent_id: agentId,
         agent_type: 'cli',
         capabilities: ['code'],
         projects: [autoProjectDir],
-      })).body.ok).toBe(true);
+      });
+      expect(registered.body.ok).toBe(true);
+      registrationIds.set(agentId, registered.body.data!.registration_id);
       const claimed = await post<Claimed>('/claim', {
         agent_id: agentId,
+        registration_id: registered.body.data!.registration_id,
+        claim_request_id: `claim_${agentId}_initial_001`,
         blocking: false,
         preferred_project: autoProjectDir,
       });
@@ -538,6 +549,8 @@ describe('文件/依赖等待的事件驱动恢复', () => {
     expect(await taskStatus(ids.dependencyWaiter)).toBe('blocked');
     const dependencyOwnerSecond = await post<Claimed>('/claim', {
       agent_id: agents.dependencyOwner,
+      registration_id: registrationIds.get(agents.dependencyOwner),
+      claim_request_id: 'claim_dependency_owner_second_001',
       blocking: false,
       preferred_project: autoProjectDir,
     });

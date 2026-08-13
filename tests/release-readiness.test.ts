@@ -16,7 +16,21 @@ describe('release configuration', () => {
       }
     }
 
-    expect([...variableNames].sort()).toHaveLength(8);
+    const expectedVariables = new Set([
+      'ACCEPTANCE_REVERIFY_TEST_REDIS_URL',
+      'AGENT_EPOCH_TEST_REDIS_URL',
+      'BLOCKING_CLAIM_TEST_REDIS_URL',
+      'LEASE_LIFECYCLE_TEST_REDIS_URL',
+      'LEGACY_REVIEW_TEST_REDIS_URL',
+      'OWNERSHIP_TEST_REDIS_URL',
+      'REPAIR_OWNERSHIP_TEST_REDIS_URL',
+      'RESTORE_DOORBELL_TEST_REDIS_URL',
+      'RESTORE_MAINTENANCE_TEST_REDIS_URL',
+      'RUNTIME_RECONCILE_TEST_REDIS_URL',
+      'STATUS_PROJECTION_TEST_REDIS_URL',
+      'SUPERSEDE_TEST_REDIS_URL',
+    ]);
+    expect(variableNames).toEqual(expectedVariables);
 
     const workflow = YAML.parse(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
       jobs?: { test?: { env?: Record<string, string> } };
@@ -42,5 +56,57 @@ describe('release configuration', () => {
     const config = readFileSync(join(root, 'vitest.config.ts'), 'utf8');
     expect(config).toMatch(/fileParallelism:\s*false/);
     expect(config).toMatch(/singleFork:\s*true/);
+  });
+
+  it('keeps full Redis tests on the primary Node job and runs portable server/package gates on Node 22', () => {
+    const workflow = YAML.parse(readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
+      jobs?: Record<string, {
+        services?: Record<string, unknown>;
+        steps?: Array<{ uses?: string; with?: Record<string, string>; run?: string }>;
+      }>;
+    };
+    const primary = workflow.jobs?.test;
+    const portable = workflow.jobs?.node22;
+
+    expect(primary?.services?.redis).toBeTruthy();
+    expect(portable).toBeTruthy();
+    expect(portable?.services).toBeUndefined();
+
+    const setupNode = portable?.steps?.find((step) => step.uses?.startsWith('actions/setup-node@'));
+    expect(setupNode?.with?.['node-version']).toBe('22.12.0');
+    const commands = portable?.steps?.map((step) => step.run ?? '').join('\n') ?? '';
+    expect(commands).toContain('npm run test:web');
+    expect(commands).toContain('tests/worker.test.ts');
+    expect(commands).toContain('tests/worker-signal-propagation.test.ts');
+    expect(commands).toContain('tests/supervisor-runtime.test.ts');
+    expect(commands).toContain('npm run build');
+    expect(commands).toContain('npm run verify:package');
+    expect(commands).not.toMatch(/\bnpm test\b/);
+  });
+
+  it('documents both supported layouts and the operational audit boundaries', () => {
+    const readme = readFileSync(join(root, 'README.md'), 'utf8');
+
+    expect(readme).toContain('### 源码 clone');
+    expect(readme).toContain('### 已安装 npm tarball');
+    expect(readme).toContain('./node_modules/.bin/biao-bootstrap');
+    expect(readme).toContain('当前待处理');
+    expect(readme).toContain('历史审计');
+    expect(readme).toContain('显式离线');
+    expect(readme).toContain('排除但保留审计');
+  });
+
+  it('keeps distribution private and unlicensed for public reuse', () => {
+    const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+      private?: boolean;
+      license?: string;
+    };
+    const workflowSources = readdirSync(join(root, '.github', 'workflows'))
+      .filter((name) => /\.ya?ml$/.test(name))
+      .map((name) => readFileSync(join(root, '.github', 'workflows', name), 'utf8'));
+
+    expect(packageJson.private).toBe(true);
+    expect(packageJson.license).toBe('UNLICENSED');
+    expect(workflowSources.join('\n')).not.toMatch(/\bnpm publish\b/);
   });
 });

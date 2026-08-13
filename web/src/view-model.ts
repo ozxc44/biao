@@ -34,10 +34,58 @@ export interface PlanAttention {
   action: PlanAttentionAction;
 }
 
+export interface GlobalStatusSummary {
+  attention: {
+    failed: number;
+    rejected: number;
+    needsPmDecision: number;
+    staleRunningAgents: number;
+  };
+  history: {
+    resolvedFailed: number;
+    resolvedRejected: number;
+    staleAgents: number;
+  };
+}
+
 const ONLINE_AGENT_STATUSES = new Set(['idle', 'busy', 'online']);
 
 export function countOnlineAgents(agents: AgentInfo[]): number {
   return agents.filter((agent) => ONLINE_AGENT_STATUSES.has(agent.status.toLowerCase())).length;
+}
+
+/**
+ * 新服务把不可变审计总数与当前待处理异常分开；旧服务则安全退回 raw 计数。
+ * 首页只能消费这里的 attention，避免已闭环历史继续显示为红色故障。
+ */
+export function getGlobalStatusSummary(
+  status: Pick<StatusData, 'tasks' | 'reviews' | 'attention' | 'history'>,
+): GlobalStatusSummary {
+  return {
+    attention: {
+      failed: status.attention?.failed ?? status.tasks.failed,
+      rejected: status.attention?.rejected ?? status.reviews?.rejected ?? 0,
+      needsPmDecision: status.attention?.needs_pm_decision ?? 0,
+      staleRunningAgents: status.attention?.stale_running_agents ?? 0,
+    },
+    history: {
+      resolvedFailed: status.history?.resolved_failed ?? 0,
+      resolvedRejected: status.history?.resolved_rejected ?? 0,
+      staleAgents: status.history?.stale_agents ?? 0,
+    },
+  };
+}
+
+/** 在线 Agent 与失联但仍持有 running task 的 Agent 留在当前列表，其余仅作历史审计。 */
+export function partitionAgents(agents: AgentInfo[]): { current: AgentInfo[]; history: AgentInfo[] } {
+  const current: AgentInfo[] = [];
+  const history: AgentInfo[] = [];
+  for (const agent of agents) {
+    const online = ONLINE_AGENT_STATUSES.has(agent.status.toLowerCase());
+    const staleRunning = agent.current_task_status?.toLowerCase() === 'running';
+    (online || staleRunning ? current : history).push(agent);
+  }
+  return { current, history };
 }
 
 /** 将服务端机器语义码翻译到当前 UI 语言；未知旧 hint 保留原文以兼容旧服务。 */

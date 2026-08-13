@@ -51,6 +51,8 @@ describe('Mock Worker progress artifact', () => {
     const artifact = join(workDir, '.progress.json');
     let claimed = false;
     let progressDuringReport: Record<string, any> | undefined;
+    const registrationId = 'mock_registration_0123456789abcdef';
+    const lifecycle: string[] = [];
 
     server = createServer((request, response) => {
       let body = '';
@@ -58,10 +60,39 @@ describe('Mock Worker progress artifact', () => {
       request.on('end', () => {
         response.setHeader('Content-Type', 'application/json');
         if (request.url === '/register') {
+          lifecycle.push('register');
+          response.end(JSON.stringify({ ok: true, data: { registration_id: registrationId } }));
+          return;
+        }
+        if (request.url === '/heartbeat') {
+          const heartbeat = JSON.parse(body) as Record<string, unknown>;
+          expect(heartbeat).toMatchObject({
+            agent_id: 'mock-progress-worker',
+            registration_id: registrationId,
+          });
+          lifecycle.push('heartbeat');
           response.end(JSON.stringify({ ok: true, data: {} }));
           return;
         }
+        if (request.url === '/agent/offline') {
+          const offline = JSON.parse(body) as Record<string, unknown>;
+          expect(offline).toMatchObject({
+            agent_id: 'mock-progress-worker',
+            registration_id: registrationId,
+            reason: 'worker_exit',
+          });
+          lifecycle.push('offline');
+          response.end(JSON.stringify({ ok: true, data: { offline: true } }));
+          return;
+        }
         if (request.url === '/claim') {
+          const claim = JSON.parse(body) as Record<string, unknown>;
+          expect(claim).toMatchObject({
+            agent_id: 'mock-progress-worker',
+            registration_id: registrationId,
+            claim_request_id: expect.stringMatching(/^claim_[a-f0-9]{32}$/),
+          });
+          lifecycle.push('claim');
           if (claimed) {
             response.end(JSON.stringify({ ok: true, data: null }));
             return;
@@ -131,5 +162,6 @@ describe('Mock Worker progress artifact', () => {
     ]);
     expect(raw).not.toContain('mock-secret-claim-token');
     expect(statSync(artifact).mode & 0o777).toBe(0o600);
+    expect(lifecycle).toEqual(['register', 'heartbeat', 'claim', 'offline']);
   });
 });

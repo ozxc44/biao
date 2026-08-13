@@ -7,8 +7,9 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import Redis from 'ioredis';
-import { agentRegister, claim, pmReview, report } from '../src/server/service.js';
+import { agentRegister, claim, planSubmit, pmReview, report, setSqliteStore } from '../src/server/service.js';
 import { createHttpServer } from '../src/server/http.js';
+import { SqliteStore } from '../src/db/sqlite-store.js';
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import { keys } from '../src/redis/keys.js';
 import type { BiaoConfig } from '../src/types/index.js';
@@ -23,6 +24,7 @@ beforeAll(() => {
 });
 
 beforeEach(async () => {
+  setSqliteStore(null);
   await redis.flushdb();
   await writePlanToRedis(redis, {
     plan_id: 'repair-ownership-plan',
@@ -124,6 +126,13 @@ describe('PM repair ownership escalation', () => {
     expect(repair.goal_md).toContain('原任务 ownership 未修改');
 
     const sourceAfter = await redis.hgetall(keys.hash.task('expanded-inheritance'));
+    expect(sourceAfter).toMatchObject({
+      pm_repair_ownership_required: 'true',
+      pm_repair_ownership_intent: JSON.stringify({
+        files: ['apps/api/src/mcp/mailbox-v2.ts'],
+        modules: ['mailbox-v2'],
+      }),
+    });
     expect({
       ownership_files: sourceAfter.ownership_files,
       ownership_modules: sourceAfter.ownership_modules,
@@ -137,6 +146,64 @@ describe('PM repair ownership escalation', () => {
       project_path: sourceBefore.project_path,
       created_at: sourceBefore.created_at,
     });
+  });
+
+  it('来源 reject 审计的显式扩权 intent 同步写入 SQLite', async () => {
+    const store = new SqliteStore(':memory:');
+    setSqliteStore(store);
+    try {
+      await planSubmit(redis, new URL('./fixtures/test-plan', import.meta.url).pathname);
+      await agentRegister(redis, 'sqlite-escalation-worker', 'mock', ['code']);
+      const claimed = await claim(redis, {
+        agent_id: 'sqlite-escalation-worker',
+        blocking: false,
+        timeout_ms: 1,
+        preferred_project: '/tmp/biao-test',
+      });
+      expect(claimed.data?.task_id).toBe('test-m0-plan-01-be');
+      await report(redis, {
+        task_id: claimed.data!.task_id,
+        agent_id: 'sqlite-escalation-worker',
+        claim_token: claimed.data!.claim_token,
+        status: 'done',
+        verify_results: [{ cmd: 'echo hello', exit_code: 0, passed: true }],
+      });
+      const reviewed = await pmReview(redis, claimed.data!.task_id, {
+        verdict: 'reject',
+        reviewed_by: 'pm',
+        reject_reason: '相邻层需要修复',
+        repair_ownership: { files: ['apps/api/src/mcp/mailbox-v2.ts'], modules: ['mailbox-v2'] },
+      });
+      expect(reviewed).toMatchObject({ ok: true });
+      expect(store.getAllTasks().find((task) => task.task_id === claimed.data!.task_id)).toMatchObject({
+        ownership_files: 'apps/server/**',
+        pm_repair_ownership_required: 'true',
+        pm_repair_ownership_intent: JSON.stringify({
+          files: ['apps/api/src/mcp/mailbox-v2.ts'],
+          modules: ['mailbox-v2'],
+        }),
+      });
+    } finally {
+      setSqliteStore(null);
+      store.close();
+    }
+  });
+
+  it('重复显式 reject 只重放同一条 repair', async () => {
+    await doneSource('repeat-escalation');
+    const request = {
+      verdict: 'reject' as const,
+      reviewed_by: 'pm',
+      reject_reason: '相邻层需要修复',
+      repair_ownership: { files: ['apps/api/src/mcp/mailbox-v2.ts'], modules: ['mailbox-v2'] },
+    };
+
+    const first = await pmReview(redis, 'repeat-escalation', request);
+    const second = await pmReview(redis, 'repeat-escalation', request);
+
+    expect(first.data?.fix_task_id).toBe('repeat-escalation-repair-1');
+    expect(second.data?.fix_task_id).toBe('repeat-escalation-repair-1');
+    expect(await redis.exists(keys.hash.task('repeat-escalation-repair-2'))).toBe(0);
   });
 
   it('HTTP review 接口将显式扩权写入可读取的 repair 审计', async () => {

@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import {
   BiaoSupervisorRuntime,
+  SharedWorkerCoordinator,
   releaseLocalLock,
   tryAcquireLocalLock,
   type SupervisorWorkerSlot,
@@ -126,7 +127,7 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const chunks: Buffer[] = [];
     req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    req.on('end', () => {
+    req.on('end', async () => {
       requests.push({ method: req.method ?? 'GET', path: `${url.pathname}${url.search}`, body: Buffer.concat(chunks).toString('utf8') });
       res.setHeader('Content-Type', 'application/json');
       if (url.pathname === '/plans') {
@@ -196,6 +197,14 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
         res.end(JSON.stringify(options.heartbeat?.(body) ?? { ok: true, data: {} }));
         return;
       }
+      if (url.pathname === '/lease/renew') {
+        res.end(JSON.stringify({ ok: true, data: {} }));
+        return;
+      }
+      if (url.pathname === '/agent/offline') {
+        res.end(JSON.stringify({ ok: true, data: {} }));
+        return;
+      }
       if (url.pathname === '/report') {
         let body: Record<string, unknown> = {};
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; } catch { /* test server returns normal envelope */ }
@@ -205,7 +214,7 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
       if (url.pathname === '/claim') {
         let body: Record<string, unknown> = {};
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; } catch { /* test server returns normal envelope */ }
-        res.end(JSON.stringify({ ok: true, data: options.claim?.(body) ?? null }));
+        res.end(JSON.stringify({ ok: true, data: await options.claim?.(body) ?? null }));
         return;
       }
       if (url.pathname.startsWith('/task/')) {
@@ -407,8 +416,8 @@ describe('BiaoSupervisorRuntime production transport', () => {
     });
     const heartbeats = requests.filter((request) => request.path === '/heartbeat').map((request) => JSON.parse(request.body));
     expect(heartbeats).toEqual([
-      { agent_id: 'review-a' },
-      { agent_id: 'review-b' },
+      { agent_id: 'review-a', registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/) },
+      { agent_id: 'review-b', registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/) },
     ]);
 
     await runtime.runOnce();
@@ -596,6 +605,187 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/heartbeat')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
+    const offline = requests.filter((request) => request.path === '/agent/offline');
+    expect(offline).toHaveLength(1);
+    expect(JSON.parse(offline[0].body)).toEqual({
+      agent_id: 'code-a',
+      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
+      reason: 'plans_terminal',
+    });
+  });
+
+  it('signal abort explicitly takes every configured shared Worker offline', async () => {
+    const controller = new AbortController();
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => [{
+        plan_id: 'signal-plan', status: 'active', project_path: '/tmp/a',
+        tasks: { pending: 0, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      signal: controller.signal,
+      workers: [{
+        agentId: 'signal-worker', agentType: 'test', preferredProject: '/tmp/a', capabilities: ['code'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+      pollIntervalMs: 60_000,
+    });
+
+    const running = runtime.run();
+    while (!requests.some((request) => request.path === '/heartbeat')) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    controller.abort();
+    await running;
+
+    const offline = requests.filter((request) => request.path === '/agent/offline');
+    expect(offline).toHaveLength(1);
+    expect(JSON.parse(offline[0].body)).toEqual({
+      agent_id: 'signal-worker',
+      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
+      reason: 'supervisor_signal',
+    });
+  });
+
+  it('signal abort 等待全部运行 slot settle 后才最终 offline，不先伪装退出', async () => {
+    const controller = new AbortController();
+    const projectPath = createTempDir('biao-supervisor-await-slot-');
+    let claimed = false;
+    let executionStarted!: () => void;
+    let closeExecution!: () => void;
+    const started = new Promise<void>((resolve) => { executionStarted = resolve; });
+    const executionClosed = new Promise<void>((resolve) => { closeExecution = resolve; });
+    const task: ClaimedTask = {
+      ...sampleTask(), task_id: 'await-slot-task', project_path: projectPath, timeout_seconds: 20,
+    };
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => [{
+        plan_id: 'open-a', status: 'active', project_path: projectPath,
+        tasks: { pending: claimed ? 0 : 1, running: claimed ? 1 : 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+      claim: () => {
+        if (claimed) return null;
+        claimed = true;
+        return task;
+      },
+      task: () => ({ ok: true, data: { status: 'running' } }),
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url, consumer: 'pm-a', signal: controller.signal, pollIntervalMs: 60_000,
+      workers: [{
+        agentId: 'await-slot-worker', agentType: 'test', preferredProject: projectPath, capabilities: ['code'],
+        execute: async (_task, _project, signal) => {
+          executionStarted();
+          await new Promise<void>((resolve) => signal?.addEventListener('abort', resolve, { once: true }));
+          await executionClosed;
+          return {
+            run: { exitCode: 130, stdout: '', stderr: '', durationMs: 10, timedOut: false, aborted: true },
+            changedFiles: [], backend: 'test', model: 'test',
+          };
+        },
+      }],
+    });
+
+    const running = runtime.run();
+    await started;
+    controller.abort();
+    let runtimeSettled = false;
+    void running.then(() => { runtimeSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+
+    expect(runtimeSettled).toBe(false);
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
+    closeExecution();
+    await running;
+
+    const offline = requests.filter((request) => request.path === '/agent/offline');
+    expect(offline).toHaveLength(1);
+    expect(JSON.parse(offline[0].body)).toEqual({
+      agent_id: 'await-slot-worker',
+      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
+      reason: 'supervisor_signal',
+    });
+    expect(requests.filter((request) => request.path === '/report')).toHaveLength(0);
+  });
+
+  it('signal abort stops renewing a still-running execution instead of hiding an immortal lease', async () => {
+    const controller = new AbortController();
+    const projectPath = createTempDir('biao-supervisor-abort-running-');
+    let claimed = false;
+    let releaseExecution!: () => void;
+    let executionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { executionStarted = resolve; });
+    const executionGate = new Promise<void>((resolve) => { releaseExecution = resolve; });
+    const task: ClaimedTask = {
+      ...sampleTask(),
+      task_id: 'abort-running-task',
+      title: 'abort running task',
+      project_path: projectPath,
+      timeout_seconds: 1,
+    };
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => [{
+        plan_id: 'open-a', status: 'active', project_path: projectPath,
+        tasks: { pending: claimed ? 0 : 1, running: claimed ? 1 : 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+      claim: () => {
+        if (claimed) return null;
+        claimed = true;
+        return task;
+      },
+      task: () => ({ ok: true, data: { status: 'running' } }),
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      signal: controller.signal,
+      workers: [{
+        agentId: 'abort-running-worker', agentType: 'test', preferredProject: projectPath, capabilities: ['code'],
+        heartbeatMs: 1_000,
+        execute: async () => {
+          executionStarted();
+          await executionGate;
+          return {
+            run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+            changedFiles: [], backend: 'test', model: 'test',
+          };
+        },
+      }],
+      pollIntervalMs: 60_000,
+    });
+
+    const running = runtime.run();
+    await started;
+    while (!requests.some((request) => request.path === '/lease/renew')) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    controller.abort();
+    const renewalsAtAbort = requests.filter((request) => request.path === '/lease/renew').length;
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    const renewalsAfterGrace = requests.filter((request) => request.path === '/lease/renew').length;
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
+    releaseExecution();
+    await running;
+
+    expect(renewalsAfterGrace).toBe(renewalsAtAbort);
+    // abort 保留 running 指针，等真实执行 settle 后才只登记一次 offline；
+    // 不把停止伪造成 done/failed report，由 lease 统一回收。
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/report')).toHaveLength(0);
   });
 
   it('同项目的异能力 slot 不会被前一个空 claim 饿死', async () => {
@@ -701,6 +891,124 @@ describe('BiaoSupervisorRuntime production transport', () => {
 
     expect(requests.filter((request) => request.method === 'POST' && request.path === '/reconcile')).toHaveLength(3);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(2);
+  });
+});
+
+describe('SharedWorkerCoordinator shutdown serialization', () => {
+  it('延迟 claim 已在途时，等待调度和新启动的任务 settle 后才登记 offline', async () => {
+    const projectPath = createTempDir('biao-supervisor-delayed-claim-');
+    let releaseClaim!: () => void;
+    let notifyClaimStarted!: () => void;
+    let releaseExecution!: () => void;
+    let notifyExecutionStarted!: () => void;
+    const claimStarted = new Promise<void>((resolve) => { notifyClaimStarted = resolve; });
+    const claimGate = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    const executionStarted = new Promise<void>((resolve) => { notifyExecutionStarted = resolve; });
+    const executionGate = new Promise<void>((resolve) => { releaseExecution = resolve; });
+    const { url, requests } = await startBiaoLikeServer({
+      claim: async () => {
+        notifyClaimStarted();
+        await claimGate;
+        return { ...sampleTask(), task_id: 'delayed-claim-task', project_path: projectPath };
+      },
+      task: () => ({ ok: true, data: { status: 'running', claimed_by: 'delayed-worker' } }),
+    });
+    const coordinator = new SharedWorkerCoordinator({
+      biaoUrl: url,
+      slots: [{
+        agentId: 'delayed-worker', agentType: 'test', preferredProject: projectPath, capabilities: ['code'],
+        execute: async () => {
+          notifyExecutionStarted();
+          await executionGate;
+          return {
+            run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+            changedFiles: [], backend: 'test', model: 'test',
+          };
+        },
+      }],
+    });
+
+    const scheduling = coordinator.scheduleIfRequested();
+    await claimStarted;
+    let stopped = false;
+    const stopping = coordinator.offlineAll('supervisor_exit').then(() => { stopped = true; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(stopped).toBe(false);
+      expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
+
+      releaseClaim();
+      await executionStarted;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(stopped).toBe(false);
+      expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
+
+      releaseExecution();
+      await Promise.all([scheduling, stopping]);
+      const reportIndex = requests.findIndex((request) => request.path === '/report');
+      const offlineIndex = requests.findIndex((request) => request.path === '/agent/offline');
+      expect(reportIndex).toBeGreaterThanOrEqual(0);
+      expect(offlineIndex).toBeGreaterThan(reportIndex);
+      expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+    } finally {
+      // 回归再次出现时也释放测试门闩，避免残留 HTTP 请求拖死 afterEach。
+      releaseClaim();
+      releaseExecution();
+      await Promise.allSettled([scheduling, stopping]);
+    }
+  });
+
+  it('并发 offlineAll 共享同一个关停过程，每个 slot 只登记一次', async () => {
+    const { url, requests } = await startBiaoLikeServer();
+    const coordinator = new SharedWorkerCoordinator({
+      biaoUrl: url,
+      slots: [{
+        agentId: 'single-offline-worker', agentType: 'test', capabilities: ['code'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+    });
+
+    await Promise.all([
+      coordinator.offlineAll('supervisor_signal'),
+      coordinator.offlineAll('supervisor_exit'),
+    ]);
+
+    const offline = requests.filter((request) => request.path === '/agent/offline');
+    expect(offline).toHaveLength(1);
+    expect(JSON.parse(offline[0].body)).toEqual({
+      agent_id: 'single-offline-worker',
+      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
+      reason: 'supervisor_signal',
+    });
+  });
+
+  it('关停完成后 wake 不再触发注册或新 claim', async () => {
+    const wakeSignals: string[] = [];
+    const { url, requests } = await startBiaoLikeServer();
+    const coordinator = new SharedWorkerCoordinator({
+      biaoUrl: url,
+      onWake: () => wakeSignals.push('wake'),
+      slots: [{
+        agentId: 'stopped-worker', agentType: 'test', capabilities: ['code'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+    });
+
+    await coordinator.offlineAll('supervisor_exit');
+    coordinator.wake();
+    await coordinator.scheduleIfRequested();
+
+    expect(wakeSignals).toEqual([]);
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
+    expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
   });
 });
 

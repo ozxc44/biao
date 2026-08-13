@@ -16,7 +16,15 @@ function executable(path: string, body: string): void {
   chmodSync(path, 0o755);
 }
 
-function fakeEnvironment(opts: { node?: boolean; nodeVersion?: string; redis?: boolean; redisUp?: boolean; os?: 'Darwin' | 'Linux' } = {}) {
+function fakeEnvironment(opts: {
+  node?: boolean;
+  nodeVersion?: string;
+  redis?: boolean;
+  redisCli?: boolean;
+  redisServer?: boolean;
+  redisUp?: boolean;
+  os?: 'Darwin' | 'Linux';
+} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'biao-system-bootstrap-'));
   roots.push(root);
   const bin = join(root, 'bin');
@@ -36,8 +44,10 @@ else
 fi`);
   }
   if (opts.node) executable(join(bin, 'npm'), 'exit 0');
-  if (opts.redis) {
+  if (opts.redis || opts.redisCli) {
     executable(join(bin, 'redis-cli'), opts.redisUp === false ? 'exit 1' : 'echo PONG');
+  }
+  if (opts.redis || opts.redisServer) {
     executable(join(bin, 'redis-server'), 'exit 0');
   }
   executable(
@@ -76,11 +86,46 @@ fi`,
 }
 
 describe('无 Node/Redis 时的仓库首入口', () => {
+  it('缺少 Node 和 Redis 时 --help 仍直接显示用法并零退出', () => {
+    const fake = fakeEnvironment();
+    const result = spawnSync('/bin/sh', [script, '--help'], { env: fake.env, encoding: 'utf8' });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Biao 开箱配置');
+    expect(result.stdout).toContain('--workspace <path>');
+    expect(`${result.stdout}${result.stderr}`).not.toContain('[missing]');
+    expect(() => readFileSync(fake.log, 'utf8')).toThrow();
+  });
+
   it('依赖齐全时只检测，不执行系统安装', () => {
     const fake = fakeEnvironment({ node: true, redis: true, redisUp: true });
     const output = execFileSync('/bin/sh', [script], { env: fake.env, encoding: 'utf8' });
     expect(output).toContain('[ok] Node.js 20.19+');
     expect(output).toContain('[ok] Redis 可连接');
+    expect(() => readFileSync(fake.log, 'utf8')).toThrow();
+  });
+
+  it('--check 是公开的严格只读入口，依赖齐全也不进入 Node bootstrap', () => {
+    const fake = fakeEnvironment({ node: true, redis: true, redisUp: true });
+    const result = spawnSync('/bin/sh', [script, '--check', '--workspace', '/must-not-be-written'], {
+      env: { ...fake.env, BIAO_BOOTSTRAP_SYSTEM_ONLY: '0' },
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('只读检查通过');
+    expect(() => readFileSync(fake.log, 'utf8')).toThrow();
+  });
+
+  it('--check 即使同时给 --yes 也不安装缺失依赖', () => {
+    const fake = fakeEnvironment();
+    const result = spawnSync('/bin/sh', [script, '--check', '--yes'], {
+      env: { ...fake.env, BIAO_BOOTSTRAP_SYSTEM_ONLY: '0' },
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(2);
+    expect(`${result.stdout}${result.stderr}`).toContain('只读检查未通过');
     expect(() => readFileSync(fake.log, 'utf8')).toThrow();
   });
 
@@ -123,6 +168,53 @@ echo PONG`);
     expect(output).not.toContain('private-pass');
     expect(output).not.toContain('query-secret');
   });
+
+  it.each(['Darwin', 'Linux'] as const)(
+    '远程 Redis 在 %s 只要求安全客户端探测，不安装本机 redis-server',
+    (os) => {
+      const fake = fakeEnvironment({ os, node: true, redisCli: true, redisUp: true });
+      const result = spawnSync('/bin/sh', [script, '--yes', '--redis-url', 'redis://remote.example:6379/4'], {
+        env: fake.env,
+        encoding: 'utf8',
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('[ok] Redis 可连接');
+      expect(() => readFileSync(fake.log, 'utf8')).toThrow();
+    },
+  );
+
+  it.each(['redis://localhost', 'redis://127.0.0.1'])(
+    '无显式端口的本机 Redis URL %s 仍安装/要求本机服务端',
+    (redisUrl) => {
+      const fake = fakeEnvironment({ node: true, redisCli: true, redisUp: true });
+      const output = execFileSync('/bin/sh', [script, '--yes', '--redis-url', redisUrl], {
+        env: fake.env,
+        encoding: 'utf8',
+      });
+      expect(output).toContain('[installed] Redis');
+      expect(readFileSync(fake.log, 'utf8')).toContain('brew install redis');
+    },
+  );
+
+  it.each(['Darwin', 'Linux'] as const)(
+    '远程 Redis 在 %s 缺探测客户端时也不安装本机 Redis 服务端',
+    (os) => {
+      const fake = fakeEnvironment({ os, node: true });
+      const redisUrl = 'redis://private-user:private-pass@remote.example:6379/4';
+      const result = spawnSync('/bin/sh', [script, '--yes', '--redis-url', redisUrl], {
+        env: fake.env,
+        encoding: 'utf8',
+      });
+      const output = `${result.stdout}${result.stderr}`;
+
+      expect(result.status).toBe(1);
+      expect(output).toContain('redis-cli');
+      expect(output).not.toContain('private-user');
+      expect(output).not.toContain('private-pass');
+      expect(() => readFileSync(fake.log, 'utf8')).toThrow();
+    },
+  );
 
   it('依赖缺失且没有 --yes 时停止并给出明确安装指令', () => {
     const fake = fakeEnvironment();

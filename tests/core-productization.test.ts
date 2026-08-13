@@ -150,6 +150,37 @@ async function eventsForTask(taskId: string): Promise<Record<string, string>[]> 
 }
 
 describe('report 在验证通过前不消耗运行态', () => {
+  it('重新 claim 会清掉异常遗留的旧验收轮次，新的 report 只能重新等待 PM', async () => {
+    await seedTask('fresh-review-round');
+    await redis.hset(keys.hash.task('fresh-review-round'), {
+      pm_review_status: 'accepted',
+      pm_reviewed_by: 'stale-pm',
+      pm_reviewed_at: '1',
+      pm_review_comment: 'old round',
+      pm_accept_effects_applied: 'true',
+    });
+
+    const claimed = await claimAs('fresh-round-worker');
+    expect(claimed.data?.task_id).toBe('fresh-review-round');
+    expect(await redis.hmget(
+      keys.hash.task('fresh-review-round'),
+      'pm_review_status',
+      'pm_reviewed_by',
+      'pm_accept_effects_applied',
+    )).toEqual(['', '', '']);
+
+    const reported = await report(redis, {
+      task_id: 'fresh-review-round',
+      agent_id: 'fresh-round-worker',
+      claim_token: claimed.data!.claim_token,
+      status: 'done',
+      verify_results: [],
+    });
+    expect(reported.ok).toBe(true);
+    expect(await redis.hget(keys.hash.task('fresh-review-round'), 'pm_review_status')).toBe('');
+    expect(await redis.zscore(keys.reviewRequested.pending, 'fresh-review-round')).not.toBeNull();
+  });
+
   it('缺少声明的 verify 结果时保留 lease、ownership 和 running', async () => {
     await seedTask('verify-required', {
       ownership: { files: ['src/core/**'] },
@@ -293,7 +324,9 @@ describe('acceptance 完成闸门', () => {
 });
 
 describe('PM review 与状态可见性', () => {
-  it('无 Worker 时返回 clone 后生成入口，不硬编码端口或不存在的文档', async () => {
+  it('有待领取任务且无 Worker 时返回 clone 后生成入口，不硬编码端口或不存在的文档', async () => {
+    await seedPlan();
+    await seedTask('pending-needs-worker');
     const status = await getStatus(redis);
     expect(status.data.hint).toEqual({
       code: 'NO_ONLINE_WORKERS',
@@ -302,6 +335,34 @@ describe('PM review 与状态可见性', () => {
       pm_guide: '.biao/PM_AGENT.md',
       start_worker: '.biao/worker-codex、.biao/worker-kimi 或 .biao/worker-custom',
     });
+  });
+
+  it('全部计划已关闭时不因孤立 pending 审计提示启动 Worker', async () => {
+    await seedPlan();
+    await seedTask('completed-task');
+    await redis.zrem(keys.zset.status.pending, 'completed-task');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'completed-task');
+    await redis.hset(keys.hash.task('completed-task'), {
+      status: 'done',
+      pm_review_status: 'accepted',
+    });
+    // 防御历史损坏/升级残留：闭合 plan 外仍有孤立索引时也不应唤醒执行者。
+    await redis.zadd(keys.zset.status.pending, Date.now() + 1, 'orphan-pending-audit');
+
+    const status = await getStatus(redis);
+    expect(status.data.hint).toBeNull();
+  });
+
+  it('计划仍 active 但只有孤立 pending 索引时也不提示启动 Worker', async () => {
+    await seedPlan();
+    await seedTask('running-keeps-plan-active');
+    await redis.zrem(keys.zset.status.pending, 'running-keeps-plan-active');
+    await redis.zadd(keys.zset.status.running, Date.now(), 'running-keeps-plan-active');
+    await redis.hset(keys.hash.task('running-keeps-plan-active'), { status: 'running' });
+    await redis.zadd(keys.zset.status.pending, Date.now() + 1, 'orphan-pending-audit');
+
+    const status = await getStatus(redis);
+    expect(status.data.hint).toBeNull();
   });
 
   it('非 done 任务不能执行 PM review', async () => {
@@ -335,6 +396,48 @@ describe('PM review 与状态可见性', () => {
     expect(plan.data.tasks.done[0].review_status).toBe('rejected');
     const status = await getStatus(redis);
     expect(status.data).toMatchObject({ reviews: { pending: 0, accepted: 0, rejected: 1 } });
+  });
+
+  it('全局状态保留原始计数，并把已闭环失败和拒绝归入历史而非当前异常', async () => {
+    await seedPlan();
+    for (const taskId of ['resolved-failed', 'current-failed', 'resolved-rejected', 'current-rejected']) {
+      await seedTask(taskId);
+      await redis.zrem(keys.zset.status.pending, taskId);
+    }
+
+    const now = Date.now();
+    await redis.zadd(keys.zset.status.failed, now, 'resolved-failed', now + 1, 'current-failed');
+    await redis.hset(keys.hash.task('resolved-failed'), {
+      status: 'failed',
+      resolution_status: 'resolved',
+      resolved_by_task: 'resolved-failed-repair-1',
+    });
+    await redis.hset(keys.hash.task('current-failed'), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+    });
+
+    await redis.zadd(keys.zset.status.done, now + 2, 'resolved-rejected', now + 3, 'current-rejected');
+    await redis.hset(keys.hash.task('resolved-rejected'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      resolution_status: 'resolved',
+      resolved_by_task: 'resolved-rejected-repair-1',
+    });
+    await redis.hset(keys.hash.task('current-rejected'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+    });
+
+    const status = await getStatus(redis);
+    expect(status.data).toMatchObject({
+      // 兼容字段仍是不可变审计总数。
+      tasks: { failed: 2 },
+      reviews: { rejected: 2 },
+      // 新字段才用于首页的当前红色异常与历史审计。
+      attention: { failed: 1, rejected: 1, needs_pm_decision: 1 },
+      history: { resolved_failed: 1, resolved_rejected: 1 },
+    });
   });
 
   it('blocked 和 cancelled 在 getPlan/getStatus 中都有独立桶', async () => {

@@ -19,6 +19,7 @@
 import { openSync, closeSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
+import { isPlanTerminalStatus } from '../plan/status.js';
 import { stableHash } from '../redis/keys.js';
 import { BiaoClient, runWorkerLoop, type WorkerConfig } from './base.js';
 import type { ClaimedTask, TaskType } from '../types/index.js';
@@ -643,6 +644,7 @@ export interface SupervisorWorkerSlot {
 interface ManagedWorkerSlot extends SupervisorWorkerSlot {
   client: BiaoClient;
   running: boolean;
+  settled?: Promise<void>;
 }
 
 export interface SharedWorkerCoordinatorOptions {
@@ -674,7 +676,13 @@ export class SharedWorkerCoordinator {
   private readonly onError?: (message: string) => void;
   private started = false;
   private scheduling = false;
+  /** 当前 claim 调度轮次的完成信号；offlineAll 必须等待它发现并启动的任务。 */
+  private scheduleSettled?: Promise<void>;
   private scheduleRequested = true;
+  private offline = false;
+  /** 所有并发关停调用共享同一个副作用过程，避免重复登记 offline。 */
+  private offlining?: Promise<void>;
+  private shutdownReason?: 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit';
   /** 连续相同的空闲心跳错误只提示一次；成功恢复后才允许再次提示。 */
   private readonly presenceErrors = new Map<string, string>();
 
@@ -688,6 +696,7 @@ export class SharedWorkerCoordinator {
       ...slot,
       client: new BiaoClient(opts.biaoUrl, slot.agentId, opts.apiToken),
       running: false,
+      settled: undefined,
     }));
   }
 
@@ -695,8 +704,57 @@ export class SharedWorkerCoordinator {
     return this.slots.filter((slot) => slot.running).length;
   }
 
+  /**
+   * Supervisor 是共享 slot 注册的生命周期所有者，因此由它统一显式离线。
+   * 服务端保留 registered_at/last_heartbeat/last_task 审计，不再等待 watchdog 猜测退出。
+   */
+  async offlineAll(reason: 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit'): Promise<void> {
+    this.scheduleRequested = false;
+    if (this.offline) return;
+    if (this.offlining) {
+      await this.offlining;
+      return;
+    }
+    this.shutdownReason = reason;
+    const offlining = this.finishOfflineAll(reason);
+    this.offlining = offlining;
+    try {
+      await offlining;
+    } finally {
+      if (this.offlining === offlining) this.offlining = undefined;
+    }
+  }
+
+  private async finishOfflineAll(reason: 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit'): Promise<void> {
+    // AbortSignal 已传到真实 Agent CLI；等进程树 TERM/KILL 后发出 close，且
+    // runWorkerLoop 确认没有 report 业务终态，才可以把 slot 统一登记 offline。
+    // 同时等待已在途的 claim 调度；它返回的 task 会先进入 slot.settled，再由下一轮
+    // 快照纳入等待。这使 offline 成为停止完成证据，不是“已发送 abort”的乐观投影。
+    for (;;) {
+      const scheduleSettled = this.scheduleSettled;
+      const activeSettlements = this.slots.flatMap((slot) => slot.settled ? [slot.settled] : []);
+      const pending = scheduleSettled ? [scheduleSettled, ...activeSettlements] : activeSettlements;
+      if (pending.length === 0) break;
+      await Promise.allSettled(pending);
+    }
+    if (this.offline) return;
+    await Promise.all(this.slots.map(async (slot) => {
+      try {
+        const response = await slot.client.offline(reason);
+        if (response?.ok === false) {
+          this.onError?.(`共享 Worker 离线登记失败（${slot.agentId}）：${response.error?.code ?? 'UNKNOWN'}`);
+        }
+      } catch (error) {
+        this.onError?.(`共享 Worker 离线登记异常（${slot.agentId}）：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }));
+    this.started = false;
+    this.offline = true;
+  }
+
   /** 仅设置一个共享重试信号；所有 slot 都不会自行轮询。 */
   wake(): void {
+    if (this.shutdownReason || this.offlining || this.offline) return;
     this.scheduleRequested = true;
     this.onWake?.();
   }
@@ -707,10 +765,10 @@ export class SharedWorkerCoordinator {
    * 的心跳和 lease 续租，避免重复流量。
    */
   async refreshIdlePresence(): Promise<void> {
-    if (this.signal?.aborted) return;
+    if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline) return;
     await this.ensureRegistered();
     for (const slot of this.slots) {
-      if (this.signal?.aborted || slot.running) continue;
+      if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline || slot.running) continue;
       try {
         const heartbeat = await slot.client.heartbeat();
         if (heartbeat?.ok === false) {
@@ -732,16 +790,29 @@ export class SharedWorkerCoordinator {
    * 因此资源随“状态变化”而非 slot 数量/时间线性增长。
    */
   async scheduleIfRequested(): Promise<void> {
-    if (!this.scheduleRequested || this.scheduling || this.signal?.aborted) return;
+    if (
+      !this.scheduleRequested
+      || this.scheduling
+      || this.signal?.aborted
+      || this.shutdownReason
+      || this.offlining
+      || this.offline
+    ) return;
     this.scheduleRequested = false;
     this.scheduling = true;
+    let notifyScheduleSettled!: () => void;
+    const scheduleSettled = new Promise<void>((resolve) => { notifyScheduleSettled = resolve; });
+    this.scheduleSettled = scheduleSettled;
     try {
       await this.ensureRegistered();
       // 只合并“完全相同 claim 条件”的空结果。不能只按 project 合并：例如 review
       // slot 先看到空队列时，后面的 code slot 仍必须有机会领取同一项目的 code 任务。
       const unavailableClaimScopes = new Set<string>();
       for (const slot of this.slots) {
-        if (this.signal?.aborted || slot.running) continue;
+        // 已发出的 claim 必须处理其返回值，避免把服务端已领取的任务静默丢弃；
+        // 但关停开始后不再向后续 slot 发起新 claim。
+        if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline) break;
+        if (slot.running) continue;
         const preferredTypes = normalizePreferredTypes(slot.preferredTypes ?? supportedTaskTypes(slot.capabilities));
         const key = `${slot.preferredProject ?? '*'}\u0000${preferredTypes.join(',')}\u0000${this.preferredPlanIds?.join(',') ?? '*'}`;
         // 一个完全相同的 claim 范围在同一轮已经明确空队列时，不再重复请求。
@@ -768,16 +839,25 @@ export class SharedWorkerCoordinator {
       }
     } finally {
       this.scheduling = false;
+      if (this.scheduleSettled === scheduleSettled) this.scheduleSettled = undefined;
+      notifyScheduleSettled();
       // 运行期间可能有其它 slot 完成或远端事件到来；只再跑一轮，避免递归/忙循环。
-      if (this.scheduleRequested && !this.signal?.aborted) {
+      if (
+        this.scheduleRequested
+        && !this.signal?.aborted
+        && !this.shutdownReason
+        && !this.offlining
+        && !this.offline
+      ) {
         queueMicrotask(() => { void this.scheduleIfRequested(); });
       }
     }
   }
 
   private async ensureRegistered(): Promise<void> {
-    if (this.started) return;
+    if (this.started || this.shutdownReason || this.offlining || this.offline) return;
     for (const slot of this.slots) {
+      if (this.shutdownReason || this.offlining || this.offline) return;
       const registered = await slot.client.register(
         slot.agentType,
         slot.capabilities ?? ['code', 'review', 'research', 'docs', 'acceptance'],
@@ -788,6 +868,7 @@ export class SharedWorkerCoordinator {
         throw new Error(`共享 Worker 注册失败（${slot.agentId}）：${registered.error?.code ?? 'UNKNOWN'} ${registered.error?.message ?? ''}`.trim());
       }
     }
+    if (this.shutdownReason || this.offlining || this.offline) return;
     this.started = true;
   }
 
@@ -809,13 +890,19 @@ export class SharedWorkerCoordinator {
       client: slot.client,
       execute: slot.execute,
     };
-    void runWorkerLoop(config)
+    const settled = runWorkerLoop(config)
       .catch((error) => this.onError?.(`Worker ${slot.agentId} 执行 ${task.task_id} 异常：${error instanceof Error ? error.message : String(error)}`))
       .finally(() => {
         slot.running = false;
+        slot.settled = undefined;
+        if (this.shutdownReason) {
+          // offlineAll 正在等待这个 promise；由它在所有 slot settle 后统一登记。
+          return;
+        }
         // 正常 report / Question / failed 之后立刻再取下一项；没有任务时只留下共享等待。
         this.wake();
       });
+    slot.settled = settled;
   }
 }
 
@@ -876,7 +963,10 @@ export class BiaoSupervisorRuntime {
       // 先由共享 plan 快照判定是否仍有活跃受管项目，再允许 slot 注册/claim。
       // 这样 `--plans` 全部 completed/cancelled 时会直接退出，不遗留闲置 Worker。
       afterRunOnce: async (hasActiveProjects) => {
-        if (!hasActiveProjects) return;
+        if (!hasActiveProjects) {
+          await this.workers?.offlineAll('plans_terminal');
+          return;
+        }
         await this.workers?.refreshIdlePresence();
         await this.workers?.scheduleIfRequested();
       },
@@ -917,7 +1007,17 @@ export class BiaoSupervisorRuntime {
 
   /** 常驻运行：所有 plan 完成并验收后退出；下次启动会重新全量发现 reset/reject/new task。 */
   async run(): Promise<void> {
-    await this.supervisor.run();
+    try {
+      await this.supervisor.run();
+    } finally {
+      await this.workers?.offlineAll(
+        this.opts.signal?.aborted
+          ? 'supervisor_signal'
+          : this.supervisor.allClosed()
+            ? 'plans_terminal'
+            : 'supervisor_exit',
+      );
+    }
   }
 
   allClosed(): boolean {
@@ -997,7 +1097,7 @@ export class BiaoSupervisorRuntime {
       present.add(snapshot.plan_id);
       const pending = Number(snapshot.tasks?.pending ?? 0);
       const previousPending = this.planPendingCounts.get(snapshot.plan_id);
-      if (!isPlanClosed(snapshot.status) && pending > 0 && (previousPending === undefined || pending > previousPending)) {
+      if (!isPlanTerminalStatus(snapshot.status) && pending > 0 && (previousPending === undefined || pending > previousPending)) {
         addedRunnableWork = true;
       }
       this.planPendingCounts.set(snapshot.plan_id, Number.isFinite(pending) ? pending : 0);
@@ -1005,15 +1105,15 @@ export class BiaoSupervisorRuntime {
       if (existing) {
         existing.snapshot = snapshot;
         // 一个已完成项目若被 reset/reject/new task 重新激活，常驻 supervisor 立即恢复监控。
-        existing.project.paused = isPlanClosed(snapshot.status);
+        existing.project.paused = isPlanTerminalStatus(snapshot.status);
         continue;
       }
       const project = new SupervisedProject({
         planId: snapshot.plan_id,
-        isClosed: async () => isPlanClosed(this.plans.get(snapshot.plan_id)?.snapshot.status ?? 'active'),
+        isClosed: async () => isPlanTerminalStatus(this.plans.get(snapshot.plan_id)?.snapshot.status ?? 'active'),
         pendingItems: async () => this.intakeItems.get(snapshot.plan_id) ?? [],
       });
-      project.paused = isPlanClosed(snapshot.status);
+      project.paused = isPlanTerminalStatus(snapshot.status);
       this.plans.set(snapshot.plan_id, { snapshot, project });
     }
     // 已删除 plan 不应让常驻进程保留一个永远 active 的幽灵项目。
@@ -1033,10 +1133,6 @@ export class BiaoSupervisorRuntime {
     if (!items.some((existing) => itemDedupeKey(existing) === key)) items.push(item);
     this.intakeItems.set(item.plan_id, items);
   }
-}
-
-function isPlanClosed(status: string): boolean {
-  return status === 'completed' || status === 'cancelled';
 }
 
 /** Biao 的 capability 名与 TaskType 同名时才进入 claim 过滤，未知 capability 绝不扩大领取范围。 */

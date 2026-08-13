@@ -9,6 +9,7 @@ import {
   dbRestore,
   pmReview,
   previewPlanSupersede,
+  resolutionDecision,
   setSqliteStore,
   supersedePlan,
   supersedeTask,
@@ -118,6 +119,153 @@ afterAll(async () => {
 });
 
 describe('历史 done + pending review 安全 supersede', () => {
+  it.each([
+    ['pmReview', (taskId: string) => pmReview(redis, taskId, { verdict: 'accept', reviewed_by: 'pm-cleanup' })],
+    ['taskReset', (taskId: string) => taskReset(redis, taskId, { force: true, reset_by: 'pm-cleanup' })],
+    ['supersedeTask', (taskId: string) => supersedeTask(redis, taskId, {
+      reason: 'cleanup fault', superseded_by: 'pm-cleanup', confirmed: true,
+    })],
+    ['resolutionDecision', (taskId: string) => resolutionDecision(redis, taskId, {
+      action: 'cancel', decided_by: 'pm-cleanup',
+    })],
+  ])('%s 的 cleanup 失败不覆盖原业务错误返回', async (_name, invoke) => {
+    const taskId = `missing-cleanup-${_name}`;
+    if (_name === 'resolutionDecision') await seedTask(taskId);
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let cleanupFailed = false;
+    const originalConsoleError = console.error;
+    console.error = () => undefined;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!cleanupFailed && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('release-pm-review-lock-v1')) {
+        cleanupFailed = true;
+        return Promise.reject(new Error(`simulated ${_name} cleanup failure`));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      await expect(invoke(taskId)).resolves.toMatchObject({
+        ok: false,
+        error: { code: _name === 'resolutionDecision' ? 'RESOLUTION_DECISION_NOT_PENDING' : 'TASK_NOT_FOUND' },
+      });
+      expect(cleanupFailed).toBe(true);
+    } finally {
+      client.sendCommand = original;
+      console.error = originalConsoleError;
+      await redis.del(keys.string.pmReviewLock(taskId));
+    }
+  });
+
+  it('单任务业务异常与 cleanup 同时失败时保留原异常', async () => {
+    const taskId = 'single-primary-cleanup-failure';
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const originalCommand = client.sendCommand;
+    const originalHgetall = redis.hgetall.bind(redis);
+    const originalConsoleError = console.error;
+    let cleanupFailed = false;
+    console.error = () => undefined;
+    redis.hgetall = (async (key: string) => {
+      if (key === keys.hash.task(taskId)) throw new Error('simulated single primary failure');
+      return originalHgetall(key);
+    }) as typeof redis.hgetall;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!cleanupFailed && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('release-pm-review-lock-v1')) {
+        cleanupFailed = true;
+        return Promise.reject(new Error('simulated single cleanup failure'));
+      }
+      return originalCommand.call(this, command, ...args);
+    };
+    try {
+      await expect(taskReset(redis, taskId, { force: true, reset_by: 'pm-cleanup' }))
+        .rejects.toThrow('simulated single primary failure');
+      expect(cleanupFailed).toBe(true);
+    } finally {
+      redis.hgetall = originalHgetall as typeof redis.hgetall;
+      client.sendCommand = originalCommand;
+      console.error = originalConsoleError;
+      await redis.del(keys.string.pmReviewLock(taskId));
+    }
+  });
+
+  it('单任务业务成功但 cleanup 失败时明确暴露 cleanup 故障', async () => {
+    const taskId = 'single-success-cleanup-failure';
+    await seedTask(taskId);
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let cleanupFailed = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!cleanupFailed && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('release-pm-review-lock-v1')) {
+        cleanupFailed = true;
+        return Promise.reject(new Error('simulated successful cleanup failure'));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      await expect(taskReset(redis, taskId, { reset_by: 'pm-cleanup' }))
+        .rejects.toThrow('PM decision lock cleanup failed');
+      expect(cleanupFailed).toBe(true);
+      expect(await redis.hget(keys.hash.task(taskId), 'status')).toBe('pending');
+    } finally {
+      client.sendCommand = original;
+      await redis.del(keys.string.pmReviewLock(taskId));
+    }
+  });
+
+  it('锁过期后旧 supersede 不能覆盖后来已提交的 PM review', async () => {
+    const taskId = 'supersede-expired-lock-race';
+    await seedTask(taskId);
+    await markDonePendingReview(taskId, 91_000);
+    const contender = redis.duplicate();
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let held = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!held && command?.name?.toLowerCase() === 'eval' && script.includes('commit-supersede-round-fenced-v1')) {
+        held = true;
+        entered();
+        return releasePromise.then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      const staleSupersede = supersedeTask(redis, taskId, {
+        reason: '旧请求不应覆盖新验收', superseded_by: 'pm-old', confirmed: true,
+      });
+      await enteredPromise;
+      await contender.pexpire(keys.string.pmReviewLock(taskId), 5);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      const newReview = await pmReview(contender, taskId, {
+        verdict: 'reject', reviewed_by: 'pm-new', reject_reason: '新 PM 已判定需修复', fix_instructions: '补齐有效产物',
+      });
+      expect(newReview).toMatchObject({
+        ok: true, data: { review_status: 'rejected' },
+      });
+      release();
+      expect(await staleSupersede).toMatchObject({
+        ok: false, error: { code: 'TASK_SUPERSEDE_ROUND_CHANGED' },
+      });
+      expect(await contender.hgetall(keys.hash.task(taskId))).toMatchObject({
+        status: 'done', pm_review_status: 'rejected', pm_reviewed_by: 'pm-new',
+      });
+      expect(await contender.zscore(keys.zset.status.superseded, taskId)).toBeNull();
+    } finally {
+      client.sendCommand = original;
+      release?.();
+      contender.disconnect();
+    }
+  });
+
   it('HTTP 边界拒绝缺少确认或额外字段，并暴露 task/plan 显式路由', async () => {
     await seedTask('http-legacy');
     await markDonePendingReview('http-legacy');
@@ -296,6 +444,194 @@ describe('历史 done + pending review 安全 supersede', () => {
 });
 
 describe('Plan supersede 预览令牌与依赖安全', () => {
+  it('首个 release 失败也停止全部续租并释放其余 owner-token 锁', async () => {
+    const previousTtl = process.env.BIAO_TEST_PM_DECISION_LOCK_TTL_MS;
+    process.env.BIAO_TEST_PM_DECISION_LOCK_TTL_MS = '90';
+    await seedTask('cleanup-lock-a');
+    await seedTask('cleanup-lock-b');
+    await markDonePendingReview('cleanup-lock-a', 71_000);
+    await markDonePendingReview('cleanup-lock-b', 72_000);
+    const preview = await previewPlanSupersede(redis, 'legacy-plan');
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let failedFirstRelease = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      const lockKey = String(command?.args?.[2] ?? '');
+      if (!failedFirstRelease && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('release-pm-review-lock-v1') && lockKey === keys.string.pmReviewLock('cleanup-lock-a')) {
+        failedFirstRelease = true;
+        return Promise.reject(new Error('simulated first owner-token release failure'));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      await expect(supersedePlan(redis, 'legacy-plan', {
+        reason: 'cleanup failure injection',
+        superseded_by: 'pm-cleanup',
+        confirmed: true,
+        preview_token: preview.data!.preview_token,
+      })).rejects.toThrow('PM decision lock cleanup failed');
+
+      expect(failedFirstRelease).toBe(true);
+      // 后续 task 与 plan release 即使首个 EVAL 失败也必须执行。
+      expect(await redis.get(keys.string.pmReviewLock('cleanup-lock-b'))).toBeNull();
+      expect(await redis.get(keys.string.planSupersedeLock('legacy-plan'))).toBeNull();
+
+      // 首个 owner-token 暂时残留，但所有 renewal 已先停止；缩短其剩余 TTL 后不会被
+      // timer 再次续上，新 owner 可以正常接管。
+      expect(await redis.pexpire(keys.string.pmReviewLock('cleanup-lock-a'), 30)).toBe(1);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(await redis.get(keys.string.pmReviewLock('cleanup-lock-a'))).toBeNull();
+      expect(await redis.set(keys.string.pmReviewLock('cleanup-lock-a'), 'new-owner', 'PX', 90, 'NX')).toBe('OK');
+    } finally {
+      client.sendCommand = original;
+      if (previousTtl === undefined) delete process.env.BIAO_TEST_PM_DECISION_LOCK_TTL_MS;
+      else process.env.BIAO_TEST_PM_DECISION_LOCK_TTL_MS = previousTtl;
+      await redis.del(
+        keys.string.pmReviewLock('cleanup-lock-a'),
+        keys.string.pmReviewLock('cleanup-lock-b'),
+        keys.string.planSupersedeLock('legacy-plan'),
+      );
+    }
+  });
+
+  it('cleanup 同时失败时不覆盖原业务异常，并仍释放其它锁', async () => {
+    await seedTask('cleanup-primary-a');
+    await seedTask('cleanup-primary-b');
+    await markDonePendingReview('cleanup-primary-a', 73_000);
+    await markDonePendingReview('cleanup-primary-b', 74_000);
+    const preview = await previewPlanSupersede(redis, 'legacy-plan');
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let failedBusiness = false;
+    let failedCleanup = false;
+    const originalConsoleError = console.error;
+    console.error = () => undefined;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      const lockKey = String(command?.args?.[2] ?? '');
+      if (!failedBusiness && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('commit-supersede-round-fenced-v1')) {
+        failedBusiness = true;
+        return Promise.reject(new Error('simulated primary supersede failure'));
+      }
+      if (!failedCleanup && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('release-pm-review-lock-v1') && lockKey === keys.string.pmReviewLock('cleanup-primary-a')) {
+        failedCleanup = true;
+        return Promise.reject(new Error('simulated secondary cleanup failure'));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      await expect(supersedePlan(redis, 'legacy-plan', {
+        reason: 'primary failure injection',
+        superseded_by: 'pm-cleanup',
+        confirmed: true,
+        preview_token: preview.data!.preview_token,
+      })).rejects.toThrow('simulated primary supersede failure');
+      expect(failedBusiness).toBe(true);
+      expect(failedCleanup).toBe(true);
+      expect(await redis.get(keys.string.pmReviewLock('cleanup-primary-b'))).toBeNull();
+      expect(await redis.get(keys.string.planSupersedeLock('legacy-plan'))).toBeNull();
+    } finally {
+      client.sendCommand = original;
+      console.error = originalConsoleError;
+      await redis.del(
+        keys.string.pmReviewLock('cleanup-primary-a'),
+        keys.string.pmReviewLock('cleanup-primary-b'),
+        keys.string.planSupersedeLock('legacy-plan'),
+      );
+    }
+  });
+
+  it('最终提交复核 preview revision，拒绝重算后才出现的新依赖者', async () => {
+    await seedTask('preview-race-source');
+    await markDonePendingReview('preview-race-source', 99_000);
+    const preview = await previewPlanSupersede(redis, 'legacy-plan');
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let held = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!held && command?.name?.toLowerCase() === 'eval' && script.includes('commit-supersede-round-fenced-v1')) {
+        held = true;
+        entered();
+        return releasePromise.then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      const staleBatch = supersedePlan(redis, 'legacy-plan', {
+        reason: '旧 preview', superseded_by: 'pm-old', confirmed: true,
+        preview_token: preview.data!.preview_token,
+      });
+      await enteredPromise;
+      await seedTask('late-dependent', { depends_on: ['preview-race-source'] });
+      release();
+      expect(await staleBatch).toMatchObject({ ok: false, error: { code: 'PLAN_SUPERSEDE_PREVIEW_STALE' } });
+      expect(await redis.hget(keys.hash.task('preview-race-source'), 'status')).toBe('done');
+      expect(await redis.hget(keys.hash.task('late-dependent'), 'status')).toBe('pending');
+    } finally {
+      client.sendCommand = original;
+      release?.();
+    }
+  });
+
+  it('批量提交中任一候选锁过期时整批失败，不用旧快照覆盖新 review', async () => {
+    await seedTask('batch-race-a');
+    await seedTask('batch-race-b');
+    await markDonePendingReview('batch-race-a', 101_000);
+    await markDonePendingReview('batch-race-b', 102_000);
+    const preview = await previewPlanSupersede(redis, 'legacy-plan');
+    const contender = redis.duplicate();
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let held = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!held && command?.name?.toLowerCase() === 'eval' && script.includes('commit-supersede-round-fenced-v1')) {
+        held = true;
+        entered();
+        return releasePromise.then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      const staleBatch = supersedePlan(redis, 'legacy-plan', {
+        reason: '旧批次', superseded_by: 'pm-old', confirmed: true,
+        preview_token: preview.data!.preview_token,
+      });
+      await enteredPromise;
+      await contender.pexpire(keys.string.pmReviewLock('batch-race-a'), 5);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      const newReview = await pmReview(contender, 'batch-race-a', {
+        verdict: 'reject', reviewed_by: 'pm-new', reject_reason: '新 PM 已判定需修复', fix_instructions: '补齐有效产物',
+      });
+      expect(newReview.ok).toBe(true);
+      release();
+      expect(await staleBatch).toMatchObject({ ok: false, error: { code: 'PLAN_SUPERSEDE_PREVIEW_STALE' } });
+      expect(await contender.hgetall(keys.hash.task('batch-race-a'))).toMatchObject({
+        status: 'done', pm_review_status: 'rejected',
+      });
+      expect(await contender.hget(keys.hash.task('batch-race-b'), 'status')).toBe('done');
+      expect(await contender.zscore(keys.zset.status.superseded, 'batch-race-a')).toBeNull();
+      expect(await contender.zscore(keys.zset.status.superseded, 'batch-race-b')).toBeNull();
+    } finally {
+      client.sendCommand = original;
+      release?.();
+      contender.disconnect();
+    }
+  });
+
   it('只对预览快照中的待验收任务批量终止，保留已验收任务并让 plan 明确 cancelled', async () => {
     await seedTask('legacy-a');
     await seedTask('legacy-b', { depends_on: ['legacy-a'] });

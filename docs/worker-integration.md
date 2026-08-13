@@ -68,6 +68,7 @@ register
   → 运行任务 + renew lease
   → 写结果 + 逐项 verify
   → report(done | failed, verify_results)
+  → 正常退出时 agent/offline
 ```
 
 ### 1. 注册与领取
@@ -80,18 +81,24 @@ curl -X POST http://127.0.0.1:7331/register \
   -H 'Content-Type: application/json' \
   -d '{"agent_id":"remote-impl-1","agent_type":"custom","capabilities":["code","acceptance"]}'
 
+# 保存 register 响应中的 data.registration_id；下面所有生命周期请求必须复用它。
+# 推荐 Worker 在一次进程生命周期开始时自己生成 128 bit 随机 registration_id 并随 register 提交，
+# 这样网络重试仍是同一代会话；不要在日志或不同 Worker 之间复用。
+
 curl -X POST http://127.0.0.1:7331/claim \
   -H "Authorization: Bearer $BIAO_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "agent_id":"remote-impl-1",
+    "registration_id":"<registration_id returned by register>",
+    "claim_request_id":"<new random id for this claim call; reuse only for transport retry>",
     "blocking":false,
     "preferred_types":["code"],
     "preferred_project":"/path/to/workspace/my-project"
   }'
 ```
 
-成功响应中的 `task_id`、`claim_token`、`project_path`、`ownership_files`、`verify`、`timeout_seconds` 是本次 claim 的事实来源。不要复用旧 token；同一个 `agent_id` 同时只能持有一个 `running` 任务。
+注册响应中的 `registration_id` 是该 Agent 进程的会话代次，不是任务凭据；`heartbeat`、`claim` 和 `agent/offline` 都必须携带它。每次业务 claim 还要新建一个高熵 `claim_request_id`；同一次 claim 的网络重试必须复用它，新的领取调用必须换新 ID。这样平台在“已领取、响应丢失”时会重放原任务与原 token，不会把 Worker 卡到 lease 过期。新进程用新的代次重新注册后，旧进程的心跳、领取和离线请求会被拒绝，不能覆盖同名新会话。领取成功响应中的 `task_id`、`claim_token`、`project_path`、`ownership_files`、`verify`、`timeout_seconds` 是本次 claim 的事实来源。不要复用旧 token；同一个 `agent_id` 同时只能持有一个 `running` 任务。
 
 ### 2. ownership：先检查，再写入
 
@@ -183,3 +190,16 @@ curl -X POST http://127.0.0.1:7331/report \
 - acceptance 不能由执行被验收任务的同一 `agent_id` 完成。
 
 `done` 只是把产物交给 PM Review，不是项目完成。失败或被拒绝后的下一步由 repair 闭环处理，见 [无人盯盘的闭环](autonomous-closure.md)。
+
+### 6. 正常退出时显式离线
+
+内置 Worker 和共享 Supervisor 会在正常退出、停止信号或所有受管 Plan 终结时自动调用离线接口。自定义 HTTP Worker 若不再保持心跳，也应完成同样的生命周期收口：
+
+```bash
+curl -X POST http://127.0.0.1:7331/agent/offline \
+  -H "Authorization: Bearer $BIAO_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id":"remote-impl-1","registration_id":"<registration_id returned by register>","reason":"worker_exit"}'
+```
+
+允许的 reason 为 `worker_exit`、`worker_signal`、`plans_terminal`、`supervisor_signal`、`supervisor_exit`。该调用幂等，会标记离线并把最后任务、离线原因和时间保留为历史审计；任务已终结时清除 `current_task`，任务仍为 `running` 时则保留该指针并停止续租，确保 `/status` 与 watchdog 能在 lease 到期前后持续看到并安全回收它。接口不会删除注册记录、任务、报告或 Review。进程异常崩溃来不及调用时，平台才以心跳超时和 watchdog 兜底。

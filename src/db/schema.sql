@@ -42,10 +42,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   pm_reviewed_by    TEXT,
   pm_reviewed_at    TEXT,
   pm_review_comment TEXT,
+  -- accepted 后 dependency/repair 副作用已完成；灾难恢复时防止重复重放。
+  pm_accept_effects_applied TEXT,
   pm_reject_reason TEXT,
   pm_fix_instructions TEXT,
   pm_rejection_resolution_mode TEXT,
   repair_ownership_extension TEXT,
+  pm_repair_ownership_required TEXT,
+  pm_repair_ownership_intent TEXT,
   failure_reason TEXT,
   fix_for TEXT,
   repair_root_task_id TEXT,
@@ -103,3 +107,22 @@ CREATE TABLE IF NOT EXISTS questions (
 
 CREATE INDEX IF NOT EXISTS idx_questions_task ON questions(task_id);
 CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
+
+-- Agent 代次是 fencing 的耐久真相。每个 agent_id 的 generation 单调递增；
+-- 历史行不删除，使 Redis 灾备后的旧 register 重试仍然只能被拒绝。
+CREATE TABLE IF NOT EXISTS agent_registrations (
+  agent_id            TEXT NOT NULL,
+  registration_id     TEXT NOT NULL,
+  generation          INTEGER NOT NULL,
+  registration_source TEXT NOT NULL,
+  agent_type          TEXT,
+  capabilities        TEXT,
+  endpoint            TEXT,
+  projects            TEXT,
+  registered_at       TEXT,
+  PRIMARY KEY (agent_id, registration_id),
+  UNIQUE (agent_id, generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_registrations_current
+  ON agent_registrations(agent_id, generation DESC);

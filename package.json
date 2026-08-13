@@ -29,10 +29,12 @@
     "scripts/install.sh",
     "docs",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "bin": {
     "biao": "bin/biao.js",
+    "biao-bootstrap": "bin/biao-bootstrap.js",
     "biao-worker": "bin/biao-worker.js",
     "cli-worker": "bin/cli-worker.js",
     "codex-worker": "bin/codex-worker.js",

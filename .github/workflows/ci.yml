@@ -32,6 +32,10 @@ jobs:
       RESTORE_DOORBELL_TEST_REDIS_URL: redis://127.0.0.1:6379/7
       RESTORE_MAINTENANCE_TEST_REDIS_URL: redis://127.0.0.1:6379/8
       SUPERSEDE_TEST_REDIS_URL: redis://127.0.0.1:6379/9
+      RUNTIME_RECONCILE_TEST_REDIS_URL: redis://127.0.0.1:6379/10
+      STATUS_PROJECTION_TEST_REDIS_URL: redis://127.0.0.1:6379/11
+      AGENT_EPOCH_TEST_REDIS_URL: redis://127.0.0.1:6379/12
+      BLOCKING_CLAIM_TEST_REDIS_URL: redis://127.0.0.1:6379/15
 
     steps:
       - name: Checkout
@@ -71,3 +75,46 @@ jobs:
 
       - name: Smoke-test installed package
         run: bash .github/scripts/package-smoke.sh
+
+  node22:
+    name: Node 22.12 portable server and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Install web dependencies
+        run: npm --prefix web ci
+
+      - name: Test server without Redis integration suites
+        run: >-
+          npx vitest run
+          tests/bootstrap.test.ts
+          tests/system-bootstrap.test.ts
+          tests/package-contents.test.ts
+          tests/release-readiness.test.ts
+          tests/worker.test.ts
+          tests/worker-signal-propagation.test.ts
+          tests/supervisor-runtime.test.ts
+
+      - name: Test web console
+        run: npm run test:web
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify package contents
+        run: npm run verify:package

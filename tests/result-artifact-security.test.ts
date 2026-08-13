@@ -148,24 +148,55 @@ describe('task result artifact boundary', () => {
       result_path: artifacts.resultPath,
       result_json_path: artifacts.resultJsonPath,
     })).ok).toBe(true);
+    const beforeSwap = await redis.hgetall(keys.hash.task('task-swap'));
+    expect(beforeSwap).toMatchObject({
+      status: 'done',
+      result_path: artifacts.resultPath,
+      result_json_path: artifacts.resultJsonPath,
+      // Redis 内部以空串表示当前 delivery round 尚未 PM review；claim/report 会显式
+      // 清空旧轮次审计，读取 API 再把空串归一为 undefined。
+      pm_review_status: '',
+      pm_reviewed_by: '',
+      pm_reviewed_at: '',
+      pm_review_comment: '',
+    });
 
     const secret = join(PROJECT_PATH, 'post-report-secret.md');
     writeFileSync(secret, 'DO NOT EXPOSE');
     unlinkSync(artifacts.resultPath);
     symlinkSync(secret, artifacts.resultPath);
 
-    expect(await getReviewInfo(redis, 'task-swap')).toMatchObject({
+    const reviewInfo = await getReviewInfo(redis, 'task-swap');
+    expect(reviewInfo).toMatchObject({
       ok: false,
       error: { code: 'RESULT_ARTIFACT_INVALID' },
     });
-    expect(await pmReview(redis, 'task-swap', {
+    expect(JSON.stringify(reviewInfo)).not.toContain('DO NOT EXPOSE');
+    const accept = await pmReview(redis, 'task-swap', {
       verdict: 'accept',
       reviewed_by: 'pm-artifact',
-    })).toMatchObject({
+    });
+    expect(accept).toMatchObject({
       ok: false,
       error: { code: 'RESULT_ARTIFACT_INVALID' },
     });
-    expect(await redis.hget(keys.hash.task('task-swap'), 'pm_review_status')).toBeNull();
+    expect(JSON.stringify(accept)).not.toContain('DO NOT EXPOSE');
+
+    // fail-closed 不能把无效产物误记为 accepted/rejected，也不能删除原 report 的
+    // 待验收事实。完整 review round 与结果路径保持原样，PM 可在产物修复后重新验收。
+    const afterRejectedRead = await redis.hgetall(keys.hash.task('task-swap'));
+    expect(afterRejectedRead).toMatchObject({
+      status: beforeSwap.status,
+      done_at: beforeSwap.done_at,
+      result_path: beforeSwap.result_path,
+      result_json_path: beforeSwap.result_json_path,
+      pm_review_status: beforeSwap.pm_review_status,
+      pm_reviewed_by: beforeSwap.pm_reviewed_by,
+      pm_reviewed_at: beforeSwap.pm_reviewed_at,
+      pm_review_comment: beforeSwap.pm_review_comment,
+      pm_accept_effects_applied: beforeSwap.pm_accept_effects_applied,
+    });
+    expect(await redis.zscore(keys.reviewRequested.pending, 'task-swap')).not.toBeNull();
   });
 
   it('恶意 task_id 不能把预期结果根移出 work 单层目录', () => {

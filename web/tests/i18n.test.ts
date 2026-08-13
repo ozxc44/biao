@@ -130,6 +130,10 @@ describe('status labels', () => {
   it('translates board group keys', () => {
     expect(getGroupLabel('review_pending', zh)).toBe('待验收');
     expect(getGroupLabel('review_pending', en)).toBe('Review pending');
+    expect(getGroupLabel('rejected', zh)).toBe('已拒绝（审计）');
+    expect(getGroupLabel('rejected', en)).toBe('Rejected (audit)');
+    expect(getGroupLabel('failed', zh)).toBe('执行失败（审计）');
+    expect(getGroupLabel('failed', en)).toBe('Failed (audit)');
   });
 
   it('translates by locale helper', () => {

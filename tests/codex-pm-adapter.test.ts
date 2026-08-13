@@ -1,6 +1,6 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -26,6 +26,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
   argv: process.argv.slice(2),
   stdin: readFileSync(0, 'utf8'),
+  cwd: process.cwd(),
   apiToken: process.env.BIAO_API_TOKEN ?? null,
   redisUrl: process.env.BIAO_REDIS_URL ?? null,
 }), 'utf8');
@@ -33,6 +34,21 @@ process.exit(${exitCode});
 `, { mode: 0o755 });
   chmodSync(bin, 0o755);
   return { bin, capture };
+}
+
+function fakeRuntime(dir: string, name = 'runtime'): string {
+  const runtimeDir = join(dir, name);
+  mkdirSync(runtimeDir);
+  for (const launcher of ['pm-start', 'pm']) {
+    const path = join(runtimeDir, launcher);
+    writeFileSync(path, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(path, 0o755);
+  }
+  return runtimeDir;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
 
 function run(input: string, env: NodeJS.ProcessEnv = {}) {
@@ -52,6 +68,7 @@ function run(input: string, env: NodeJS.ProcessEnv = {}) {
 describe('Codex PM Agent adapter', () => {
   it('把最小门铃转换为可执行 PM 契约，并用临时 Codex 会话处理', () => {
     const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
     const { bin, capture } = fakeCodex(dir);
     const result = run(`${JSON.stringify({
       biaoUrl: 'http://127.0.0.1:7331',
@@ -61,7 +78,9 @@ describe('Codex PM Agent adapter', () => {
       count: 2,
     })}\n`, {
       BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
       BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
     });
 
     expect(result.status).toBe(0);
@@ -81,9 +100,12 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.argv).toContain('sandbox_workspace_write.network_access=true');
     expect(invoked.argv).toContain('model_reasoning_effort="high"');
     expect(invoked.argv).toContain('--add-dir');
-    expect(invoked.argv).toContain(dir);
+    expect(invoked.argv).toContain(realpathSync(dir));
     expect(invoked.stdin).toContain('plan-one');
-    expect(invoked.stdin).toContain('.biao/pm-start --once');
+    const canonicalRuntime = realpathSync(runtimeDir);
+    const pmStartLauncher = shellQuote(join(canonicalRuntime, 'pm-start'));
+    const pmLauncher = shellQuote(join(canonicalRuntime, 'pm'));
+    expect(invoked.stdin).toContain(`${pmStartLauncher} --once`);
     expect(invoked.stdin).toContain('question list');
     expect(invoked.stdin).toContain("question list --consumer 'pm-a' --status open --plan 'plan-one'");
     expect(invoked.stdin).toContain("question get <question_id> --consumer 'pm-a' --plan 'plan-one'");
@@ -92,13 +114,13 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain("pm ack --consumer 'pm-a' --plan 'plan-one' --event-id <asked_event_id>");
     expect(invoked.stdin).toContain('question answer');
     expect(invoked.stdin).toContain('review');
-    expect(invoked.stdin).toContain('.biao/pm task resolution <task_id>');
+    expect(invoked.stdin).toContain(`${pmLauncher} task resolution <task_id>`);
     expect(invoked.stdin).toContain('--action continue');
     expect(invoked.stdin).toContain('--action cancel');
     expect(invoked.stdin).toContain('只有 continue/cancel 成功后才 ack');
-    expect(invoked.stdin).toContain('.biao/pm task get <task_id>');
-    expect(invoked.stdin).toContain('.biao/pm task resume <task_id>');
-    expect(invoked.stdin).toContain('.biao/pm watchdog --auto-fix');
+    expect(invoked.stdin).toContain(`${pmLauncher} task get <task_id>`);
+    expect(invoked.stdin).toContain(`${pmLauncher} task resume <task_id>`);
+    expect(invoked.stdin).toContain(`${pmLauncher} watchdog --auto-fix`);
     expect(invoked.stdin).toContain('waiting_dependency / waiting_file_release');
     expect(invoked.stdin).toContain('条件已经消失');
     expect(invoked.stdin).toContain('真正无法自治');
@@ -111,6 +133,70 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain('不得改用浏览器');
     expect(invoked.apiToken).toBeNull();
     expect(invoked.redisUrl).toBeNull();
+  });
+
+  it('从外置 runtime 启动，并在提示中只使用该 runtime 的绝对 launcher', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir, "runtime state with ' quote");
+    const { bin, capture } = fakeCodex(dir);
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as {
+      argv: string[];
+      stdin: string;
+      cwd: string;
+    };
+    const canonicalRuntime = realpathSync(runtimeDir);
+    expect(invoked.argv[invoked.argv.indexOf('-C') + 1]).toBe(canonicalRuntime);
+    expect(invoked.cwd).toBe(canonicalRuntime);
+    expect(invoked.stdin).toContain(`${shellQuote(join(canonicalRuntime, 'pm-start'))} --once`);
+    expect(invoked.stdin).toContain(`${shellQuote(join(canonicalRuntime, 'pm'))} pm intake`);
+    expect(invoked.stdin).not.toContain('.biao/pm-start');
+    expect(invoked.stdin).not.toContain('.biao/pm ');
+  });
+
+  it('固定符号链接祖先解析后的 canonical runtime 路径', () => {
+    const dir = tempDir();
+    const realParent = join(dir, 'real-parent');
+    mkdirSync(realParent);
+    const realRuntime = fakeRuntime(realParent, 'runtime');
+    const linkedParent = join(dir, 'linked-parent');
+    symlinkSync(realParent, linkedParent);
+    const configuredRuntime = join(linkedParent, 'runtime');
+    const { bin, capture } = fakeCodex(dir);
+
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: configuredRuntime,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[]; stdin: string; cwd: string };
+    const canonical = realpathSync(realRuntime);
+    expect(invoked.cwd).toBe(canonical);
+    expect(invoked.argv[invoked.argv.indexOf('-C') + 1]).toBe(canonical);
+    expect(invoked.stdin).toContain(shellQuote(join(canonical, 'pm-start')));
+    expect(invoked.stdin).not.toContain(configuredRuntime);
   });
 
   it('拒绝畸形或扩权的唤醒载荷，不启动 Codex', () => {
@@ -130,8 +216,124 @@ describe('Codex PM Agent adapter', () => {
     expect(existsSync(capture)).toBe(false);
   });
 
+  it('拒绝 runtime 中的符号链接 launcher，不启动 Codex', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const { bin, capture } = fakeCodex(dir);
+    rmSync(join(runtimeDir, 'pm'));
+    symlinkSync(join(runtimeDir, 'pm-start'), join(runtimeDir, 'pm'));
+
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), { BIAO_CODEX_BIN: bin, BIAO_RUNTIME_DIR: runtimeDir });
+
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('runtime 配置无效');
+    expect(result.stderr).toContain('符号链接');
+    expect(existsSync(capture)).toBe(false);
+  });
+
+  it('把 project 与 workspace roots 固定后仅授予 canonical project', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const realWorkspace = join(dir, 'real-workspace');
+    const realProject = join(realWorkspace, 'project');
+    const linkedWorkspace = join(dir, 'linked-workspace');
+    const secondRoot = join(dir, 'second-root');
+    mkdirSync(realProject, { recursive: true });
+    mkdirSync(secondRoot);
+    symlinkSync(realWorkspace, linkedWorkspace);
+    const configuredProject = join(linkedWorkspace, 'project');
+    const { bin, capture } = fakeCodex(dir);
+
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: configuredProject,
+      BIAO_WORKSPACE_ROOTS: [linkedWorkspace, secondRoot].join(delimiter),
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[] };
+    expect(invoked.argv[invoked.argv.indexOf('--add-dir') + 1]).toBe(realpathSync(realProject));
+    expect(invoked.argv).not.toContain(configuredProject);
+    expect(invoked.argv).not.toContain(realpathSync(realWorkspace));
+  });
+
+  it('拒绝通过 project 最终符号链接逃出 canonical workspace roots', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const workspace = join(dir, 'workspace');
+    const outside = join(dir, 'outside');
+    const projectLink = join(workspace, 'project-link');
+    mkdirSync(workspace);
+    mkdirSync(outside);
+    symlinkSync(outside, projectLink);
+    const { bin, capture } = fakeCodex(dir);
+
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: projectLink,
+      BIAO_WORKSPACE_ROOTS: workspace,
+    });
+
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('workspace 配置无效');
+    expect(result.stderr).toContain('project 必须位于 workspace roots 内');
+    expect(existsSync(capture)).toBe(false);
+  });
+
+  it('拒绝通过 project 祖先符号链接逃出 canonical workspace roots', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const workspace = join(dir, 'workspace');
+    const outsideParent = join(dir, 'outside-parent');
+    const outsideProject = join(outsideParent, 'project');
+    const linkedParent = join(workspace, 'linked-parent');
+    mkdirSync(workspace);
+    mkdirSync(outsideProject, { recursive: true });
+    symlinkSync(outsideParent, linkedParent);
+    const { bin, capture } = fakeCodex(dir);
+
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: join(linkedParent, 'project'),
+      BIAO_WORKSPACE_ROOTS: workspace,
+    });
+
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('workspace 配置无效');
+    expect(result.stderr).toContain('project 必须位于 workspace roots 内');
+    expect(existsSync(capture)).toBe(false);
+  });
+
   it('把门铃 Plan 范围传给 PM 启动，并逐 Plan 读取 intake，避免混入其它计划', () => {
     const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
     const { bin, capture } = fakeCodex(dir);
     const result = run(JSON.stringify({
       biaoUrl: 'http://127.0.0.1:7331',
@@ -139,13 +341,21 @@ describe('Codex PM Agent adapter', () => {
       planIds: ['plan-one', 'plan-two'],
       kinds: { review_requested: 2 },
       count: 2,
-    }), { BIAO_CODEX_BIN: bin });
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+    });
 
     expect(result.status).toBe(0);
     const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { stdin: string };
-    expect(invoked.stdin).toContain(".biao/pm-start --once --consumer 'pm-a' --plans 'plan-one,plan-two'");
-    expect(invoked.stdin).toContain(".biao/pm pm intake --consumer 'pm-a' --plan 'plan-one'");
-    expect(invoked.stdin).toContain(".biao/pm pm intake --consumer 'pm-a' --plan 'plan-two'");
+    const canonicalRuntime = realpathSync(runtimeDir);
+    const pmStartLauncher = shellQuote(join(canonicalRuntime, 'pm-start'));
+    const pmLauncher = shellQuote(join(canonicalRuntime, 'pm'));
+    expect(invoked.stdin).toContain(`${pmStartLauncher} --once --consumer 'pm-a' --plans 'plan-one,plan-two'`);
+    expect(invoked.stdin).toContain(`${pmLauncher} pm intake --consumer 'pm-a' --plan 'plan-one'`);
+    expect(invoked.stdin).toContain(`${pmLauncher} pm intake --consumer 'pm-a' --plan 'plan-two'`);
     expect(invoked.stdin).toContain("question list --consumer 'pm-a' --status open --plan 'plan-two'");
     expect(invoked.stdin).toContain("pm unacked --consumer 'pm-a' --plan 'plan-two' --type question_asked --json");
     expect(invoked.stdin).not.toContain('.biao/pm pm intake --consumer pm-a` 主动读取详情');
@@ -153,6 +363,7 @@ describe('Codex PM Agent adapter', () => {
 
   it('Codex 执行失败时原样返回非零，交给共享 Supervisor 下轮重试', () => {
     const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
     const { bin } = fakeCodex(dir, 7);
     const result = run(JSON.stringify({
       biaoUrl: 'http://127.0.0.1:7331',
@@ -160,7 +371,12 @@ describe('Codex PM Agent adapter', () => {
       planIds: ['plan-one'],
       kinds: { review_requested: 1 },
       count: 1,
-    }), { BIAO_CODEX_BIN: bin });
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+    });
 
     expect(result.status).toBe(7);
     expect(result.stderr).toContain('Codex PM Agent 未完成');

@@ -41,10 +41,12 @@ export function resolveServerConfig(
   const args = parseArgs(argv);
   const apiToken = nonEmpty(overrides.apiToken) ?? nonEmpty(env.BIAO_API_TOKEN);
   const dataDir = nonEmpty(env.BIAO_DATA_DIR);
+  const explicitSqlitePath = overrides.sqlitePath ?? nonEmpty(env.BIAO_SQLITE_PATH) ?? (dataDir ? join(dataDir, 'biao.sqlite') : undefined);
+  if ((env.NODE_ENV === 'test' || env.VITEST === 'true' || nonEmpty(env.VITEST_WORKER_ID)) && !explicitSqlitePath) {
+    throw new Error('BIAO_SQLITE_PATH 在 test runtime 中必须显式指向隔离数据库，拒绝回落到生产 SQLite');
+  }
   const sqlitePath = resolve(
-    overrides.sqlitePath ??
-      nonEmpty(env.BIAO_SQLITE_PATH) ??
-      (dataDir ? join(dataDir, 'biao.sqlite') : join(biaoPkgDir, 'data', 'biao.sqlite')),
+    explicitSqlitePath ?? join(biaoPkgDir, 'data', 'biao.sqlite'),
   );
 
   return {
@@ -98,7 +100,12 @@ export async function startServer(overrides: Partial<BiaoConfig> = {}): Promise<
   }
 
   // SQLite 持久化：初始化 store + 注入 service 层 + Redis 空时自动恢复
-  const store = new SqliteStore(config.sqlitePath);
+  const store = new SqliteStore(config.sqlitePath, {
+    restoreWorkspaceRoots: config.workspaceRoots,
+    // 默认 loopback 安装未配置 roots 时仍恢复真实项目，只把 OS 临时项目留作审计。
+    // 如果操作者确实把项目放在临时根，可显式把该目录加入 BIAO_WORKSPACE_ROOTS。
+    excludeSystemTemporaryProjects: true,
+  });
   setSqliteStore(store);
   console.log(`[biao] SQLite 持久化已启用：${config.sqlitePath}（${store.getTaskCount()} 个 task 已存档）`);
 
@@ -106,8 +113,8 @@ export async function startServer(overrides: Partial<BiaoConfig> = {}): Promise<
   try {
     const namespaceEmpty = await isBiaoNamespaceEmpty(redis);
     const sqliteCount = store.getTaskCount();
-    if (namespaceEmpty && sqliteCount > 0) {
-      console.log(`[biao] ⚠ Redis 为空但 SQLite 有 ${sqliteCount} 条数据，自动恢复...`);
+    if (namespaceEmpty && store.hasDurableState()) {
+      console.log(`[biao] ⚠ Redis 为空但 SQLite 有耐久状态（${sqliteCount} 个 task），自动恢复...`);
       const r = await dbRestore(redis, store);
       console.log(`[biao] ✓ 恢复完成：${r.restored} 个 task`, JSON.stringify(r.byStatus));
     }

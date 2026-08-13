@@ -48,7 +48,7 @@ export function createKimiWorkerConfig(overrides: KimiWorkerOptions = {}): Worke
     preclaimedTask: overrides.preclaimedTask,
     skipRegistration: overrides.skipRegistration,
     heartbeatWhenIdle: overrides.heartbeatWhenIdle,
-    async execute(task: ClaimedTask, projectPath: string) {
+    async execute(task: ClaimedTask, projectPath: string, signal?: AbortSignal) {
       const prompt = buildKimiPrompt(task, agentId);
       console.log(`[kimi-worker] 调用 kimi（model=${kimiModel}, cwd=${projectPath}）`);
       const run = await runAgentCli(
@@ -56,6 +56,9 @@ export function createKimiWorkerConfig(overrides: KimiWorkerOptions = {}): Worke
         ['-m', kimiModel, '-p', prompt, '--output-format', 'stream-json'],
         projectPath,
         task.timeout_seconds ?? 1800,
+        undefined,
+        undefined,
+        signal,
       );
       // 从 stream-json 输出解析改动文件 + 提取文本结果
       const { changedFiles, text } = parseKimiOutput(run.stdout);

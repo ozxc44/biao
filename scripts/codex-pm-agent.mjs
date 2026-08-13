@@ -4,11 +4,11 @@
  *
  * 由 scripts/pm-agent.mjs 按需启动；本脚本只把五字段门铃转换成明确的 PM 契约，
  * 再启动一次 ephemeral Codex。任务正文、结果、Question 正文和 Biao 凭据都不会从
- * 门铃透传，Codex 必须通过本地 .biao/pm 包装器自行回平台读取并实际处置。
+ * 门铃透传，Codex 必须通过当前 runtime 的绝对 launcher 自行回平台读取并实际处置。
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const MAX_WAKE_BYTES = 16 * 1024;
@@ -94,39 +94,95 @@ function safeAgentEnvironment() {
   return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
 }
 
-function existingAbsoluteDirectory(value) {
-  if (!value || !isAbsolute(value) || !existsSync(value)) return undefined;
-  try {
-    return statSync(value).isDirectory() ? value : undefined;
-  } catch {
-    return undefined;
+function isInside(root, candidate) {
+  const child = relative(root, candidate);
+  return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child));
+}
+
+function canonicalAbsoluteDirectory(rawValue, label) {
+  const value = rawValue?.trim();
+  if (!value || !isAbsolute(value)) {
+    throw new Error(`${label} 必须是已存在的绝对目录：${value ?? ''}`);
   }
+  try {
+    const canonical = realpathSync(resolve(value));
+    if (!lstatSync(canonical).isDirectory()) throw new Error('not-directory');
+    return canonical;
+  } catch {
+    throw new Error(`${label} 必须是已存在的绝对目录：${value}`);
+  }
+}
+
+function resolveCanonicalProject() {
+  const configuredRoots = process.env.BIAO_WORKSPACE_ROOTS?.split(delimiter)
+    .map((root) => root.trim())
+    .filter(Boolean) ?? [];
+  if (configuredRoots.length === 0) {
+    throw new Error('BIAO_WORKSPACE_ROOTS 必须至少包含一个绝对目录');
+  }
+  const roots = [...new Set(configuredRoots.map((root) => canonicalAbsoluteDirectory(root, 'workspace root')))];
+  const project = canonicalAbsoluteDirectory(process.env.BIAO_PREFERRED_PROJECT, 'project');
+  if (!roots.some((root) => isInside(root, project))) {
+    throw new Error(`project 必须位于 workspace roots 内：${project}`);
+  }
+  return project;
+}
+
+function resolveRuntimeDirectory(repoRoot) {
+  const configured = process.env.BIAO_RUNTIME_DIR?.trim();
+  const lexicalCandidate = resolve(configured || join(repoRoot, '.biao'));
+  if ((configured && !isAbsolute(configured)) || !existsSync(lexicalCandidate)) {
+    throw new Error(`BIAO_RUNTIME_DIR 必须是已存在的绝对目录：${configured || lexicalCandidate}`);
+  }
+  const metadata = lstatSync(lexicalCandidate);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`BIAO_RUNTIME_DIR 必须是真实目录且不能是符号链接：${lexicalCandidate}`);
+  }
+  // 固定所有祖先链接解析后的真实路径。后续 cwd/-C/launcher prompt 和校验都使用
+  // 同一 canonical 路径，避免祖先 symlink 在校验后改指造成 TOCTOU。
+  const candidate = realpathSync(lexicalCandidate);
+  for (const name of ['pm-start', 'pm']) {
+    const launcher = join(candidate, name);
+    let launcherMetadata;
+    try {
+      launcherMetadata = lstatSync(launcher);
+      accessSync(launcher, constants.X_OK);
+    } catch {
+      throw new Error(`Biao runtime 缺少可执行 launcher：${launcher}`);
+    }
+    if (launcherMetadata.isSymbolicLink() || !launcherMetadata.isFile()) {
+      throw new Error(`Biao runtime launcher 必须是普通可执行文件且不能是符号链接：${launcher}`);
+    }
+  }
+  return candidate;
 }
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
-function buildPrompt(wake) {
+function buildPrompt(wake, runtimeDir) {
   const plans = wake.planIds.length > 0 ? wake.planIds.join(', ') : '未预先限定（必须从 intake 确认范围）';
   const kinds = Object.entries(wake.kinds).map(([kind, count]) => `${kind}=${count}`).join(', ');
   const consumerArg = shellQuote(wake.consumer);
-  const pmStartCommand = `.biao/pm-start --once --consumer ${consumerArg}${wake.planIds.length > 0
+  const pmStartLauncher = shellQuote(join(runtimeDir, 'pm-start'));
+  const pmLauncher = shellQuote(join(runtimeDir, 'pm'));
+  const pmStartCommand = `${pmStartLauncher} --once --consumer ${consumerArg}${wake.planIds.length > 0
     ? ` --plans ${shellQuote(wake.planIds.join(','))}`
     : ''}`;
   const intakeCommands = wake.planIds.length > 0
-    ? wake.planIds.map((planId) => `.biao/pm pm intake --consumer ${consumerArg} --plan ${shellQuote(planId)}`)
-    : [`.biao/pm pm intake --consumer ${consumerArg}`];
+    ? wake.planIds.map((planId) => `${pmLauncher} pm intake --consumer ${consumerArg} --plan ${shellQuote(planId)}`)
+    : [`${pmLauncher} pm intake --consumer ${consumerArg}`];
   const intakeCommandList = intakeCommands.map((command) => `\`${command}\``).join('、');
   const questionScopes = wake.planIds.length > 0 ? wake.planIds : [undefined];
   const questionCommands = questionScopes.map((planId) => {
     const planArg = planId ? ` --plan ${shellQuote(planId)}` : '';
     return [
-      `.biao/pm question list --consumer ${consumerArg} --status open${planArg}`,
-      `.biao/pm question get <question_id> --consumer ${consumerArg}${planArg}`,
-      `.biao/pm question answer <question_id> --consumer ${consumerArg}${planArg} --answer <明确答复>`,
-      `.biao/pm pm unacked --consumer ${consumerArg}${planArg} --type question_asked --json`,
-      `.biao/pm pm ack --consumer ${consumerArg}${planArg} --event-id <asked_event_id>`,
+      `${pmLauncher} question list --consumer ${consumerArg} --status open${planArg}`,
+      `${pmLauncher} question get <question_id> --consumer ${consumerArg}${planArg}`,
+      `${pmLauncher} question answer <question_id> --consumer ${consumerArg}${planArg} --answer <明确答复>`,
+      `${pmLauncher} pm unacked --consumer ${consumerArg}${planArg} --type question_asked --json`,
+      `${pmLauncher} pm ack --consumer ${consumerArg}${planArg} --event-id <asked_event_id>`,
     ].map((command) => `\`${command}\``).join(' → ');
   }).join('；');
   return `你是 Biao 的一次性 PM/验收 Agent。平台只给了最小门铃，不代表事项已处理。
@@ -137,7 +193,7 @@ Plan 范围：${plans}
 门铃类型：${kinds}
 
 执行工具边界（强制）：
-- 这是本机 CLI 闭环，必须直接使用 shell/exec 运行下列 \`.biao/*\` 命令；这些入口已在当前仓库配置好认证。
+- 这是本机 CLI 闭环，必须直接使用 shell/exec 运行上述 runtime 绝对 launcher；这些入口已配置好认证。
 - 禁止使用 Computer Use、桌面 Terminal、ZCode UI 或任何浏览器来代替 CLI，也不得改用浏览器访问 Biao。
 - 不要读取或调用任何 skill、memory、MCP、Connector 或插件；本提示已包含完整操作契约，外部工具失败不能改写任务范围。
 - 若某条 CLI 命令失败，直接记录其 stderr/exit code 并让本次会话非零退出；不要绕行 UI，事件会保留供下轮重试。
@@ -147,12 +203,12 @@ Plan 范围：${plans}
 2. review/acceptance：读取 task、result、verify_results 和已有审查证据，执行足够的独立验证；通过才 accept，失败必须 reject 并写清可执行修复要求。done、退出码 0 或测试数量都不能替代 PM 验收。
 3. question_asked：严格按每个受管 Plan 分别执行 ${questionCommands}。get/answer 成功返回的 asked_event_id 是唯一可 ack 的对应门铃；不得省略 Plan 过滤或跨 Plan 批量处理。根据任务书、代码和计划作出明确答复。Worker 必须经平台取得答复并 fresh claim；不要向当前人类提问，也不要让 Worker 绕过平台问人。
 4. failed/blocked/stale/resolution：按状态执行，禁止 reset 绕过修复链或清门铃：
-   - 有 task_id 时先运行 \`.biao/pm task get <task_id>\` 读取当前真相。\`waiting_dependency / waiting_file_release\` 是平台与共享 Supervisor 的内部等待，正常不会打扰 PM；不得手工 resume 或 ack 催跑。\`waiting_pm_reply\` 必须走上面的 Question answer。
-   - 未知 blocked 只有在证据确认外部条件已经消失时才运行 \`.biao/pm task resume <task_id>\`，随后重读 task/intake；条件仍存在就保留门铃。
-   - stale_agent 或 running 已丢 lease 时运行 \`.biao/pm watchdog --auto-fix\`，再重读 task/intake；该命令只做安全的 lease/agent 恢复和遗留 resolution 补偿，不会自动验收。
-   - failed 先看 resolution/repair 状态：repairing 等 Worker，required Review 当前 repair，needs_pm_decision 先运行 \`.biao/pm task resolution <task_id>\`；证据支持时用 \`--action continue\`，明确终止时用 \`--action cancel\`。没有 resolution 的 legacy failed 运行一次 \`.biao/pm watchdog --auto-fix\` 补建 repair 后重读，不得 reset 原任务。
+   - 有 task_id 时先运行 \`${pmLauncher} task get <task_id>\` 读取当前真相。\`waiting_dependency / waiting_file_release\` 是平台与共享 Supervisor 的内部等待，正常不会打扰 PM；不得手工 resume 或 ack 催跑。\`waiting_pm_reply\` 必须走上面的 Question answer。
+   - 未知 blocked 只有在证据确认外部条件已经消失时才运行 \`${pmLauncher} task resume <task_id>\`，随后重读 task/intake；条件仍存在就保留门铃。
+   - stale_agent 或 running 已丢 lease 时运行 \`${pmLauncher} watchdog --auto-fix\`，再重读 task/intake；该命令只做安全的 lease/agent 恢复和遗留 resolution 补偿，不会自动验收。
+   - failed 先看 resolution/repair 状态：repairing 等 Worker，required Review 当前 repair，needs_pm_decision 先运行 \`${pmLauncher} task resolution <task_id>\`；证据支持时用 \`--action continue\`，明确终止时用 \`--action cancel\`。没有 resolution 的 legacy failed 运行一次 \`${pmLauncher} watchdog --auto-fix\` 补建 repair 后重读，不得 reset 原任务。
    - 对于 resolution，只有 continue/cancel 成功后才 ack；其它异常也必须等对应恢复动作成功、intake 当前事实消失后才 ack。真正无法自治时保留门铃并让本次会话非零退出；不要直接替 Worker 修改实现文件，也不要伪造成功结果。
-5. 只有事项实际处置完成后，才对对应 event 执行 \`.biao/pm pm ack --consumer ${consumerArg} --event-id <id>\`。绝不批量盲 ack、自动通过或把门铃当完成证明。
+5. 只有事项实际处置完成后，才对对应 event 执行 \`${pmLauncher} pm ack --consumer ${consumerArg} --event-id <id>\`。绝不批量盲 ack、自动通过或把门铃当完成证明。
 6. 最后再次逐条运行 ${intakeCommandList}，确认本次门铃 Plan 范围内的可处理事项已清空；不得用无 Plan 过滤的 intake 代替。若因真实外部阻塞无法处置，保留未 ack 状态并在最终结果明确说明，不得假装闭环。
 
 保持平台被动、输出简短。你是 PM，不是本轮 Worker。`;
@@ -171,8 +227,20 @@ function main() {
   }
 
   const repoRoot = resolve(import.meta.dirname, '..');
-  const workspace = existingAbsoluteDirectory(process.env.BIAO_PREFERRED_PROJECT)
-    ?? existingAbsoluteDirectory(process.env.BIAO_WORKSPACE_ROOTS);
+  let runtimeDir;
+  try {
+    runtimeDir = resolveRuntimeDirectory(repoRoot);
+  } catch (error) {
+    console.error(`[codex-pm-agent] runtime 配置无效：${error instanceof Error ? error.message : String(error)}`);
+    return 3;
+  }
+  let project;
+  try {
+    project = resolveCanonicalProject();
+  } catch (error) {
+    console.error(`[codex-pm-agent] workspace 配置无效：${error instanceof Error ? error.message : String(error)}`);
+    return 3;
+  }
   const codexBin = process.env.BIAO_CODEX_BIN?.trim() || 'codex';
   const sandbox = ['read-only', 'workspace-write'].includes(process.env.BIAO_CODEX_PM_SANDBOX ?? '')
     ? process.env.BIAO_CODEX_PM_SANDBOX
@@ -182,13 +250,13 @@ function main() {
     '--color', 'never',
     '-c', 'sandbox_workspace_write.network_access=true',
     '-c', 'model_reasoning_effort="high"',
-    '-s', sandbox, '-C', repoRoot,
-    ...(workspace && workspace !== repoRoot ? ['--add-dir', workspace] : []),
+    '-s', sandbox, '-C', runtimeDir,
+    ...(project !== runtimeDir ? ['--add-dir', project] : []),
     '-',
   ];
   const result = spawnSync(codexBin, args, {
-    cwd: repoRoot,
-    input: buildPrompt(wake),
+    cwd: runtimeDir,
+    input: buildPrompt(wake, runtimeDir),
     encoding: 'utf8',
     stdio: ['pipe', 'inherit', 'inherit'],
     env: safeAgentEnvironment(),

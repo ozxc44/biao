@@ -70,16 +70,48 @@ package_name=$(npm pack --pack-destination "$pack_dir" --ignore-scripts --silent
 npm install --prefix "$consumer_dir" "$pack_dir/$package_name" --ignore-scripts --no-audit --no-fund
 
 installed_root="$consumer_dir/node_modules/@vtp/biao"
-BIAO_BOOTSTRAP_TOKEN=ci-package-smoke-token /bin/sh "$installed_root/bootstrap.sh" --yes \
-  --workspace "$workspace_dir" \
-  --project "$workspace_dir" \
-  --redis-url "$smoke_redis_url" \
-  --port "$service_port" \
-  --pm-agent codex
+installed_real_root=$(cd "$installed_root" && pwd -P)
+runtime_root="$consumer_dir/.biao"
+fake_agent_bin="$consumer_dir/fake-agent-bin"
+mkdir -p "$fake_agent_bin"
+cat >"$fake_agent_bin/codex" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+chmod 700 "$fake_agent_bin/codex"
+(
+  cd "$consumer_dir"
+  PATH="$fake_agent_bin:$PATH" BIAO_BOOTSTRAP_TOKEN=ci-package-smoke-token ./node_modules/.bin/biao-bootstrap --yes \
+    --workspace "$workspace_dir" \
+    --project "$workspace_dir" \
+    --redis-url "$smoke_redis_url" \
+    --port "$service_port" \
+    --pm-agent codex
+)
+runtime_real_root=$(cd "$runtime_root" && pwd -P)
 
-"$installed_root/.biao/doctor"
-"$installed_root/.biao/pm" --help >/dev/null
-"$installed_root/.biao/start" >"$consumer_dir/service.log" 2>&1 &
+[[ ! -e "$installed_root/.biao" ]] || {
+  echo '安装包 smoke 失败：可变状态被写入了 node_modules。' >&2
+  exit 1
+}
+grep -Fq "BIAO_PACKAGE_ROOT='$installed_real_root'" "$runtime_root/start" || {
+  echo '安装包 smoke 失败：start 未固定到 canonical package root。' >&2
+  exit 1
+}
+if grep -Fq 'SCRIPT_DIR/../' "$runtime_root/start"; then
+  echo '安装包 smoke 失败：start 仍依赖 runtime 相对包路径。' >&2
+  exit 1
+fi
+grep -Fq "BIAO_PM_AGENT_CMD='$runtime_real_root/codex-pm-agent'" "$runtime_root/config.env" || {
+  echo '安装包 smoke 失败：Codex PM 未指向稳定 runtime wrapper。' >&2
+  exit 1
+}
+PATH="$fake_agent_bin:$PATH" "$runtime_root/doctor" || {
+  echo '安装包 smoke 失败：doctor 未通过。' >&2
+  exit 1
+}
+"$runtime_root/pm" --help >/dev/null
+"$runtime_root/start" >"$consumer_dir/service.log" 2>&1 &
 service_pid=$!
 
 for _ in {1..50}; do
@@ -93,11 +125,11 @@ grep -q '"ok":true' "$consumer_dir/health.json"
 curl --fail --silent --show-error -H 'Accept: text/html' "http://127.0.0.1:$service_port/" | grep -qi '<!doctype html'
 status_code=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$service_port/status")
 [[ "$status_code" == 401 ]]
-. "$installed_root/.biao/config.env"
+. "$runtime_root/config.env"
 printf 'header = "Authorization: Bearer %s"\n' "$BIAO_API_TOKEN" \
   | curl --config - --fail --silent --show-error "http://127.0.0.1:$service_port/install" \
   | grep -q 'Installing CLI'
 unset BIAO_API_TOKEN
-BIAO_AGENT_ID=package-smoke-worker BIAO_EXEC_CMD=/bin/true "$installed_root/.biao/worker-custom"
+BIAO_AGENT_ID=package-smoke-worker BIAO_EXEC_CMD=/bin/true "$runtime_root/worker-custom"
 
 echo '[biao] tarball install/bootstrap/doctor/CLI/service smoke 通过。'

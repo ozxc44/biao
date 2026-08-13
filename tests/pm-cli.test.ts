@@ -208,8 +208,10 @@ describe('biao pm start', () => {
         res.end(JSON.stringify({
           ok: true,
           data: {
-            tasks: { pending: 10, running: 0, blocked: 0, done: 40, failed: 0, cancelled: 0 },
-            reviews: { pending: 40, accepted: 0, rejected: 0 },
+            tasks: { pending: 10, running: 0, blocked: 0, done: 40, failed: 3, cancelled: 0 },
+            reviews: { pending: 40, accepted: 13, rejected: 9 },
+            attention: { failed: 0, rejected: 0, needs_pm_decision: 0, stale_running_agents: 0 },
+            history: { resolved_failed: 3, resolved_rejected: 9, stale_agents: 16 },
             agents: [{ agent_id: 'old-worker', status: 'stale' }],
             hint: { code: 'NO_ONLINE_WORKERS', doctor: '.biao/doctor', start_worker: '.biao/worker-codex' },
           },
@@ -274,6 +276,8 @@ describe('biao pm start', () => {
     expect(stdout).toContain('待 PM 验收：40 项');
     expect(stdout).toContain('历史待验收');
     expect(stdout).toContain('暂无在线 Worker');
+    expect(stdout).toContain('当前异常：0');
+    expect(stdout).toContain('历史审计：已修复失败 3，已修复拒绝 9，历史 Agent 16');
     expect(stdout).toContain('一次性运行 PM Supervisor');
     expect(requests).toContain('GET /health');
     expect(requests).toContain('GET /status');

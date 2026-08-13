@@ -1,5 +1,5 @@
 import { delimiter, join, resolve } from 'node:path';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -30,6 +30,39 @@ describe('workspace path security', () => {
     expect(() => resolveAndValidateWorkspacePath(`${root}/../outside`, [root])).toThrowError(
       expect.objectContaining({ code: 'WORKSPACE_PATH_DENIED' }),
     );
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects a non-existent tail whose existing symlink ancestor escapes the workspace', () => {
+    const sandbox = mkdtempSync(join(tmpdir(), 'biao-workspace-symlink-'));
+    try {
+      const root = join(sandbox, 'workspace');
+      const outside = join(sandbox, 'outside');
+      const linkedProject = join(root, 'linked-project');
+      mkdirSync(root);
+      mkdirSync(outside);
+      symlinkSync(outside, linkedProject, 'dir');
+
+      expect(() => resolveAndValidateWorkspacePath(
+        join(linkedProject, 'future-directory', 'plan'),
+        [root],
+      )).toThrowError(expect.objectContaining({ code: 'WORKSPACE_PATH_DENIED' }));
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('allows a non-existent tail when its deepest existing ancestor remains inside the workspace', () => {
+    const sandbox = mkdtempSync(join(tmpdir(), 'biao-workspace-future-'));
+    try {
+      const root = join(sandbox, 'workspace');
+      const existingProject = join(root, 'project');
+      const futurePath = join(existingProject, 'future-directory', 'plan');
+      mkdirSync(existingProject, { recursive: true });
+
+      expect(resolveAndValidateWorkspacePath(futurePath, [root])).toBe(resolve(futurePath));
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 
   it('rejects an empty or NUL-containing path', () => {
@@ -85,6 +118,14 @@ describe('server configuration contract', () => {
     );
 
     expect(config.sqlitePath).toBe('/tmp/custom.sqlite');
+  });
+
+  it('fails closed in a test process when no isolated SQLite path is explicit', () => {
+    expect(() => resolveServerConfig(
+      {},
+      { NODE_ENV: 'test', VITEST: 'true' },
+      [],
+    )).toThrow(/BIAO_SQLITE_PATH.*test/i);
   });
 
   it('rejects non-loopback exposure without both token and workspace roots', () => {

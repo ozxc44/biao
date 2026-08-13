@@ -65,14 +65,17 @@ async function seedAndClaim(taskId: string, agentId: string, priority = 3) {
     timeout_seconds: 120,
     verify: [],
   }, `# ${taskId}`, 'ownership-contract-plan', PROJECT_PATH, priority);
-  expect((await post('/register', {
+  const registered = await post<{ registration_id: string }>('/register', {
     agent_id: agentId,
     agent_type: 'cli',
     capabilities: ['code'],
     projects: [PROJECT_PATH],
-  })).body.ok).toBe(true);
+  });
+  expect(registered.body.ok).toBe(true);
   const claimed = await post<{ task_id: string; claim_token: string }>('/claim', {
     agent_id: agentId,
+    registration_id: registered.body.data!.registration_id,
+    claim_request_id: `claim_${agentId}_${taskId}`,
     blocking: false,
     preferred_project: PROJECT_PATH,
   });
@@ -117,12 +120,15 @@ describe('ownership declaration/release current-holder contract', () => {
       task_id: 'http-other-task', title: 'other', type: 'code', phase: 'impl', priority: 10,
       timeout_seconds: 60, verify: [],
     }, '# other', 'http-other-plan', PROJECT_PATH, 10);
-    expect((await post('/register', {
+    const registered = await post<{ registration_id: string }>('/register', {
       agent_id: 'http-plan-filter-worker', agent_type: 'cli', capabilities: ['code'], projects: [PROJECT_PATH],
-    })).body.ok).toBe(true);
+    });
+    expect(registered.body.ok).toBe(true);
 
     const claimed = await post<{ task_id: string; plan_id: string }>('/claim', {
       agent_id: 'http-plan-filter-worker',
+      registration_id: registered.body.data!.registration_id,
+      claim_request_id: 'claim_http_plan_filter_001',
       blocking: false,
       preferred_project: PROJECT_PATH,
       preferred_plan_ids: ['http-allowed-plan'],

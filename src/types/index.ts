@@ -172,6 +172,10 @@ export interface TaskRecord extends TaskFrontmatter {
   supersede_batch_size?: number;
   /** PM reject 时仅写在 repair 上的额外 ownership 授权审计。 */
   repair_ownership_extension?: RepairOwnershipExtension;
+  /** reject 审计是否包含显式 repair ownership；用于识别 intent 缺失/损坏而 fail closed。 */
+  pm_repair_ownership_required?: boolean;
+  /** reject 写入与 repair 创建之间崩溃时，用于确定性重放的规范化 ownership 扩展。 */
+  pm_repair_ownership_intent?: RepairOwnershipExtension;
   claim_token?: string;
 }
 
@@ -198,6 +202,10 @@ export interface OwnershipRecord {
 /** POST /claim 请求 */
 export interface ClaimRequest {
   agent_id: string;
+  /** register 返回的 Agent 生命周期 fencing token。 */
+  registration_id?: string;
+  /** 一次 claim 调用的幂等 ID；传输重试必须复用。 */
+  claim_request_id?: string;
   blocking?: boolean;
   timeout_ms?: number;
   preferred_types?: TaskType[];

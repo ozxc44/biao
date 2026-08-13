@@ -2,19 +2,25 @@
 
 import { randomBytes } from 'node:crypto';
 import {
-  chmodSync,
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fstatSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -28,25 +34,272 @@ function assertDirectory(path, label) {
   }
 }
 
+function canonicalDirectory(path, label) {
+  let canonical;
+  try {
+    canonical = realpathSync(path);
+    if (!lstatSync(canonical).isDirectory()) throw new Error('not-directory');
+  } catch {
+    throw new Error(`${label} 不存在或不是目录：${path}`);
+  }
+  return canonical;
+}
+
 function isInside(root, candidate) {
   const child = relative(root, candidate);
   return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child));
 }
 
-function writeExecutable(path, content) {
-  writeFileSync(path, content, { mode: 0o755 });
-  chmodSync(path, 0o755);
+function lstatIfExists(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
 }
 
-function wrapper(body) {
+function assertRegularGeneratedTarget(path) {
+  const metadata = lstatIfExists(path);
+  if (!metadata) return;
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`Biao 生成目标必须是普通文件且不能是符号链接：${path}`);
+  }
+}
+
+function readGeneratedFile(path) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`Biao 生成目标必须是普通文件且不能是符号链接：${path}`);
+    }
+    return readFileSync(fd, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new Error(`Biao 生成目标必须是普通文件且不能是符号链接：${path}`);
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function atomicWriteGeneratedFile(path, content, mode) {
+  assertRegularGeneratedTarget(path);
+  const parent = dirname(path);
+  const prefix = `.${basename(path)}.tmp-${process.pid}-`;
+  let temporaryPath;
+  let fd;
+  try {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      temporaryPath = join(parent, `${prefix}${randomBytes(8).toString('hex')}`);
+      try {
+        fd = openSync(
+          temporaryPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          mode,
+        );
+        break;
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+        temporaryPath = undefined;
+      }
+    }
+    if (fd === undefined || temporaryPath === undefined) {
+      throw new Error(`无法为 Biao 生成目标创建安全临时文件：${path}`);
+    }
+    writeFileSync(fd, content, 'utf8');
+    fchmodSync(fd, mode);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    // 同目录 rename 不会跟随目标符号链接；即使校验后发生竞态，也只替换链接本身。
+    renameSync(temporaryPath, path);
+    temporaryPath = undefined;
+    // 文件内容落盘后还需同步父目录项；否则断电可能丢失刚完成的 rename，留下旧配置。
+    const parentFd = openSync(parent, constants.O_RDONLY);
+    try {
+      fsyncSync(parentFd);
+    } finally {
+      closeSync(parentFd);
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    if (temporaryPath !== undefined) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+  }
+}
+
+function writeExecutable(path, content) {
+  atomicWriteGeneratedFile(path, content, 0o755);
+}
+
+function wrapper(body, packageRoot) {
   return `#!/usr/bin/env sh
 set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIAO_PACKAGE_ROOT=${shellQuote(resolve(packageRoot))}
+readonly BIAO_PACKAGE_ROOT
 set -a
 . "$SCRIPT_DIR/config.env"
 set +a
+BIAO_RUNTIME_DIR=$SCRIPT_DIR
+export BIAO_RUNTIME_DIR
+readonly BIAO_RUNTIME_DIR
 ${body}
 `;
+}
+
+// runtime-dir 可能尚不存在。先 realpath 最深的已存在祖先，再拼回缺失段，
+// 这样既支持首次安装，也不会让符号链接绕过 node_modules/packageRoot 边界。
+function canonicalPotentialPath(path) {
+  let cursor = resolve(path);
+  const missing = [];
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    missing.unshift(basename(cursor));
+    cursor = parent;
+  }
+  const base = existsSync(cursor) ? realpathSync(cursor) : cursor;
+  return resolve(base, ...missing);
+}
+
+function hasNodeModulesSegment(path) {
+  return resolve(path)
+    .split(/[\\/]+/)
+    .some((part) => part.toLowerCase() === 'node_modules');
+}
+
+function pathContainsNodeModules(path) {
+  return hasNodeModulesSegment(path) || hasNodeModulesSegment(canonicalPotentialPath(path));
+}
+
+const BIAO_RUNTIME_MARKER = '.biao-runtime';
+const BIAO_RUNTIME_MARKER_CONTENT = 'biao-runtime-v1\n';
+const BIAO_RUNTIME_GITIGNORE = '*\n!.gitignore\n';
+const BIAO_GENERATED_FILES = [
+  BIAO_RUNTIME_MARKER,
+  '.gitignore',
+  'config.env',
+  'PM_AGENT.md',
+  'doctor',
+  'copy-token',
+  'token-status',
+  'start',
+  'pm',
+  'pm-intake',
+  'pm-start',
+  'pm-agent',
+  'codex-pm-agent',
+  'supervisor',
+  'worker-codex',
+  'worker-kimi',
+  'worker-custom',
+];
+
+function validateGeneratedTargets(setupDir) {
+  for (const name of BIAO_GENERATED_FILES) {
+    assertRegularGeneratedTarget(join(setupDir, name));
+  }
+}
+
+function isPlainFile(path) {
+  const metadata = lstatIfExists(path);
+  if (!metadata) return false;
+  return metadata.isFile() && !metadata.isSymbolicLink();
+}
+
+function hasValidRuntimeMarker(setupDir) {
+  const markerPath = join(setupDir, BIAO_RUNTIME_MARKER);
+  if (!lstatIfExists(markerPath)) return false;
+  assertRegularGeneratedTarget(markerPath);
+  if (readGeneratedFile(markerPath) !== BIAO_RUNTIME_MARKER_CONTENT) {
+    throw new Error(`已有目录包含无效的 Biao runtime 标记：${markerPath}`);
+  }
+  return true;
+}
+
+function validateExistingRuntimeDirectory(setupDir, allowSourceDefault) {
+  const metadata = lstatIfExists(setupDir);
+  if (!metadata) return;
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`--runtime-dir 必须是真实目录且不能是符号链接：${setupDir}`);
+  }
+  const entries = readdirSync(setupDir);
+  if (entries.length === 0) return;
+
+  const markedRuntime = hasValidRuntimeMarker(setupDir);
+  const legacyRuntime = isPlainFile(join(setupDir, 'config.env'));
+  if (!allowSourceDefault && !markedRuntime && !legacyRuntime) {
+    throw new Error(`已有目录非空且不是专用 Biao runtime，拒绝写入：${setupDir}`);
+  }
+}
+
+function prepareRuntimeDirectory(setupDir) {
+  const existingMetadata = lstatIfExists(setupDir);
+  const existed = existingMetadata !== undefined;
+  if (existingMetadata && (existingMetadata.isSymbolicLink() || !existingMetadata.isDirectory())) {
+    throw new Error(`--runtime-dir 必须是真实目录且不能是符号链接：${setupDir}`);
+  }
+  const wasEmpty = existed && readdirSync(setupDir).length === 0;
+  if (!existed) mkdirSync(setupDir, { recursive: true });
+  validateGeneratedTargets(setupDir);
+
+  const markerPath = join(setupDir, BIAO_RUNTIME_MARKER);
+  if (lstatIfExists(markerPath)) {
+    hasValidRuntimeMarker(setupDir);
+  } else {
+    atomicWriteGeneratedFile(markerPath, BIAO_RUNTIME_MARKER_CONTENT, 0o600);
+  }
+
+  // 只在第一次初始化一个新目录（或调用方预建的空目录）时放入默认保护规则。
+  // 已有 runtime 的 .gitignore 属于操作者配置，bootstrap 永不覆盖。
+  const gitignorePath = join(setupDir, '.gitignore');
+  if ((!existed || wasEmpty) && !lstatIfExists(gitignorePath)) {
+    atomicWriteGeneratedFile(gitignorePath, BIAO_RUNTIME_GITIGNORE, 0o644);
+  }
+}
+
+export function resolveBootstrapSetupDir(options) {
+  const repoRoot = resolve(options.repoRoot);
+  const invocationCwd = resolve(options.invocationCwd ?? process.cwd());
+  const setupDir = options.runtimeDir
+    ? resolve(invocationCwd, options.runtimeDir)
+    : options.runtimeLayout === 'source'
+      ? join(repoRoot, '.biao')
+      : join(invocationCwd, '.biao');
+
+  const canonicalPackageRoot = canonicalPotentialPath(repoRoot);
+  const canonicalSetupDir = canonicalPotentialPath(setupDir);
+  const canonicalHome = canonicalPotentialPath(homedir());
+  const sourceDefault =
+    options.runtimeLayout === 'source' && resolve(setupDir) === resolve(repoRoot, '.biao');
+  const safeSourceDefault =
+    sourceDefault && canonicalSetupDir === join(canonicalPackageRoot, '.biao');
+
+  if (dirname(canonicalSetupDir) === canonicalSetupDir) {
+    throw new Error(`--runtime-dir 不能是文件系统根目录：${setupDir}`);
+  }
+  if (canonicalSetupDir === canonicalHome) {
+    throw new Error(`--runtime-dir 不能是 HOME 目录：${setupDir}`);
+  }
+  if (pathContainsNodeModules(setupDir)) {
+    throw new Error(`--runtime-dir 运行目录不能位于 node_modules 内：${setupDir}`);
+  }
+  if (isInside(canonicalPackageRoot, canonicalSetupDir) && !safeSourceDefault) {
+    throw new Error(`--runtime-dir 运行目录不能位于安装包或源码仓库内：${setupDir}`);
+  }
+  // 后续所有校验、open/rename 和返回路径都固定到同一 canonical 目录，避免祖先
+  // symlink 在校验后改指而把生成文件写到另一个位置。
+  validateExistingRuntimeDirectory(canonicalSetupDir, safeSourceDefault);
+  return canonicalSetupDir;
 }
 
 /**
@@ -82,12 +335,15 @@ function runNpm(cwd, args, label) {
 
 const SOURCE_BUILD_INPUTS = [
   ['package.json', 'file'],
-  ['package-lock.json', 'file'],
   ['tsconfig.json', 'file'],
   ['src', 'directory'],
   ['web/package.json', 'file'],
-  ['web/package-lock.json', 'file'],
 ];
+
+function npmDependencyInstallArgs(cwd) {
+  const hasLockfile = existsSync(join(cwd, 'package-lock.json')) || existsSync(join(cwd, 'npm-shrinkwrap.json'));
+  return [hasLockfile ? 'ci' : 'install', '--workspaces=false'];
+}
 
 // npm 安装包不携带 TypeScript / Web 源码；bootstrap 只能在所有生产入口都在时
 // 采用预构建模式，不能因某一个 dist 文件碰巧存在就生成无法启动的 .biao。
@@ -239,10 +495,31 @@ export function resolveBootstrapToken(args = {}, env = process.env) {
 
 export function bootstrap(options) {
   const repoRoot = resolve(options.repoRoot);
-  const workspace = resolve(options.workspace);
-  const project = resolve(options.project ?? workspace);
-  const setupDir = join(repoRoot, '.biao');
+  const requestedWorkspace = resolve(options.workspace);
+  const requestedProject = resolve(options.project ?? requestedWorkspace);
+
+  assertDirectory(repoRoot, 'repoRoot');
+  // 固定祖先与最终符号链接解析后的真实目录。containment 和后续配置始终使用
+  // 同一组 canonical 路径，避免词法上位于 workspace 内的 project 实际逃逸。
+  const workspace = canonicalDirectory(requestedWorkspace, 'workspace');
+  const project = canonicalDirectory(requestedProject, 'project');
+  if (!isInside(workspace, project)) {
+    throw new Error(`project 必须位于 workspace 内：${project}`);
+  }
+  const runtimeLayout = detectBootstrapRuntimeLayout(repoRoot);
+  if (runtimeLayout === 'incomplete') {
+    throw new Error('安装内容不完整：既不是可构建的 Git 源码，也不是完整的预构建运行时；请重新 clone 或重新安装发布包');
+  }
+  const setupDir = resolveBootstrapSetupDir({
+    repoRoot,
+    runtimeLayout,
+    invocationCwd: options.invocationCwd,
+    runtimeDir: options.runtimeDir,
+  });
   const configPath = join(setupDir, 'config.env');
+  // 在 npm install/build 或任何写入之前一次性检查全部受 bootstrap 管理的目标。
+  // 这样 upgrade 不会因较晚遇到链接而留下半升级状态。
+  validateGeneratedTargets(setupDir);
 
   if (options.pmAgent && options.pmAgentCommand) {
     throw new Error('pmAgent 与 pmAgentCommand 不能同时配置');
@@ -254,29 +531,18 @@ export function bootstrap(options) {
     ? join(setupDir, 'codex-pm-agent')
     : (options.pmAgentCommand ?? '');
 
-  assertDirectory(repoRoot, 'repoRoot');
-  assertDirectory(workspace, 'workspace');
-  if (!isInside(workspace, project)) {
-    throw new Error(`project 必须位于 workspace 内：${project}`);
-  }
-  assertDirectory(project, 'project');
-
-  const runtimeLayout = detectBootstrapRuntimeLayout(repoRoot);
-  if (runtimeLayout === 'incomplete') {
-    throw new Error('安装内容不完整：既不是可构建的 Git 源码，也不是完整的预构建运行时；请重新 clone 或重新安装发布包');
-  }
-
-  const configExists = existsSync(configPath);
+  const configExists = lstatIfExists(configPath) !== undefined;
   const upgrading = configExists && !options.force && options.upgrade === true;
   if (configExists && !options.force && !upgrading) {
     assertCompleteRuntime(repoRoot, '检查已有配置');
+    prepareRuntimeDirectory(setupDir);
     return { created: false, setupDir, configPath, runtimeLayout };
   }
 
   const runCommand = options.commandRunner ?? runNpm;
   if (runtimeLayout === 'source' && !options.skipInstall) {
-    runCommand(repoRoot, ['install', '--workspaces=false'], '根目录依赖安装');
-    runCommand(join(repoRoot, 'web'), ['install', '--workspaces=false'], 'Web 依赖安装');
+    runCommand(repoRoot, npmDependencyInstallArgs(repoRoot), '根目录依赖安装');
+    runCommand(join(repoRoot, 'web'), npmDependencyInstallArgs(join(repoRoot, 'web')), 'Web 依赖安装');
   }
   if (runtimeLayout === 'source' && !options.skipBuild) runCommand(repoRoot, ['run', 'build', '--workspaces=false'], '项目构建');
   assertCompleteRuntime(repoRoot, runtimeLayout === 'source' ? '源码准备' : '预构建包校验');
@@ -287,7 +553,12 @@ export function bootstrap(options) {
   const urlHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
   const token = options.token ?? randomBytes(24).toString('hex');
   const dataDir = join(setupDir, 'data');
-  mkdirSync(dataDir, { recursive: true });
+  const dataMetadata = lstatIfExists(dataDir);
+  if (dataMetadata && (dataMetadata.isSymbolicLink() || !dataMetadata.isDirectory())) {
+    throw new Error(`Biao data 目标必须是真实目录且不能是符号链接：${dataDir}`);
+  }
+  prepareRuntimeDirectory(setupDir);
+  if (!dataMetadata) mkdirSync(dataDir, { mode: 0o700 });
 
   const config = [
     '# 由 Biao bootstrap 生成。包含访问凭据，不要提交到 Git。',
@@ -299,27 +570,35 @@ export function bootstrap(options) {
     `BIAO_WORKSPACE_ROOTS=${shellQuote(workspace)}`,
     `BIAO_PREFERRED_PROJECT=${shellQuote(project)}`,
     `BIAO_API_TOKEN=${shellQuote(token)}`,
+    `BIAO_PM_AGENT=${shellQuote(options.pmAgent ?? '')}`,
     `BIAO_PM_AGENT_CMD=${shellQuote(pmAgentCommand)}`,
     '',
   ].join('\n');
 
-  mkdirSync(setupDir, { recursive: true });
   if (!upgrading) {
-    writeFileSync(configPath, config, { mode: 0o600 });
-    chmodSync(configPath, 0o600);
+    atomicWriteGeneratedFile(configPath, config, 0o600);
   } else if (options.pmAgent || options.pmAgentCommand) {
-    const previous = readFileSync(configPath, 'utf8');
-    const line = `BIAO_PM_AGENT_CMD=${shellQuote(pmAgentCommand)}`;
-    const next = /^BIAO_PM_AGENT_CMD=.*$/m.test(previous)
-      ? previous.replace(/^BIAO_PM_AGENT_CMD=.*$/m, line)
-      : `${previous.replace(/\n?$/, '\n')}${line}\n`;
-    writeFileSync(configPath, next, { mode: 0o600 });
-    chmodSync(configPath, 0o600);
+    const previous = readGeneratedFile(configPath);
+    const replacements = [
+      ['BIAO_PM_AGENT', options.pmAgent ?? ''],
+      ['BIAO_PM_AGENT_CMD', pmAgentCommand],
+    ];
+    let next = previous;
+    for (const [name, value] of replacements) {
+      const line = `${name}=${shellQuote(value)}`;
+      const pattern = new RegExp(`^${name}=.*$`, 'm');
+      next = pattern.test(next)
+        ? next.replace(pattern, line)
+        : `${next.replace(/\n?$/, '\n')}${line}\n`;
+    }
+    atomicWriteGeneratedFile(configPath, next, 0o600);
   }
+
+  const runtimeWrapper = (body) => wrapper(body, repoRoot);
 
   writeExecutable(
     join(setupDir, 'doctor'),
-    wrapper(`redis_probe_url=$BIAO_REDIS_URL
+    runtimeWrapper(`redis_probe_url=$BIAO_REDIS_URL
 unset BIAO_API_TOKEN BIAO_BOOTSTRAP_TOKEN BIAO_REDIS_URL
 failed=0
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=12)||(a===20&&b>=19)?0:1)'; then
@@ -330,7 +609,7 @@ else
   failed=1
 fi
 if command -v redis-cli >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
-  if BIAO_REDIS_PROBE_URL=$redis_probe_url node "$SCRIPT_DIR/../scripts/redis-probe.mjs" >/dev/null 2>&1; then
+  if BIAO_REDIS_PROBE_URL=$redis_probe_url node "$BIAO_PACKAGE_ROOT/scripts/redis-probe.mjs" >/dev/null 2>&1; then
     echo "[ok] Redis 可连接"
   else
     echo "[missing] Redis 不可连接；请检查 .biao/config.env 中的 BIAO_REDIS_URL" >&2
@@ -340,9 +619,17 @@ else
   echo "[missing] redis-cli（无法检查 Redis）" >&2
   failed=1
 fi
+required_pm_agent=\${BIAO_PM_AGENT:-}
 for optional_name in codex kimi; do
   if command -v "$optional_name" >/dev/null 2>&1; then
-    echo "[ok] 可选 Agent: $optional_name"
+    if [ "$required_pm_agent" = "$optional_name" ]; then
+      echo "[ok] 必需 PM Agent: $optional_name"
+    else
+      echo "[ok] 可选 Agent: $optional_name"
+    fi
+  elif [ "$required_pm_agent" = "$optional_name" ]; then
+    echo "[missing] 必需 PM Agent: $optional_name" >&2
+    failed=1
   else
     echo "[optional] 未安装 $optional_name"
   fi
@@ -401,49 +688,49 @@ fi
 fingerprint_suffix=$(printf '%s' "$BIAO_API_TOKEN" | node -e 'const { createHash } = require("node:crypto"); const chunks = []; process.stdin.on("data", chunk => chunks.push(chunk)); process.stdin.on("end", () => process.stdout.write(createHash("sha256").update(Buffer.concat(chunks)).digest("hex").slice(-12)));')
 printf '[biao] API Token 已配置（SHA-256 指纹末尾：…%s）。\n' "$fingerprint_suffix"`),
   );
-  writeExecutable(join(setupDir, 'start'), wrapper('exec node "$SCRIPT_DIR/../dist/server/main.js"'));
+  writeExecutable(join(setupDir, 'start'), runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/dist/server/main.js"'));
   writeExecutable(
     join(setupDir, 'pm'),
-    wrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$SCRIPT_DIR/../bin/biao.js" "$@"'),
+    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$BIAO_PACKAGE_ROOT/bin/biao.js" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'pm-intake'),
-    wrapper(`export BIAO_AGENT_ID="\${BIAO_PM_AGENT_ID:-pm-agent}"
-node "$SCRIPT_DIR/../bin/biao.js" status
-node "$SCRIPT_DIR/../bin/biao.js" pm intake --consumer "\${BIAO_PM_CONSUMER:-pm}" || {
+    runtimeWrapper(`export BIAO_AGENT_ID="\${BIAO_PM_AGENT_ID:-pm-agent}"
+node "$BIAO_PACKAGE_ROOT/bin/biao.js" status
+node "$BIAO_PACKAGE_ROOT/bin/biao.js" pm intake --consumer "\${BIAO_PM_CONSUMER:-pm}" || {
   intake_code=$?
   [ "$intake_code" -eq 2 ] || exit "$intake_code"
 }
-exec node "$SCRIPT_DIR/../bin/biao.js" watchdog`),
+exec node "$BIAO_PACKAGE_ROOT/bin/biao.js" watchdog`),
   );
   writeExecutable(
     join(setupDir, 'pm-start'),
-    wrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$SCRIPT_DIR/../bin/biao.js" pm start "$@"'),
+    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$BIAO_PACKAGE_ROOT/bin/biao.js" pm start "$@"'),
   );
   writeExecutable(
     join(setupDir, 'pm-agent'),
-    wrapper('exec node "$SCRIPT_DIR/../scripts/pm-agent.mjs" "$@"'),
+    runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/pm-agent.mjs" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'codex-pm-agent'),
-    wrapper('exec node "$SCRIPT_DIR/../scripts/codex-pm-agent.mjs" "$@"'),
+    runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/codex-pm-agent.mjs" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'supervisor'),
-    wrapper('exec node "$SCRIPT_DIR/../scripts/supervisor.mjs" "$@"'),
+    runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'worker-codex'),
-    wrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-codex-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$SCRIPT_DIR/../bin/codex-worker.js" "$@"'),
+    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-codex-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/codex-worker.js" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'worker-kimi'),
-    wrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-kimi-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$SCRIPT_DIR/../bin/kimi-worker.js" "$@"'),
+    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-kimi-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/kimi-worker.js" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'worker-custom'),
-    wrapper(`if [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
-  exec node "$SCRIPT_DIR/../bin/biao-worker.js" "$@"
+    runtimeWrapper(`if [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
+  exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"
 fi
 if [ -z "\${BIAO_EXEC_CMD:-}" ]; then
   echo "请先设置 BIAO_EXEC_CMD=/absolute/path/to/executor" >&2
@@ -451,10 +738,10 @@ if [ -z "\${BIAO_EXEC_CMD:-}" ]; then
 fi
 export BIAO_AGENT_ID="\${BIAO_AGENT_ID:-custom-1}"
 export BIAO_EXIT_ON_IDLE="\${BIAO_EXIT_ON_IDLE:-1}"
-exec node "$SCRIPT_DIR/../bin/biao-worker.js" "$@"`),
+exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"`),
   );
 
-  const guide = `# Biao PM Agent 操作契约
+  const guideTemplate = `# Biao PM Agent 操作契约
 
 你是 Biao 的 PM/验收负责人，不是默认执行 Worker。
 
@@ -580,7 +867,10 @@ BIAO_EXEC_CMD=/absolute/path/to/executor .biao/worker-custom
 当用户要求你“作为 PM 推进”时，先运行 \`.biao/pm-start --once\`，然后按上述验收口径持续推进。
 Supervisor 只给最小门铃，永不自动 ack；每个事项必须在读取详情并实际处置后，才执行一次对应的 \`.biao/pm pm ack\`。
 `;
-  writeFileSync(join(setupDir, 'PM_AGENT.md'), guide);
+  const guide = options.runtimeDir
+    ? guideTemplate.replaceAll('.biao/', `${shellQuote(setupDir)}/`)
+    : guideTemplate;
+  atomicWriteGeneratedFile(join(setupDir, 'PM_AGENT.md'), guide, 0o644);
 
   return {
     created: !upgrading,
@@ -593,24 +883,26 @@ Supervisor 只给最小门铃，永不自动 ack；每个事项必须在读取�
 }
 
 export function formatCompletion(result) {
+  const setupDir = result.setupDir ?? '.biao';
+  const command = (name) => shellQuote(join(setupDir, name));
   if (result.upgraded) {
-    return `[biao] 已保留 .biao/config.env，并升级启动器与 PM 手册。
-  网页鉴权：运行 .biao/copy-token，再粘贴到网页右上角 API Token（仅存当前标签页 sessionStorage）`;
+    return `[biao] 已保留 ${join(setupDir, 'config.env')}，并升级启动器与 PM 手册。
+  网页鉴权：运行 ${command('copy-token')}，再粘贴到网页右上角 API Token（仅存当前标签页 sessionStorage）`;
   }
   if (!result.created) {
-    return '[biao] 已存在 .biao/config.env；未覆盖。需要重建时使用 --force，更新启动器时使用 --upgrade。';
+    return `[biao] 已存在 ${join(setupDir, 'config.env')}；未覆盖。需要重建时使用 --force，更新启动器时使用 --upgrade。`;
   }
   return `[biao] 配置完成。
-  环境检查：.biao/doctor
-  启动服务：.biao/start
-  网页鉴权：另开终端运行 .biao/copy-token → 粘贴到网页右上角 API Token
+  环境检查：${command('doctor')}
+  启动服务：${command('start')}
+  网页鉴权：另开终端运行 ${command('copy-token')} → 粘贴到网页右上角 API Token
               Token 仅存当前标签页 sessionStorage，命令不会打印凭据
-  Token 状态：.biao/token-status（只显示 SHA-256 指纹末尾）
-  PM 入口：  .biao/pm-start --once
-  PM 唤醒器：配置 BIAO_PM_AGENT_CMD 后由 .biao/supervisor 按需启动
-  PM 手册：  .biao/PM_AGENT.md
-  Codex：     .biao/worker-codex
-  Kimi：      .biao/worker-kimi`;
+  Token 状态：${command('token-status')}（只显示 SHA-256 指纹末尾）
+  PM 入口：  ${command('pm-start')} --once
+  PM 唤醒器：配置 BIAO_PM_AGENT_CMD 后由 ${command('supervisor')} 按需启动
+  PM 手册：  ${join(setupDir, 'PM_AGENT.md')}
+  Codex：     ${command('worker-codex')}
+  Kimi：      ${command('worker-kimi')}`;
 }
 
 export function parseArgs(argv) {
@@ -642,10 +934,12 @@ function usage() {
 
 用法：
   ./bootstrap.sh --yes --workspace <允许根目录> [--project <默认项目>]
+  biao-bootstrap --yes --workspace <允许根目录> [--project <默认项目>]
 
 选项：
   --workspace <path>   Biao 允许访问的工作区；默认当前 Biao 仓库
   --project <path>     Worker 默认领取的项目；默认等于 workspace
+  --runtime-dir <path> 可变配置与数据目录；安装包默认当前目录/.biao
   --redis-url <url>    默认 redis://127.0.0.1:6379
   --host <host>        默认 127.0.0.1
   --port <port>        默认 7331
@@ -687,6 +981,8 @@ if (isBootstrapMain(process.argv[1])) {
     const token = resolveBootstrapToken(args, process.env);
     const result = bootstrap({
       repoRoot,
+      invocationCwd: process.cwd(),
+      runtimeDir: args.runtime_dir,
       workspace,
       project,
       redisUrl: args.redis_url,

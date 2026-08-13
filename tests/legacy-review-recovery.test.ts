@@ -152,6 +152,36 @@ describe('历史 done 未验收的 PM 门铃恢复', () => {
     expect(xrange.mock.calls.every((call) => call[1] !== '-')).toBe(true);
   });
 
+  it('门铃提交边界复核 resolution，不能把已进入修复链的旧快照重新通知 PM', async () => {
+    const { taskId } = await seedLegacyDone({
+      planId: 'review-resolution-race-plan',
+      taskId: 'review-resolution-race-task',
+    });
+
+    const originalHgetall = redis.hgetall.bind(redis);
+    let raced = false;
+    redis.hgetall = (async (key: string) => {
+      const snapshot = await originalHgetall(key);
+      if (!raced && key === keys.hash.task(taskId) && snapshot.status === 'done') {
+        raced = true;
+        await redis.hset(key, 'resolution_status', 'repairing');
+      }
+      return snapshot;
+    }) as typeof redis.hgetall;
+
+    try {
+      const intake = await pmIntake(redis, { consumer: 'pm' });
+      expect(intake.data?.items).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'review_requested', task_id: taskId }),
+      ]));
+    } finally {
+      redis.hgetall = originalHgetall as typeof redis.hgetall;
+    }
+
+    expect(await reviewEvents()).toHaveLength(0);
+    expect(await redis.zscore(keys.reviewRequested.pending, taskId)).toBeNull();
+  });
+
   it('非法 legacy consumer 同样回退默认 pm，Lua 提交边界不会把门铃路由到无人 consumer', async () => {
     const { planId, taskId } = await seedLegacyDone({
       planId: 'invalid-consumer-plan',

@@ -27,6 +27,7 @@ import {
   answerQuestion,
   cancelTask,
   reconcileResolutionBacklog,
+  reconcileRuntimeState,
   resolutionDecision,
   runWatchdog,
   unackedEvents,
@@ -92,6 +93,305 @@ async function claimAs(agentId: string) {
 }
 
 describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
+  it('continue 在 BEGIN 后、创建 child 前中断时，reconcile 从持久 intent 恢复且不重复 child', async () => {
+    const taskId = 'continue-before-child-breakpoint';
+    await seedTask(taskId, { max_retries: 1 });
+    await redis.zrem(keys.zset.status.pending, taskId);
+    await redis.zadd(keys.zset.status.failed, 53_000, taskId);
+    await redis.hset(keys.hash.task(taskId), {
+      status: 'failed',
+      failed_at: '53000',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+      resolution_task_id: `${taskId}-repair-1`,
+      resolution_task_ids: `${taskId}-repair-1`,
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+
+    const original = redis.hgetall.bind(redis);
+    let interrupted = false;
+    redis.hgetall = (async (key: string) => {
+      if (!interrupted && key === keys.hash.task(`${taskId}-repair-1`) &&
+          await redis.hget(keys.hash.task(taskId), 'resolution_continue_owner')) {
+        interrupted = true;
+        throw new Error('simulated interruption before continuation child');
+      }
+      return original(key);
+    }) as typeof redis.hgetall;
+    try {
+      await expect(resolutionDecision(redis, taskId, {
+        action: 'continue', decided_by: 'pm-before-child',
+      })).rejects.toThrow('simulated interruption before continuation child');
+    } finally {
+      redis.hgetall = original as typeof redis.hgetall;
+    }
+
+    expect(interrupted).toBe(true);
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-2`))).toBe(0);
+    expect(await redis.hget(keys.hash.task(taskId), 'resolution_continue_owner')).toBeTruthy();
+
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+    expect(await redis.hgetall(keys.hash.task(taskId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_task_id: `${taskId}-repair-2`,
+      resolution_attempts: '2',
+      resolution_decided_by: 'pm-before-child',
+    });
+    expect(await redis.hget(keys.hash.task(taskId), 'resolution_continue_owner')).toBeNull();
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-2`))).toBe(1);
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-3`))).toBe(0);
+  });
+
+  it('continue 已创建新 generation 却在审计提交前失锁时，runtime reconcile 幂等收口', async () => {
+    const taskId = 'continue-audit-breakpoint';
+    await seedTask(taskId, { max_retries: 1 });
+    await redis.zrem(keys.zset.status.pending, taskId);
+    await redis.zadd(keys.zset.status.failed, 54_000, taskId);
+    await redis.hset(keys.hash.task(taskId), {
+      status: 'failed',
+      failed_at: '54000',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+      resolution_task_id: `${taskId}-repair-1`,
+      resolution_task_ids: `${taskId}-repair-1`,
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+
+    const contender = redis.duplicate();
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let lostAtAudit = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!lostAtAudit && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('commit-resolution-continue-round-fenced-v1')) {
+        lostAtAudit = true;
+        return contender.del(keys.string.pmReviewLock(taskId))
+          .then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      expect(await resolutionDecision(redis, taskId, {
+        action: 'continue', decided_by: 'pm-breakpoint',
+      })).toMatchObject({
+        ok: false, error: { code: 'RESOLUTION_DECISION_ROUND_CHANGED' },
+      });
+    } finally {
+      client.sendCommand = original;
+    }
+
+    expect(lostAtAudit).toBe(true);
+    expect(await redis.hgetall(keys.hash.task(taskId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_task_id: `${taskId}-repair-2`,
+      resolution_attempts: '2',
+      resolution_continue_owner: expect.any(String),
+    });
+    expect(await redis.zscore(keys.runtimeReconcile.pending, taskId)).not.toBeNull();
+
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+
+    const recovered = await redis.hgetall(keys.hash.task(taskId));
+    expect(recovered).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_task_id: `${taskId}-repair-2`,
+      resolution_attempts: '2',
+      resolution_decided_by: 'pm-breakpoint',
+    });
+    expect(recovered.resolution_continue_owner).toBeUndefined();
+    expect(await redis.zscore(keys.runtimeReconcile.pending, taskId)).toBeNull();
+    expect(await redis.smembers(keys.planStatusProjection.taskIdsByPlan('autonomous-plan')))
+      .toEqual(expect.arrayContaining([taskId, `${taskId}-repair-2`]));
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-3`))).toBe(0);
+
+    const events = await redis.xrange(keys.stream.events, '-', '+') as [string, string[]][];
+    const recoveredAudits = events.filter(([, fields]) => {
+      const event = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, index) => [fields[index * 2], fields[index * 2 + 1]]),
+      );
+      return event.type === 'resolution_decided' && event.task_id === taskId && event.resolution_action === 'continue';
+    });
+    expect(recoveredAudits).toHaveLength(1);
+    contender.disconnect();
+  });
+
+  it('legacy 空 generation/attempts 的首次 continue 只创建一个 child 与一条审计', async () => {
+    const taskId = 'legacy-empty-resolution-counters';
+    await seedTask(taskId, { max_retries: 0 });
+    await redis.zrem(keys.zset.status.pending, taskId);
+    await redis.zadd(keys.zset.status.failed, 54_100, taskId);
+    await redis.hset(keys.hash.task(taskId), {
+      status: 'failed',
+      failed_at: '54100',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_generation: '',
+      resolution_attempts: '',
+      resolution_task_id: '',
+      resolution_task_ids: '',
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+
+    expect(await resolutionDecision(redis, taskId, {
+      action: 'continue', decided_by: 'pm-legacy-empty',
+    })).toMatchObject({ ok: true });
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+
+    const root = await redis.hgetall(keys.hash.task(taskId));
+    expect(root).toMatchObject({
+      resolution_task_id: `${taskId}-repair-1`,
+      resolution_attempts: '1',
+      resolution_decided_by: 'pm-legacy-empty',
+    });
+    expect(root.resolution_continue_owner).toBeUndefined();
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-1`))).toBe(1);
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-2`))).toBe(0);
+
+    const events = await redis.xrange(keys.stream.events, '-', '+') as [string, string[]][];
+    const audits = events.filter(([, fields]) => {
+      const event = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, index) => [fields[index * 2], fields[index * 2 + 1]]),
+      );
+      return event.type === 'resolution_decided' && event.task_id === taskId && event.resolution_action === 'continue';
+    });
+    expect(audits).toHaveLength(1);
+  });
+
+  it('legacy 缺失 generation/attempts 在审计断点后由两次 reconcile 幂等收口', async () => {
+    const taskId = 'legacy-missing-resolution-counters';
+    await seedTask(taskId, { max_retries: 0 });
+    await redis.zrem(keys.zset.status.pending, taskId);
+    await redis.zadd(keys.zset.status.failed, 54_200, taskId);
+    await redis.hset(keys.hash.task(taskId), {
+      status: 'failed',
+      failed_at: '54200',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+    await redis.hdel(
+      keys.hash.task(taskId),
+      'resolution_generation',
+      'resolution_attempts',
+      'resolution_task_id',
+      'resolution_task_ids',
+    );
+
+    const contender = redis.duplicate();
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let lostAtAudit = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!lostAtAudit && command?.name?.toLowerCase() === 'eval' &&
+          script.includes('commit-resolution-continue-round-fenced-v1')) {
+        lostAtAudit = true;
+        return contender.del(keys.string.pmReviewLock(taskId))
+          .then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      expect(await resolutionDecision(redis, taskId, {
+        action: 'continue', decided_by: 'pm-legacy-reconcile',
+      })).toMatchObject({ ok: false, error: { code: 'RESOLUTION_DECISION_ROUND_CHANGED' } });
+    } finally {
+      client.sendCommand = original;
+    }
+
+    expect(lostAtAudit).toBe(true);
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+    expect((await reconcileRuntimeState(redis)).ok).toBe(true);
+
+    const root = await redis.hgetall(keys.hash.task(taskId));
+    expect(root).toMatchObject({
+      resolution_task_id: `${taskId}-repair-1`,
+      resolution_attempts: '1',
+      resolution_decided_by: 'pm-legacy-reconcile',
+    });
+    expect(root.resolution_continue_owner).toBeUndefined();
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-1`))).toBe(1);
+    expect(await redis.exists(keys.hash.task(`${taskId}-repair-2`))).toBe(0);
+
+    const events = await redis.xrange(keys.stream.events, '-', '+') as [string, string[]][];
+    const audits = events.filter(([, fields]) => {
+      const event = Object.fromEntries(
+        Array.from({ length: fields.length / 2 }, (_, index) => [fields[index * 2], fields[index * 2 + 1]]),
+      );
+      return event.type === 'resolution_decided' && event.task_id === taskId && event.resolution_action === 'continue';
+    });
+    expect(audits).toHaveLength(1);
+    contender.disconnect();
+  });
+
+  it('决策锁过期后旧 continue 不能跨轮次覆盖后来已提交的 cancel', async () => {
+    const taskId = 'expired-resolution-decision';
+    await seedTask(taskId, { max_retries: 1 });
+    await redis.zrem(keys.zset.status.pending, taskId);
+    await redis.zadd(keys.zset.status.done, 55_000, taskId);
+    await redis.hset(keys.hash.task(taskId), {
+      status: 'done',
+      done_at: '55000',
+      pm_review_status: 'rejected',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+      resolution_task_id: `${taskId}-repair-1`,
+      resolution_task_ids: `${taskId}-repair-1`,
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+
+    const contender = redis.duplicate();
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const client = redis as Redis & { sendCommand: (...args: any[]) => Promise<unknown> };
+    const original = client.sendCommand;
+    let held = false;
+    client.sendCommand = function intercept(command: any, ...args: unknown[]) {
+      const script = String(command?.args?.[0] ?? '');
+      if (!held && command?.name?.toLowerCase() === 'eval' && script.includes('begin-resolution-continue-round-fenced-v1')) {
+        held = true;
+        entered();
+        return releasePromise.then(() => original.call(this, command, ...args));
+      }
+      return original.call(this, command, ...args);
+    };
+    try {
+      const staleContinue = resolutionDecision(redis, taskId, { action: 'continue', decided_by: 'pm-old' });
+      await enteredPromise;
+      await contender.pexpire(keys.string.pmReviewLock(taskId), 5);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      expect(await resolutionDecision(contender, taskId, { action: 'cancel', decided_by: 'pm-new' })).toMatchObject({
+        ok: true, data: { state: 'cancelled', action: 'cancel' },
+      });
+      release();
+      expect(await staleContinue).toMatchObject({
+        ok: false, error: { code: 'RESOLUTION_DECISION_ROUND_CHANGED' },
+      });
+      expect(await contender.hgetall(keys.hash.task(taskId))).toMatchObject({
+        resolution_status: 'cancelled',
+        resolution_action: 'cancel',
+        resolution_decided_by: 'pm-new',
+      });
+      expect(await contender.exists(keys.hash.task(`${taskId}-repair-2`))).toBe(0);
+    } finally {
+      client.sendCommand = original;
+      release?.();
+      contender.disconnect();
+    }
+  });
+
   it('普通 code report failed 后生成持久化 repair 并交给 Worker，不打扰 PM 或自动 reset', async () => {
     await seedTask('failed-code', { verify: [{ cmd: 'npm test', expect_exit: 0 }] });
     const claimed = await claimAs('failed-worker');
@@ -463,6 +763,7 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
       resolution_attempts: '2',
       resolution_decision_reason: '',
     });
+    expect(await redis.zscore(keys.runtimeReconcile.pending, 'retry-limit-source')).not.toBeNull();
     expect(await redis.hgetall(keys.hash.task('retry-limit-source-repair-1'))).toEqual(failedChild);
 
     // continue 只明确放行一代；这一代再失败后重新等待 PM，不无限续跑。

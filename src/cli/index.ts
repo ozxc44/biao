@@ -5,6 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isPlanTerminalStatus } from '../plan/status.js';
 import { startServer } from '../server/main.js';
 import { runPlanIntake, runPlanRevise, runTaskAdd, runTaskEdit } from './planning.js';
 
@@ -71,6 +72,7 @@ function parseSince(s: string): number | null {
  */
 type TaskListDisplayItem = {
   task_id: string;
+  plan_id?: string;
   title: string;
   type: string;
   phase: string;
@@ -132,7 +134,7 @@ function taskLifecycle(item: TaskListDisplayItem): { label: string; tone: TaskLi
     return { label: item.block_reason ? `阻塞：${item.block_reason}` : '阻塞', tone: 'decision' };
   }
   if (item.status === 'failed') {
-    return { label: item.failure_reason ? '失败，等待修复闭环' : '遗留失败，待核实', tone: 'legacy_failure' };
+    return { label: '遗留失败，先 watchdog --auto-fix', tone: 'legacy_failure' };
   }
   if (item.status === 'superseded') {
     return { label: '历史交付已退出验收', tone: 'quiet' };
@@ -156,9 +158,12 @@ function printTaskLifecycleSummary(tasks: TaskListDisplayItem[]): void {
   if (summary.length === 0) return;
 
   console.log(`\n闭环摘要（当前筛选）：${summary.join('；')}`);
-  if (decision > 0 || legacyFailure > 0) {
-    console.log('下一步：运行 biao pm start --once 查看最小门铃；不要手动 reset 原任务。');
-  } else if (review > 0) {
+  if (legacyFailure > 0) {
+    console.log('下一步：运行 biao watchdog --auto-fix 补建 repair，再重读任务；不要手动 reset 原任务。');
+  }
+  if (decision > 0) {
+    console.log('下一步：运行 biao task resolution <task_id> 查看 lineage，并显式 continue 或 cancel；不要手动 reset 原任务。');
+  } else if (legacyFailure === 0 && review > 0) {
     console.log('下一步：对完成任务执行 biao review <task_id>；平台不会自动验收。');
   }
 }
@@ -171,7 +176,7 @@ PM 只接收最小门铃，详情由 PM 主动从平台读取；平台不会自�
   biao pm intake [--consumer <pm>]             一次读取待处理门铃
   biao pm unacked [--consumer <pm>] [--plan <id>] 读取未确认事件（脚本使用）
   biao pm ack --event-id <id> [--consumer <pm>] [--plan <id>] 仅在事项实际处理完成后确认事件
-  biao pm watch [--interval 60]                 低频最小提醒；不会自动 ack
+  biao pm watch [--interval 60]                 低频最小提醒；全部 Plan 闭环且无待办时自动停止
 
 Worker 提问闭环（不要让 Worker 转而询问当前人类）：
   1. biao question list --consumer <pm> --status open --plan <id>
@@ -522,7 +527,7 @@ async function main() {
   --interval <seconds>   常驻模式的低频共享检查间隔，默认 60。
   --plans <p1,p2>        只监视指定计划。
 
-本命令只读门铃和状态，不自动 ack/验收；PM 必须完成处理后显式执行 biao pm ack。`);
+本命令读取门铃和状态，并执行一次幂等 reconcile；不自动 ack/验收。配置 Worker slot 时还会按显式范围调度。PM 必须完成处理后显式执行 biao pm ack。`);
         console.log(`
 收到 question_asked 时：
   biao question list --consumer <pm> --status open --plan <id>
@@ -550,6 +555,8 @@ async function main() {
       type PmStartupStatus = {
         tasks?: { pending?: number; running?: number; blocked?: number; done?: number; failed?: number; cancelled?: number; superseded?: number };
         reviews?: { pending?: number; accepted?: number; rejected?: number };
+        attention?: { failed?: number; rejected?: number; needs_pm_decision?: number; stale_running_agents?: number };
+        history?: { resolved_failed?: number; resolved_rejected?: number; stale_agents?: number };
         agents?: Array<{ agent_id?: string; status?: string }>;
         hint?: { code?: string; doctor?: string; start_worker?: string } | null;
       };
@@ -662,6 +669,31 @@ async function main() {
         .map(([kind, count]) => `${kind}=${count}`);
 
       console.log(`Biao PM 已连接：服务健康（consumer=${intakeData.consumer ?? consumer}）`);
+      if (managedPlanIds.length === 0 && statusData.attention) {
+        const attention = statusData.attention;
+        const currentFailed = Number(attention.failed ?? 0);
+        const currentRejected = Number(attention.rejected ?? 0);
+        const needsDecision = Number(attention.needs_pm_decision ?? 0);
+        const staleRunning = Number(attention.stale_running_agents ?? 0);
+        const totalAttention = currentFailed + currentRejected + needsDecision + staleRunning;
+        if (totalAttention === 0) {
+          console.log('当前异常：0（原始 failed/rejected 计数仅作历史审计，不需要动作）');
+        } else {
+          console.log(`当前异常：失败 ${currentFailed}，拒绝 ${currentRejected}，需 PM 决策 ${needsDecision}，失联运行 Agent ${staleRunning}`);
+          if (currentFailed > 0 || staleRunning > 0) {
+            console.log('  恢复：biao watchdog --auto-fix；不要手工 reset 原任务。');
+          }
+          if (currentRejected > 0) console.log('  拒绝项：读取当前 repair/reverify，不要改写原验收审计。');
+          if (needsDecision > 0) console.log('  决策项：biao task resolution <task_id>，再显式 continue 或 cancel。');
+        }
+      }
+      if (managedPlanIds.length === 0 && statusData.history) {
+        const history = statusData.history;
+        console.log(
+          `历史审计：已修复失败 ${Number(history.resolved_failed ?? 0)}，` +
+          `已修复拒绝 ${Number(history.resolved_rejected ?? 0)}，历史 Agent ${Number(history.stale_agents ?? 0)}`,
+        );
+      }
       if (reviewPending > 0) {
         const historical = reviewDoorbells === 0 ? '；历史待验收（当前没有对应未确认门铃）' : `；门铃 ${reviewDoorbells} 项`;
         console.log(`待 PM 验收：${reviewPending} 项${historical}`);
@@ -694,8 +726,8 @@ async function main() {
       if (plans) supervisorArgs.push('--plans', plans);
       if (once) supervisorArgs.push('--once');
       console.log(once
-        ? '一次性运行 PM Supervisor（只读门铃，绝不自动 ack/验收）...'
-        : '启动 PM Supervisor 低频监视（只读门铃，绝不自动 ack/验收）...');
+        ? '一次性运行 PM Supervisor（门铃 + 幂等恢复，绝不自动 ack/验收）...'
+        : '启动 PM Supervisor 低频监视（门铃 + 幂等恢复，绝不自动 ack/验收）...');
       const exitCode = await new Promise<number>((resolveExit, rejectExit) => {
         const child = spawn(process.execPath, supervisorArgs, { stdio: 'inherit', env: process.env });
         child.once('error', rejectExit);
@@ -834,7 +866,11 @@ async function main() {
       const consumer = consumerFlag(args);
       const once = args.includes('--once');
       const intervalSec = Number(flagVal(args, 'interval') ?? '60');
-      const pollOnce = async (): Promise<number> => {
+      type WatchPollResult = {
+        state: 'actionable' | 'idle' | 'terminal' | 'error';
+        count: number;
+      };
+      const pollOnce = async (): Promise<WatchPollResult> => {
         const r = (await api(`/intake?consumer=${encodeURIComponent(consumer)}`)) as {
           ok: boolean;
           data?: { items: Array<Record<string, unknown>>; cursor: string };
@@ -842,27 +878,48 @@ async function main() {
         };
         if (!r.ok || !r.data) {
           console.error(`✗ watch 轮询失败：${r.error?.message ?? '未知错误'}（将退避重试）`);
-          return -1;
+          return { state: 'error', count: 0 };
         }
         const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-        if (r.data.items.length === 0) return 0;
-        console.log(`[${ts}] 发现 ${r.data.items.length} 项待处理（cursor=${r.data.cursor}）`);
-        for (const it of r.data.items) {
-          const id = (it.task_id ?? it.agent_id ?? it.event_id) as string;
-          console.log(`  [${it.kind}] ${id}${it.plan_id ? ` (plan=${it.plan_id})` : ''}`);
+        if (r.data.items.length > 0) {
+          console.log(`[${ts}] 发现 ${r.data.items.length} 项待处理（cursor=${r.data.cursor}）`);
+          for (const it of r.data.items) {
+            const id = (it.task_id ?? it.agent_id ?? it.event_id) as string;
+            console.log(`  [${it.kind}] ${id}${it.plan_id ? ` (plan=${it.plan_id})` : ''}`);
+          }
+          // watch 仅作为最小门铃：打印不等于 PM 已处理。
+          // 必须由 PM 在读取详情、完成验收/答复等处理后，显式执行
+          // `biao pm ack --consumer <consumer> --event-id <event_id>`。
+          // 这里绝不能自动 ack，否则一次提示失败就会永久吞掉待办事件。
+          return { state: 'actionable', count: r.data.items.length };
         }
-        // watch 仅作为最小门铃：打印不等于 PM 已处理。
-        // 必须由 PM 在读取详情、完成验收/答复等处理后，显式执行
-        // `biao pm ack --consumer <consumer> --event-id <event_id>`。
-        // 这里绝不能自动 ack，否则一次提示失败就会永久吞掉待办事件。
-        return r.data.items.length;
+
+        // 只有门铃为空时才增加一次共享 Plan 快照读取；仍有待办时无需额外请求。
+        // Plan 的 completed 已包含 accepted/resolved 任务链，客户端复用同一终态判断即可。
+        const plans = (await api('/plans')) as {
+          ok: boolean;
+          data?: { plans: Array<{ status?: string }> };
+          error?: { message?: string };
+        };
+        if (!plans.ok || !Array.isArray(plans.data?.plans)) {
+          console.error(`✗ watch 轮询失败：${plans.error?.message ?? 'Plan 状态不可用'}（将退避重试）`);
+          return { state: 'error', count: 0 };
+        }
+        return {
+          state: plans.data.plans.every((plan) => isPlanTerminalStatus(plan.status)) ? 'terminal' : 'idle',
+          count: 0,
+        };
       };
       if (once) {
-        const n = await pollOnce();
-        process.exitCode = n > 0 ? 0 : n === 0 ? 2 : 1;
+        const result = await pollOnce();
+        process.exitCode = result.state === 'actionable' || result.state === 'terminal'
+          ? 0
+          : result.state === 'idle'
+            ? 2
+            : 1;
         return;
       }
-      // 常驻低频轮询（Ctrl-C 退出）。默认 60s，禁止忙循环。
+      // 常驻低频轮询（Ctrl-C 或全部 Plan 闭环后退出）。默认 60s，禁止忙循环。
       const intervalMs = Math.max(10_000, intervalSec * 1000);
       console.log(`[biao] PM watch 模式：每 ${Math.round(intervalMs / 1000)}s 轮询一次（Ctrl-C 退出）`);
       const shutdown = new AbortController();
@@ -872,9 +929,13 @@ async function main() {
       let backoff = intervalMs;
       try {
         while (!shutdown.signal.aborted) {
-          const n = await pollOnce();
+          const result = await pollOnce();
+          if (result.state === 'terminal') {
+            console.log('[biao] 所有 Plan 已闭环且 intake 为空，PM watch 已停止');
+            return;
+          }
           // 退避：失败时指数增长（上限 5*interval），成功恢复
-          if (n === -1) {
+          if (result.state === 'error') {
             backoff = Math.min(backoff * 2, intervalMs * 5);
           } else {
             backoff = intervalMs;
@@ -1690,28 +1751,82 @@ verify: []
     // biao review <task_id> [--accept --comment "..."] [--reject --reason "..." --fix-instructions "..." --reverify-only | --repair-ownership '{"files":[...],"modules":[...]}' ]
     // biao review list [--plan <id>]
     if (sub === 'list') {
-      // 列出待验收：done 但 pm_review_status 为空
+      // 直接读取服务端 current pending-review 索引，不能从有界 done 历史窗口二次过滤，
+      // 否则长期累计的 accepted/rejected 会把真正待验收任务挤出窗口。
       const flags: Record<string, string> = {};
       for (let i = 0; i < rest.length; i++) {
-        if (rest[i] === '--json') flags.json = 'true';
-        else if (rest[i].startsWith('--') && rest[i + 1]) flags[rest[i].slice(2)] = rest[++i];
-      }
-      // 用 /tasks?status=done 拿所有 done，再逐个查 review 状态（轻量：直接调 status 看 reviews 计数）
-      const r = (await api('/status')) as {
-        ok: boolean;
-        data: { reviews: { pending: number; accepted: number; rejected: number } };
-      };
-      if (flags.json) {
-        printJson(r);
-        return;
-      }
-      if (!r.ok || !r.data) {
-        console.error('✗ 验收概况查询失败');
+        const token = rest[i];
+        if (token === '--json') {
+          if (flags.json) {
+            console.error('重复参数：--json');
+            process.exitCode = 1;
+            return;
+          }
+          flags.json = 'true';
+          continue;
+        }
+        if (token === '--plan') {
+          if (flags.plan) {
+            console.error('重复参数：--plan');
+            process.exitCode = 1;
+            return;
+          }
+          const value = rest[i + 1];
+          if (!value || value.startsWith('--')) {
+            console.error('参数缺少值：--plan');
+            process.exitCode = 1;
+            return;
+          }
+          flags.plan = value;
+          i++;
+          continue;
+        }
+        console.error(`未知参数：${token}`);
         process.exitCode = 1;
         return;
       }
-      const rv = r.data.reviews;
-      console.log(`验收概况：待验收 ${rv.pending} | 已通过 ${rv.accepted} | 已拒绝 ${rv.rejected}`);
+      const params = new URLSearchParams();
+      if (flags.plan) params.set('plan_id', flags.plan);
+      const query = params.size > 0 ? `?${params.toString()}` : '';
+      const r = (await api(`/reviews/pending${query}`)) as {
+        ok: boolean;
+        data: { tasks: TaskListDisplayItem[]; total: number } | null;
+        error?: { code: string; message: string };
+      };
+      const validData = r.data && Array.isArray(r.data.tasks) && Number.isFinite(r.data.total) &&
+        r.data.total === r.data.tasks.length &&
+        r.data.tasks.every((task) => task.status === 'done' && !(task.pm_review_status ?? '').trim());
+      const result = r.ok && !validData
+        ? {
+            ok: false,
+            data: null,
+            error: { code: 'INVALID_RESPONSE', message: '服务返回的待验收列表合同无效' },
+          }
+        : r;
+      if (flags.json) {
+        printJson(result);
+        if (!result.ok) process.exitCode = 1;
+        return;
+      }
+      if (!result.ok || !result.data) {
+        console.error(`✗ 待验收任务查询失败：${result.error?.message ?? '未知错误'}`);
+        process.exitCode = 1;
+        return;
+      }
+      const pending = result.data.tasks;
+      if (pending.length === 0) {
+        console.log('（无待验收任务）');
+        return;
+      }
+      console.log(`待验收 ${pending.length} 项：\n`);
+      console.log('TASK_ID                        PLAN_ID                        TYPE         TITLE');
+      console.log('─'.repeat(105));
+      for (const task of pending) {
+        console.log(
+          `${task.task_id.padEnd(30)} ${(task.plan_id ?? '-').padEnd(30)} ${task.type.padEnd(12)} ${task.title}`,
+        );
+      }
+      console.log('\n下一步：逐项执行 biao review <task_id> 读取证据，再显式 --accept 或 --reject；列表本身不会验收或 ack。');
       return;
     }
 
@@ -1721,7 +1836,7 @@ verify: []
       console.error('  biao review <task_id>                  查看 worker 产出');
       console.error('  biao review <task_id> --accept --comment "..."     验收通过');
       console.error('  biao review <task_id> --reject --reason "..." --fix-instructions "..." [--reverify-only | --repair-ownership \'{"files":[...],"modules":[...]}\']  拒绝后修来源（默认）或只生成独立复验');
-      console.error('  biao review list                       验收概况');
+      console.error('  biao review list [--plan <id>]         列出可逐项处理的待验收任务');
       process.exit(1);
     }
 
@@ -1870,6 +1985,15 @@ verify: []
           task_count: number;
           plan_count: number;
           by_status: Record<string, number>;
+          restore_projection?: {
+            restorable_tasks: number;
+            restorable_plans: number;
+            excluded: {
+              plan_count: number;
+              task_count: number;
+              by_reason: Record<string, { plans: number; tasks: number }>;
+            };
+          };
           maintenance?: {
             state: 'idle' | 'restoring' | 'failed';
             restore_lock: boolean;
@@ -1891,6 +2015,14 @@ verify: []
       console.log(`  plans: ${r.data.plan_count}`);
       console.log(`  tasks: ${r.data.task_count}`);
       console.log(`  按状态:`, JSON.stringify(r.data.by_status));
+      if (r.data.restore_projection) {
+        const projection = r.data.restore_projection;
+        console.log(`  可恢复投影: ${projection.restorable_plans} plans / ${projection.restorable_tasks} tasks`);
+        console.log(`  排除但保留审计: ${projection.excluded.plan_count} plans / ${projection.excluded.task_count} tasks`);
+        if (Object.keys(projection.excluded.by_reason).length > 0) {
+          console.log(`  排除原因:`, JSON.stringify(projection.excluded.by_reason));
+        }
+      }
       if (r.data.maintenance) {
         const m = r.data.maintenance;
         console.log(`  maintenance: ${m.state} (lock=${m.restore_lock ? 'yes' : 'no'}, permits=${m.writer_permit_count}, expired=${m.expired_permit_count})`);
@@ -1915,7 +2047,15 @@ verify: []
       }
       const r = (await api('/db/restore', { method: 'POST', body: '{}' })) as {
         ok: boolean;
-        data: { restored: number; by_status: Record<string, number> } | null;
+        data: {
+          restored: number;
+          by_status: Record<string, number>;
+          excluded?: {
+            plan_count: number;
+            task_count: number;
+            by_reason: Record<string, { plans: number; tasks: number }>;
+          };
+        } | null;
         error?: { code?: string; message?: string };
       };
       if (!r.ok || !r.data) {
@@ -1925,6 +2065,13 @@ verify: []
         return;
       }
       console.log(`✓ 恢复了 ${r.data.restored} 个 task`, JSON.stringify(r.data.by_status));
+      if (r.data.excluded && (r.data.excluded.plan_count > 0 || r.data.excluded.task_count > 0)) {
+        console.log(
+          `  未投影 ${r.data.excluded.plan_count} 个 plan / ${r.data.excluded.task_count} 个 task；` +
+          '记录仍保留在 SQLite 审计中。',
+        );
+        console.log(`  排除原因:`, JSON.stringify(r.data.excluded.by_reason));
+      }
       return;
     }
     console.error('用法：biao db status | biao db restore --yes');
@@ -2189,7 +2336,7 @@ verify: []
   biao review <task_id>                                           查看 worker 产出（验收）
   biao review <task_id> --accept --comment "..."                  验收通过
   biao review <task_id> --reject --reason "..." --fix-instructions "..." [--reverify-only | --repair-ownership '{"files":[...],"modules":[...]}']  默认修来源；证据问题可只生成独立复验
-  biao review list                                                验收概况
+  biao review list [--plan <id>] [--json]                         列出可逐项处理的待验收任务
   biao db status                                                  SQLite 持久化状态
   biao db restore --yes                                           Redis namespace 为空时从 SQLite 灾难恢复
   biao ownership check <path>
@@ -2199,7 +2346,7 @@ verify: []
   biao pm intake [--consumer pm] [--plan <id>] [--json]               PM 主动轮询门铃（待签核/就绪/失败/阻塞/stale）
   biao pm unacked [--consumer pm] [--type review_requested] [--json]  按 consumer 查未确认事件
   biao pm ack --consumer pm --event-id <id>                           幂等确认事件（不影响其他 consumer）
-  biao pm watch [--consumer pm] [--interval 60] [--once]              低频主动轮询模式（Ctrl-C 退出）
+  biao pm watch [--consumer pm] [--interval 60] [--once]              低频主动轮询（全部 Plan 闭环且无待办时自动退出）
 
 典型流程：
   biao plan init my-feature --project /path/to/repo

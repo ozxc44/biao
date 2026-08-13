@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, parse } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 const tempRoots: string[] = [];
@@ -17,6 +17,12 @@ async function loadBootstrap() {
 }
 
 function makeRoot(): string {
+  const root = makePrebuiltRoot();
+  seedSourceCheckout(root);
+  return root;
+}
+
+function makePrebuiltRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'biao-bootstrap-'));
   tempRoots.push(root);
   mkdirSync(join(root, 'bin'), { recursive: true });
@@ -26,6 +32,20 @@ function makeRoot(): string {
   );
   seedPrebuiltPackage(root);
   return root;
+}
+
+function makeInstalledPrebuilt(version: string): { consumer: string; packageRoot: string } {
+  const root = mkdtempSync(join(tmpdir(), 'biao-installed-upgrade-'));
+  tempRoots.push(root);
+  const consumer = join(root, "consumer project with ' quote");
+  const packageRoot = join(consumer, 'node_modules', '@vtp', `biao-${version}`);
+  mkdirSync(join(packageRoot, 'bin'), { recursive: true });
+  writeFileSync(
+    join(packageRoot, 'bin', 'biao.js'),
+    `#!/usr/bin/env node\nconsole.log(JSON.stringify({version:${JSON.stringify(version)},args:process.argv.slice(2),url:process.env.BIAO_URL,agent:process.env.BIAO_AGENT_ID}))\n`,
+  );
+  seedPrebuiltPackage(packageRoot);
+  return { consumer, packageRoot };
 }
 
 function seedSourceCheckout(root: string): void {
@@ -97,6 +117,10 @@ function seedPrebuiltPackage(root: string): void {
 function writeExecutable(path: string, body: string): void {
   writeFileSync(path, body, { mode: 0o755 });
   chmodSync(path, 0o755);
+}
+
+function shellSingleQuoted(value: string): string {
+  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
 
 function makeControlledPath(root: string, osName: 'Darwin' | 'Linux'): string {
@@ -217,7 +241,7 @@ describe('clone 后自举配置', () => {
     const config = readFileSync(join(root, '.biao', 'config.env'), 'utf8');
     expect(config).toContain("BIAO_WORKSPACE_ROOTS='");
     expect(config).toContain("BIAO_API_TOKEN='test-token'");
-    expect(config).toContain(`BIAO_PREFERRED_PROJECT='${project}'`);
+    expect(config).toContain(`BIAO_PREFERRED_PROJECT='${realpathSync(project)}'`);
     expect(statSync(join(root, '.biao', 'config.env')).mode & 0o777).toBe(0o600);
 
     for (const name of ['doctor', 'start', 'copy-token', 'token-status', 'pm', 'pm-intake', 'pm-start', 'pm-agent', 'codex-pm-agent', 'supervisor', 'worker-codex', 'worker-kimi', 'worker-custom']) {
@@ -231,7 +255,10 @@ describe('clone 后自举配置', () => {
     expect(readFileSync(join(root, '.biao', 'supervisor'), 'utf8')).toContain('scripts/supervisor.mjs');
     expect(readFileSync(join(root, '.biao', 'pm-start'), 'utf8')).toContain('pm start');
     expect(readFileSync(join(root, '.biao', 'pm-agent'), 'utf8')).toContain('scripts/pm-agent.mjs');
-    expect(readFileSync(join(root, '.biao', 'codex-pm-agent'), 'utf8')).toContain('scripts/codex-pm-agent.mjs');
+    const codexPmAgent = readFileSync(join(root, '.biao', 'codex-pm-agent'), 'utf8');
+    expect(codexPmAgent).toContain('scripts/codex-pm-agent.mjs');
+    expect(codexPmAgent).toContain('BIAO_RUNTIME_DIR=$SCRIPT_DIR');
+    expect(codexPmAgent).toContain('export BIAO_RUNTIME_DIR');
     expect(readFileSync(join(root, '.biao', 'worker-codex'), 'utf8')).toContain('BIAO_EXIT_ON_IDLE');
     expect(readFileSync(join(root, '.biao', 'worker-custom'), 'utf8')).toContain('bin/biao-worker.js');
     expect(readFileSync(join(root, '.biao', 'worker-custom'), 'utf8')).toContain('"--help"');
@@ -413,6 +440,10 @@ describe('clone 后自举配置', () => {
     expect(output).toContain('右上角');
     expect(output).toContain('sessionStorage');
     expect(output).not.toContain('BIAO_API_TOKEN=');
+
+    const external = formatCompletion({ created: true, upgraded: false, setupDir: '/srv/biao state' });
+    expect(external).toContain('/srv/biao state/start');
+    expect(external).toContain('/srv/biao state/copy-token');
   });
 
   it('README 与 Worker 接入文档提供不经 URL 或终端输出的网页登录步骤', () => {
@@ -515,11 +546,112 @@ describe('clone 后自举配置', () => {
     });
     expect(configured.upgraded).toBe(true);
     const after = readFileSync(configPath, 'utf8');
-    expect(after.replace(/^BIAO_PM_AGENT_CMD=.*$/m, 'BIAO_PM_AGENT_CMD=<normalized>'))
-      .toBe(before.replace(/^BIAO_PM_AGENT_CMD=.*$/m, 'BIAO_PM_AGENT_CMD=<normalized>'));
-    const sourced = execFileSync('sh', ['-c', `. ${JSON.stringify(configPath)}; printf %s "$BIAO_PM_AGENT_CMD"`], { encoding: 'utf8' });
-    expect(sourced).toBe(join(root, '.biao', 'codex-pm-agent'));
+    const normalizePmConfig = (value: string) => value
+      .replace(/^BIAO_PM_AGENT=.*$/m, 'BIAO_PM_AGENT=<normalized>')
+      .replace(/^BIAO_PM_AGENT_CMD=.*$/m, 'BIAO_PM_AGENT_CMD=<normalized>');
+    expect(normalizePmConfig(after)).toBe(normalizePmConfig(before));
+    const sourced = execFileSync(
+      'sh',
+      ['-c', `. ${JSON.stringify(configPath)}; printf '%s|%s' "$BIAO_PM_AGENT" "$BIAO_PM_AGENT_CMD"`],
+      { encoding: 'utf8' },
+    );
+    expect(sourced).toBe(`codex|${join(realpathSync(join(root, '.biao')), 'codex-pm-agent')}`);
     expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  it.each([
+    '.biao-runtime',
+    '.gitignore',
+    'config.env',
+    'PM_AGENT.md',
+    'doctor',
+    'copy-token',
+    'token-status',
+    'start',
+    'pm',
+    'pm-intake',
+    'pm-start',
+    'pm-agent',
+    'codex-pm-agent',
+    'supervisor',
+    'worker-codex',
+    'worker-kimi',
+    'worker-custom',
+  ])('upgrade 拒绝生成目标 %s 的符号链接，且不改链接外文件', async (targetName) => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'preserve-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const target = join(root, '.biao', targetName);
+    const victim = join(root, `victim-${targetName.replaceAll('/', '-')}`);
+    writeFileSync(victim, 'victim-must-not-change\n');
+    rmSync(target);
+    symlinkSync(victim, target);
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      upgrade: true,
+      skipInstall: true,
+      skipBuild: true,
+    })).toThrow(/生成目标.*(?:符号链接|普通文件)|符号链接.*生成目标/);
+    expect(readFileSync(victim, 'utf8')).toBe('victim-must-not-change\n');
+  });
+
+  it('upgrade 拒绝非普通文件生成目标，并在替换普通文件时使用原子 rename', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'preserve-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const doctor = join(root, '.biao', 'doctor');
+    rmSync(doctor);
+    mkdirSync(doctor);
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      upgrade: true,
+      skipInstall: true,
+      skipBuild: true,
+    })).toThrow(/生成目标.*普通文件/);
+
+    rmSync(doctor, { recursive: true });
+    const start = join(root, '.biao', 'start');
+    const victim = join(root, 'hardlink-victim');
+    writeFileSync(victim, 'hardlink-victim-must-not-change\n');
+    rmSync(start);
+    linkSync(victim, start);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      upgrade: true,
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    expect(readFileSync(victim, 'utf8')).toBe('hardlink-victim-must-not-change\n');
+    expect(readFileSync(start, 'utf8')).toContain('dist/server/main.js');
+    expect(statSync(start).ino).not.toBe(statSync(victim).ino);
   });
 
   it('可在一次 bootstrap 中配置共享 Supervisor 按需唤醒 PM Agent', async () => {
@@ -566,7 +698,7 @@ describe('clone 后自举配置', () => {
 
     const configPath = join(root, '.biao', 'config.env');
     const sourced = execFileSync('sh', ['-c', `. ${JSON.stringify(configPath)}; printf %s "$BIAO_PM_AGENT_CMD"`], { encoding: 'utf8' });
-    expect(sourced).toBe(join(root, '.biao', 'codex-pm-agent'));
+    expect(sourced).toBe(join(realpathSync(join(root, '.biao')), 'codex-pm-agent'));
     const guide = readFileSync(join(root, '.biao', 'PM_AGENT.md'), 'utf8');
     expect(guide).toContain('--pm-agent codex');
     expect(guide).toContain('.biao/codex-pm-agent');
@@ -583,12 +715,95 @@ describe('clone 后自举配置', () => {
     })).toThrow(/pmAgent.*pmAgentCommand|不能同时/);
   });
 
+  it('显式选择 Codex PM Agent 后 doctor 将 codex 视为必需依赖', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      pmAgent: 'codex',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const fakeBin = makeControlledPath(root, 'Darwin');
+    writeExecutable(join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n');
+    writeExecutable(join(fakeBin, 'redis-cli'), '#!/bin/sh\nprintf "PONG\\n"\n');
+    const run = spawnSync('/bin/sh', [join(root, '.biao', 'doctor')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: fakeBin },
+    });
+
+    expect(run.status).toBe(1);
+    expect(`${run.stdout}${run.stderr}`).toContain('[missing] 必需 PM Agent: codex');
+  });
+
+  it('未选择 PM Agent 时 doctor 仍将 codex 视为可选依赖', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const fakeBin = makeControlledPath(root, 'Linux');
+    writeExecutable(join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n');
+    writeExecutable(join(fakeBin, 'redis-cli'), '#!/bin/sh\nprintf "PONG\\n"\n');
+    const run = spawnSync('/bin/sh', [join(root, '.biao', 'doctor')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: fakeBin },
+    });
+
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain('[optional] 未安装 codex');
+  });
+
   it('全新 clone 同时安装根目录和 web 依赖后再构建', async () => {
     const { bootstrap } = await loadBootstrap();
     const root = makeRoot();
     const workspace = join(root, 'workspace');
     mkdirSync(workspace);
     seedSourceCheckout(root);
+    rmSync(join(root, 'dist'), { recursive: true, force: true });
+    rmSync(join(root, 'web', 'dist'), { recursive: true, force: true });
+    const calls: Array<{ cwd: string; args: string[]; label: string }> = [];
+
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      commandRunner: (cwd: string, args: string[], label: string) => {
+        calls.push({ cwd, args, label });
+        if (label === '项目构建') seedPrebuiltPackage(root);
+      },
+    });
+
+    expect(calls).toEqual([
+      { cwd: root, args: ['ci', '--workspaces=false'], label: '根目录依赖安装' },
+      { cwd: join(root, 'web'), args: ['ci', '--workspaces=false'], label: 'Web 依赖安装' },
+      { cwd: root, args: ['run', 'build', '--workspaces=false'], label: '项目构建' },
+    ]);
+  });
+
+  it('源码布局缺少 lockfile 时兼容回退 npm install', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    seedSourceCheckout(root);
+    rmSync(join(root, 'package-lock.json'));
+    rmSync(join(root, 'web', 'package-lock.json'));
     rmSync(join(root, 'dist'), { recursive: true, force: true });
     rmSync(join(root, 'web', 'dist'), { recursive: true, force: true });
     const calls: Array<{ cwd: string; args: string[]; label: string }> = [];
@@ -643,14 +858,14 @@ describe('clone 后自举配置', () => {
 
   it('npm tarball 的完整预构建运行时无需源码、Web manifest 或开发构建即可配置', async () => {
     const { bootstrap } = await loadBootstrap();
-    const root = makeRoot();
-    const workspace = join(root, 'workspace');
+    const { consumer, packageRoot } = makeInstalledPrebuilt('v1');
+    const workspace = join(consumer, 'workspace');
     mkdirSync(workspace);
-    seedPrebuiltPackage(root);
     const calls: Array<{ cwd: string; args: string[]; label: string }> = [];
 
     const result = bootstrap({
-      repoRoot: root,
+      repoRoot: packageRoot,
+      invocationCwd: consumer,
       workspace,
       project: workspace,
       token: 'test-token',
@@ -659,24 +874,234 @@ describe('clone 后自举配置', () => {
 
     expect(result.runtimeLayout).toBe('prebuilt');
     expect(calls).toEqual([]);
-    expect(readFileSync(join(root, '.biao', 'start'), 'utf8')).toContain('dist/server/main.js');
+    expect(result.setupDir).toBe(realpathSync(join(consumer, '.biao')));
+    expect(existsSync(join(packageRoot, '.biao'))).toBe(false);
+    expect(readFileSync(join(consumer, '.biao', '.gitignore'), 'utf8')).toBe('*\n!.gitignore\n');
+    const start = readFileSync(join(consumer, '.biao', 'start'), 'utf8');
+    expect(start).toContain(`BIAO_PACKAGE_ROOT=${shellSingleQuoted(packageRoot)}`);
+    expect(start).toContain('dist/server/main.js');
+    expect(start).toContain('. "$SCRIPT_DIR/config.env"');
+  });
+
+  it('prebuilt 允许显式外置 runtime-dir，但拒绝 packageRoot 或任意 node_modules 内的可变目录', async () => {
+    const { bootstrap, resolveBootstrapSetupDir } = await loadBootstrap();
+    const { consumer, packageRoot } = makeInstalledPrebuilt('boundary');
+    const workspace = join(consumer, 'workspace');
+    const runtimeDir = join(consumer, "runtime state with ' quote");
+    mkdirSync(workspace);
+
+    const result = bootstrap({
+      repoRoot: packageRoot,
+      invocationCwd: consumer,
+      runtimeDir,
+      workspace,
+      project: workspace,
+      token: 'external-token',
+    });
+    expect(result.setupDir).toBe(realpathSync(runtimeDir));
+    expect(readFileSync(join(runtimeDir, '.biao-runtime'), 'utf8')).toBe('biao-runtime-v1\n');
+    expect(readFileSync(join(runtimeDir, 'config.env'), 'utf8')).toContain('external-token');
+    const externalGuide = readFileSync(join(runtimeDir, 'PM_AGENT.md'), 'utf8');
+    expect(externalGuide).toContain(`${shellSingleQuoted(realpathSync(runtimeDir))}/pm-start`);
+    expect(externalGuide).not.toContain('.biao/pm-start');
+
+    const linkedExternalRuntime = join(consumer, 'linked-external-runtime');
+    const nodeModulesRuntimeLink = join(consumer, 'node_modules', 'runtime-state-link');
+    mkdirSync(linkedExternalRuntime);
+    symlinkSync(linkedExternalRuntime, nodeModulesRuntimeLink);
+
+    for (const forbiddenRuntime of [
+      join(packageRoot, '.biao'),
+      join(consumer, 'node_modules', 'biao-runtime'),
+      nodeModulesRuntimeLink,
+    ]) {
+      expect(() => bootstrap({
+        repoRoot: packageRoot,
+        invocationCwd: consumer,
+        runtimeDir: forbiddenRuntime,
+        workspace,
+        project: workspace,
+        token: 'must-not-write',
+        force: true,
+      }), forbiddenRuntime).toThrow(/runtime-dir.*node_modules|运行目录.*安装包/);
+      expect(existsSync(join(forbiddenRuntime, 'config.env'))).toBe(false);
+    }
+
+    for (const broadRuntime of [parse(packageRoot).root, homedir()]) {
+      expect(() => resolveBootstrapSetupDir({
+        repoRoot: packageRoot,
+        runtimeLayout: 'prebuilt',
+        invocationCwd: consumer,
+        runtimeDir: broadRuntime,
+      }), broadRuntime).toThrow(/runtime-dir.*根目录|runtime-dir.*HOME|运行目录.*HOME/);
+    }
+
+    const operatorDirectory = join(consumer, 'existing-operator-directory');
+    mkdirSync(operatorDirectory);
+    writeFileSync(join(operatorDirectory, '.gitignore'), 'operator-rule\n');
+    writeFileSync(join(operatorDirectory, 'operator-state.txt'), 'must-survive\n');
+    expect(() => bootstrap({
+      repoRoot: packageRoot,
+      invocationCwd: consumer,
+      runtimeDir: operatorDirectory,
+      workspace,
+      project: workspace,
+      token: 'must-not-write',
+    })).toThrow(/非空.*Biao runtime|专用.*runtime|已有目录/);
+    expect(readFileSync(join(operatorDirectory, '.gitignore'), 'utf8')).toBe('operator-rule\n');
+    expect(readFileSync(join(operatorDirectory, 'operator-state.txt'), 'utf8')).toBe('must-survive\n');
+    expect(existsSync(join(operatorDirectory, 'config.env'))).toBe(false);
+  });
+
+  it('外置 runtime 的祖先含符号链接时固定到 canonical 目录写入', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const { consumer, packageRoot } = makeInstalledPrebuilt('canonical-runtime');
+    const realParent = join(consumer, 'real-parent');
+    const linkedParent = join(consumer, 'linked-parent');
+    const workspace = join(consumer, 'workspace');
+    mkdirSync(realParent);
+    mkdirSync(workspace);
+    symlinkSync(realParent, linkedParent);
+    const configuredRuntime = join(linkedParent, 'runtime');
+    mkdirSync(configuredRuntime);
+
+    const result = bootstrap({
+      repoRoot: packageRoot,
+      invocationCwd: consumer,
+      runtimeDir: configuredRuntime,
+      workspace,
+      project: workspace,
+      token: 'canonical-token',
+    });
+
+    const canonicalRuntime = realpathSync(join(realParent, 'runtime'));
+    expect(result.setupDir).toBe(canonicalRuntime);
+    expect(realpathSync(result.setupDir)).toBe(realpathSync(canonicalRuntime));
+    expect(readFileSync(join(canonicalRuntime, 'config.env'), 'utf8')).toContain('canonical-token');
+    expect(readFileSync(join(canonicalRuntime, 'PM_AGENT.md'), 'utf8')).toContain(shellSingleQuoted(canonicalRuntime));
+  });
+
+  it('prebuilt v1 到 v2 升级保留外置 config、Token、data 和 SQLite，并让启动器改指向 v2', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const { consumer, packageRoot: v1Root } = makeInstalledPrebuilt('v1');
+    const v2Root = join(consumer, 'node_modules', '@vtp', "biao-v2 with ' quote");
+    const workspace = join(consumer, 'workspace');
+    mkdirSync(workspace);
+
+    const first = bootstrap({
+      repoRoot: v1Root,
+      invocationCwd: consumer,
+      workspace,
+      project: workspace,
+      token: "stable-token-'-$HOME",
+    });
+    const runtimeDir = join(consumer, '.biao');
+    expect(first.setupDir).toBe(realpathSync(runtimeDir));
+    const configPath = join(runtimeDir, 'config.env');
+    const configBefore = readFileSync(configPath, 'utf8');
+    writeFileSync(join(runtimeDir, '.gitignore'), 'operator-runtime-rule\n');
+    rmSync(join(runtimeDir, '.biao-runtime'));
+    const tokenSentinel = join(runtimeDir, 'token.sentinel');
+    const dataSentinel = join(runtimeDir, 'data', 'operator-state.txt');
+    const sqlitePath = join(runtimeDir, 'data', 'biao.sqlite');
+    writeFileSync(tokenSentinel, 'token-sentinel-v1\n', { mode: 0o600 });
+    writeFileSync(dataSentinel, 'durable-data-v1\n', { mode: 0o600 });
+    writeFileSync(sqlitePath, 'sqlite-sentinel-v1\u0000payload', { mode: 0o600 });
+
+    mkdirSync(join(v2Root, 'bin'), { recursive: true });
+    writeFileSync(
+      join(v2Root, 'bin', 'biao.js'),
+      '#!/usr/bin/env node\nconsole.log(JSON.stringify({version:"v2",args:process.argv.slice(2)}))\n',
+    );
+    seedPrebuiltPackage(v2Root);
+
+    const upgraded = bootstrap({
+      repoRoot: v2Root,
+      invocationCwd: consumer,
+      workspace,
+      project: workspace,
+      upgrade: true,
+    });
+
+    expect(upgraded.upgraded).toBe(true);
+    expect(upgraded.setupDir).toBe(realpathSync(runtimeDir));
+    expect(readFileSync(configPath, 'utf8')).toBe(configBefore);
+    expect(readFileSync(join(runtimeDir, '.biao-runtime'), 'utf8')).toBe('biao-runtime-v1\n');
+    expect(readFileSync(join(runtimeDir, '.gitignore'), 'utf8')).toBe('operator-runtime-rule\n');
+    expect(readFileSync(tokenSentinel, 'utf8')).toBe('token-sentinel-v1\n');
+    expect(readFileSync(dataSentinel, 'utf8')).toBe('durable-data-v1\n');
+    expect(readFileSync(sqlitePath)).toEqual(Buffer.from('sqlite-sentinel-v1\u0000payload'));
+
+    const pmLauncher = readFileSync(join(runtimeDir, 'pm'), 'utf8');
+    expect(pmLauncher).toContain(`BIAO_PACKAGE_ROOT=${shellSingleQuoted(v2Root)}`);
+    expect(pmLauncher).not.toContain(shellSingleQuoted(v1Root));
+    const execution = JSON.parse(execFileSync(join(runtimeDir, 'pm'), ['status'], { encoding: 'utf8' }));
+    expect(execution).toMatchObject({ version: 'v2', args: ['status'] });
+  });
+
+  it('源码 clone 即使从其它 cwd 调用仍默认复用 repoRoot/.biao', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const invocationCwd = mkdtempSync(join(tmpdir(), 'biao-source-caller-'));
+    tempRoots.push(invocationCwd);
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+
+    const result = bootstrap({
+      repoRoot: root,
+      invocationCwd,
+      workspace,
+      project: workspace,
+      token: 'source-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    expect(result.runtimeLayout).toBe('source');
+    expect(result.setupDir).toBe(realpathSync(join(root, '.biao')));
+    expect(existsSync(join(invocationCwd, '.biao'))).toBe(false);
+  });
+
+  it('源码默认 repo/.biao 可兼容既有内容且不覆盖已有 .gitignore', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    const setupDir = join(root, '.biao');
+    mkdirSync(workspace);
+    mkdirSync(setupDir);
+    writeFileSync(join(setupDir, '.gitignore'), 'operator-source-rule\n');
+    writeFileSync(join(setupDir, 'operator-note.txt'), 'keep-me\n');
+
+    const result = bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'source-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    expect(result.setupDir).toBe(realpathSync(setupDir));
+    expect(readFileSync(join(setupDir, '.gitignore'), 'utf8')).toBe('operator-source-rule\n');
+    expect(readFileSync(join(setupDir, 'operator-note.txt'), 'utf8')).toBe('keep-me\n');
+    expect(readFileSync(join(setupDir, '.biao-runtime'), 'utf8')).toBe('biao-runtime-v1\n');
   });
 
   it('非源码布局的预构建入口缺失时 fail closed，且不生成半成品配置', async () => {
     const { bootstrap } = await loadBootstrap();
-    const root = makeRoot();
-    const workspace = join(root, 'workspace');
+    const { consumer, packageRoot } = makeInstalledPrebuilt('incomplete');
+    const workspace = join(consumer, 'workspace');
     mkdirSync(workspace);
-    seedPrebuiltPackage(root);
-    rmSync(join(root, 'web', 'dist', 'index.html'));
+    rmSync(join(packageRoot, 'web', 'dist', 'index.html'));
 
     expect(() => bootstrap({
-      repoRoot: root,
+      repoRoot: packageRoot,
+      invocationCwd: consumer,
       workspace,
       project: workspace,
       token: 'test-token',
     })).toThrow(/安装内容不完整|预构建运行时/);
-    expect(existsSync(join(root, '.biao'))).toBe(false);
+    expect(existsSync(join(consumer, '.biao'))).toBe(false);
   });
 
   it('预构建布局会校验 Worker/SQLite/安装入口以及 index.html 引用的网页资源', async () => {
@@ -692,18 +1117,19 @@ describe('clone 后自举配置', () => {
       'web/dist/manifest.json',
       'package.json',
     ]) {
-      const root = makeRoot();
-      const workspace = join(root, workspaceName);
+      const { consumer, packageRoot } = makeInstalledPrebuilt(`missing-${missingPath.replaceAll('/', '-')}`);
+      const workspace = join(consumer, workspaceName);
       mkdirSync(workspace);
-      rmSync(join(root, missingPath));
+      rmSync(join(packageRoot, missingPath));
 
       expect(() => bootstrap({
-        repoRoot: root,
+        repoRoot: packageRoot,
+        invocationCwd: consumer,
         workspace,
         project: workspace,
         token: 'test-token',
       }), missingPath).toThrow(/安装内容不完整|运行时不完整/);
-      expect(existsSync(join(root, '.biao'))).toBe(false);
+      expect(existsSync(join(consumer, '.biao'))).toBe(false);
     }
   });
 
@@ -716,6 +1142,7 @@ describe('clone 后自举配置', () => {
       .toThrow(/workspace 不存在/);
 
     mkdirSync(workspace);
+    mkdirSync(join(root, 'outside'));
     expect(() => bootstrap({
       repoRoot: root,
       workspace,
@@ -723,5 +1150,72 @@ describe('clone 后自举配置', () => {
       skipInstall: true,
       skipBuild: true,
     })).toThrow(/project 必须位于 workspace 内/);
+  });
+
+  it('把 workspace 和 project 固定为 canonical 路径写入配置', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const realWorkspace = join(root, 'real-workspace');
+    const linkedWorkspace = join(root, 'linked-workspace');
+    const realProject = join(realWorkspace, 'project');
+    mkdirSync(realProject, { recursive: true });
+    symlinkSync(realWorkspace, linkedWorkspace);
+
+    bootstrap({
+      repoRoot: root,
+      workspace: linkedWorkspace,
+      project: join(linkedWorkspace, 'project'),
+      token: 'test-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const config = readFileSync(join(root, '.biao', 'config.env'), 'utf8');
+    expect(config).toContain(`BIAO_WORKSPACE_ROOTS=${shellSingleQuoted(realpathSync(realWorkspace))}`);
+    expect(config).toContain(`BIAO_PREFERRED_PROJECT=${shellSingleQuoted(realpathSync(realProject))}`);
+    expect(config).not.toContain(linkedWorkspace);
+  });
+
+  it('拒绝通过 project 最终符号链接逃出 canonical workspace', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    const outside = join(root, 'outside');
+    const linkedProject = join(workspace, 'linked-project');
+    mkdirSync(workspace);
+    mkdirSync(outside);
+    symlinkSync(outside, linkedProject);
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: linkedProject,
+      token: 'must-not-write',
+      skipInstall: true,
+      skipBuild: true,
+    })).toThrow(/project 必须位于 workspace 内/);
+    expect(existsSync(join(root, '.biao', 'config.env'))).toBe(false);
+  });
+
+  it('拒绝通过 project 祖先符号链接逃出 canonical workspace', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    const outsideParent = join(root, 'outside-parent');
+    const outsideProject = join(outsideParent, 'project');
+    const linkedParent = join(workspace, 'linked-parent');
+    mkdirSync(workspace);
+    mkdirSync(outsideProject, { recursive: true });
+    symlinkSync(outsideParent, linkedParent);
+
+    expect(() => bootstrap({
+      repoRoot: root,
+      workspace,
+      project: join(linkedParent, 'project'),
+      token: 'must-not-write',
+      skipInstall: true,
+      skipBuild: true,
+    })).toThrow(/project 必须位于 workspace 内/);
+    expect(existsSync(join(root, '.biao', 'config.env'))).toBe(false);
   });
 });

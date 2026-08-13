@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import Redis from 'ioredis';
 import { join } from 'node:path';
-import { runWatchdog, planSubmit, claim, report, agentRegister, getTask } from '../src/server/service.js';
+import { runWatchdog, planSubmit, claim, report, agentRegister, agentOffline, getTask } from '../src/server/service.js';
 import { keys } from '../src/redis/keys.js';
 import { writeTaskToRedis } from '../src/redis/ownership.js';
 
@@ -29,7 +29,7 @@ afterAll(() => {
   redis.disconnect();
 });
 
-/** 造全套异常状态：1 自动修复中的 failed + 1 stale running + 1 stale agent + 1 done 未验收 */
+/** 造全套异常状态：1 自动修复中的 failed + 1 stale running + 1 历史 stale agent + 1 done 未验收 */
 async function seedProblems() {
   await redis.flushdb();
   await planSubmit(redis, join(FIXTURES, 'test-plan'));
@@ -82,14 +82,78 @@ async function seedProblems() {
 }
 
 describe('runWatchdog 问题发现与分类', () => {
-  it('发现 stale running / stale agent / done 未验收；自动修复中的 failed 不反复打扰 PM', async () => {
+  it('legacy failed 只读巡检只建议 watchdog auto-fix，执行后生成 repair 闭环', async () => {
+    await redis.flushdb();
+    await writeTaskToRedis(redis, {
+      task_id: 'legacy-failed-without-resolution',
+      title: 'legacy failed without resolution',
+      type: 'code',
+      phase: 'impl',
+      assignee: 'auto',
+      priority: 5,
+    }, '# legacy failed without resolution', 'legacy-plan', '/tmp/biao-test', 5);
+    await redis.zrem(keys.zset.status.pending, 'legacy-failed-without-resolution');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'legacy-failed-without-resolution');
+    await redis.hset(keys.hash.task('legacy-failed-without-resolution'), {
+      status: 'failed',
+      failed_reason: 'legacy failure',
+      resolution_status: '',
+      resolution_task_id: '',
+    });
+
+    const readonly = await runWatchdog(redis);
+    const legacyProblem = readonly.data?.problems.find((problem) => problem.task_id === 'legacy-failed-without-resolution');
+    expect(legacyProblem).toMatchObject({
+      type: 'failed',
+      suggestion: 'biao watchdog --auto-fix',
+      auto_fixable: true,
+    });
+    expect(legacyProblem?.suggestion).not.toMatch(/\b(?:reset|cancel)\b/);
+    expect(await redis.hget(keys.hash.task('legacy-failed-without-resolution'), 'resolution_status')).toBe('');
+
+    await runWatchdog(redis, { autoFix: true });
+
+    expect(await redis.hgetall(keys.hash.task('legacy-failed-without-resolution'))).toMatchObject({
+      status: 'failed',
+      resolution_status: 'repairing',
+      resolution_task_id: 'legacy-failed-without-resolution-repair-1',
+    });
+    expect(await redis.hgetall(keys.hash.task('legacy-failed-without-resolution-repair-1'))).toMatchObject({
+      status: 'pending',
+      fix_for: 'legacy-failed-without-resolution',
+      repair_root_task_id: 'legacy-failed-without-resolution',
+    });
+  });
+
+  it('explicitly offline historical agent stays auditable without making watchdog unhealthy', async () => {
+    await redis.flushdb();
+    await agentRegister(redis, 'retired-worker', 'mock', ['code']);
+    await redis.hset(keys.hash.agent('retired-worker'), 'current_task', 'historical-task', 'status', 'busy');
+
+    await agentOffline(redis, 'retired-worker', 'worker_exit');
+    await redis.hset(keys.hash.agent('retired-worker'), 'last_heartbeat', String(Date.now() - 10 * 60_000));
+
+    const agent = await redis.hgetall(keys.hash.agent('retired-worker'));
+    expect(agent).toMatchObject({
+      agent_id: 'retired-worker', status: 'offline', current_task: '',
+      last_task: 'historical-task', offline_reason: 'worker_exit',
+    });
+    expect(Number(agent.registered_at)).toBeGreaterThan(0);
+    expect(Number(agent.offline_at)).toBeGreaterThan(0);
+
+    const watchdog = await runWatchdog(redis);
+    expect(watchdog.data?.problems.some((problem) => problem.agent_id === 'retired-worker')).toBe(false);
+    expect(watchdog.data?.summary.healthy).toBe(true);
+  });
+
+  it('发现 stale running / done 未验收；自动修复中的 failed 与历史 idle agent 不反复打扰 PM', async () => {
     await seedProblems();
     const r = await runWatchdog(redis);
     expect(r.ok).toBe(true);
     const types = r.data!.problems.map((p) => p.type);
     expect(types).not.toContain('failed');
     expect(types).toContain('stale_running');
-    expect(types).toContain('stale_agent');
+    expect(types).not.toContain('stale_agent');
     expect(types).toContain('done_unreviewed');
     expect(r.data!.summary.healthy).toBe(false);
 
@@ -97,15 +161,15 @@ describe('runWatchdog 问题发现与分类', () => {
     // failed 已进入 repair，不应把“下一步靠 Worker 自动做”的状态再推给 PM。
     const unreviewed = r.data!.problems.find((p) => p.type === 'done_unreviewed')!;
     const staleRun = r.data!.problems.find((p) => p.type === 'stale_running')!;
-    const staleAgent = r.data!.problems.find((p) => p.type === 'stale_agent')!;
     expect(unreviewed.auto_fixable).toBe(false);
     expect(staleRun.auto_fixable).toBe(true);
-    expect(staleAgent.auto_fixable).toBe(true);
+    expect(staleRun.suggestion).toBe('biao watchdog --auto-fix');
+    expect(staleRun.suggestion).not.toMatch(/\btask reset\b/);
     // 每个问题都有建议
     for (const p of r.data!.problems) expect(p.suggestion.length).toBeGreaterThan(0);
   });
 
-  it('auto-fix 只处理 stale running + stale agent，不碰 repair 中失败任务 / done', async () => {
+  it('auto-fix 只处理 stale running，不碰历史 idle agent / repair 中失败任务 / done', async () => {
     const { staleTaskId } = await seedProblems();
     const r = await runWatchdog(redis, { autoFix: true });
     expect(r.ok).toBe(true);
@@ -114,9 +178,9 @@ describe('runWatchdog 问题发现与分类', () => {
     const stale = await getTask(redis, staleTaskId);
     expect(stale.data?.status).toBe('pending');
 
-    // stale agent → 已标记 offline
+    // 纯历史 stale idle agent 不是当前问题，不应被 auto-fix 改写审计状态。
     const ghost = await redis.hgetall(keys.hash.agent('ghost-worker'));
-    expect(ghost.status).toBe('offline');
+    expect(ghost.status).toBe('idle');
 
     // failed → 不被 watchdog reset，仍由 repair 闭环接管。
     const failedIds = await redis.zrange(keys.zset.status.failed, 0, -1);
@@ -130,7 +194,97 @@ describe('runWatchdog 问题发现与分类', () => {
     expect(doneHash.pm_review_status ?? '').toBe('');
 
     // 修复计数正确
-    expect(r.data!.summary.fixed).toBe(2);
+    expect(r.data!.summary.fixed).toBe(1);
+  });
+
+  it('纯历史 stale idle agent 不进 problems，不影响 healthy', async () => {
+    await redis.flushdb();
+    await agentRegister(redis, 'historical-idle', 'mock', ['code']);
+    await redis.hset(keys.hash.agent('historical-idle'), {
+      last_heartbeat: String(Date.now() - 10 * 60_000),
+      status: 'idle',
+      current_task: '',
+    });
+
+    const watchdog = await runWatchdog(redis);
+    expect(watchdog.data?.problems).toEqual([]);
+    expect(watchdog.data?.summary).toMatchObject({ total_problems: 0, healthy: true });
+  });
+
+  it('指向已终结任务的 stale agent 只作历史审计，不进 problems', async () => {
+    await redis.flushdb();
+    await agentRegister(redis, 'historical-terminal', 'mock', ['code']);
+    await redis.hset(keys.hash.task('historical-done-task'), {
+      task_id: 'historical-done-task',
+      status: 'done',
+      pm_review_status: 'accepted',
+      resolution_status: 'resolved',
+    });
+    await redis.hset(keys.hash.agent('historical-terminal'), {
+      last_heartbeat: String(Date.now() - 10 * 60_000),
+      status: 'busy',
+      current_task: 'historical-done-task',
+    });
+
+    const watchdog = await runWatchdog(redis);
+    expect(watchdog.data?.problems).toEqual([]);
+    expect(watchdog.data?.summary.healthy).toBe(true);
+  });
+
+  it('只有 current_task 对应真实 running 时才将 stale agent 列为当前异常', async () => {
+    await redis.flushdb();
+    await agentRegister(redis, 'stale-running-agent', 'mock', ['code']);
+    await redis.hset(keys.hash.task('active-running-task'), {
+      task_id: 'active-running-task',
+      status: 'running',
+      claimed_by: 'stale-running-agent',
+    });
+    await redis.zadd(keys.zset.status.running, Date.now() + 60_000, 'active-running-task');
+    await redis.set(keys.string.lease('active-running-task'), 'active-token', 'EX', 60);
+    await redis.hset(keys.hash.agent('stale-running-agent'), {
+      last_heartbeat: String(Date.now() - 10 * 60_000),
+      status: 'busy',
+      current_task: 'active-running-task',
+    });
+
+    const watchdog = await runWatchdog(redis);
+    expect(watchdog.data?.problems).toEqual([
+      expect.objectContaining({
+        type: 'stale_agent',
+        agent_id: 'stale-running-agent',
+        auto_fixable: true,
+      }),
+    ]);
+    expect(watchdog.data?.summary.healthy).toBe(false);
+  });
+
+  it('显式 offline 但仍持有 running task 时，lease 失效仍经 stale_running 可见并回收', async () => {
+    await redis.flushdb();
+    await agentRegister(redis, 'offline-running-agent', 'mock', ['code']);
+    await redis.hset(keys.hash.task('offline-running-task'), {
+      task_id: 'offline-running-task',
+      status: 'running',
+      claimed_by: 'offline-running-agent',
+      retries: '0',
+      max_retries: '2',
+      priority: '5',
+    });
+    await redis.zadd(keys.zset.status.running, Date.now() - 1, 'offline-running-task');
+    await redis.hset(keys.hash.agent('offline-running-agent'), {
+      status: 'busy',
+      current_task: 'offline-running-task',
+    });
+    await agentOffline(redis, 'offline-running-agent', 'supervisor_signal');
+
+    const watchdog = await runWatchdog(redis, { autoFix: true });
+    expect(watchdog.data?.problems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'stale_running',
+        task_id: 'offline-running-task',
+        fixed: true,
+      }),
+    ]));
+    expect((await getTask(redis, 'offline-running-task')).data?.status).toBe('pending');
   });
 
   it('健康状态：无问题时 healthy=true', async () => {

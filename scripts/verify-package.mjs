@@ -23,6 +23,7 @@ const requiredPackageInputs = [
   ...new Set([
     ...PREBUILT_RUNTIME_INPUTS,
     ...referencedWebRuntimeInputs(packageRoot),
+    'bin/biao-bootstrap.js',
     'scripts/verify-package.mjs',
   ]),
 ];

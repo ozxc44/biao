@@ -9,7 +9,7 @@
 
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import Redis from 'ioredis';
-import { agentRegister, agentHeartbeat, getStatus } from '../src/server/service.js';
+import { agentRegister, agentHeartbeat, agentOffline, getStatus } from '../src/server/service.js';
 import { keys } from '../src/redis/keys.js';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6380/1';
@@ -51,14 +51,101 @@ describe('agent 在线状态按心跳租约派生', () => {
     expect(['idle', 'busy', 'online']).not.toContain(agent!.status);
   });
 
-  it('在线计数不把历史 stale 注册算进去（hint 反映真实在线数）', async () => {
+  it('没有待领取任务时不因历史 stale Agent 提示启动 Worker', async () => {
     await agentRegister(redis, 'stale-only', 'mock', ['code']);
     await redis.hset(keys.hash.agent('stale-only'), {
       last_heartbeat: String(Date.now() - STALE_THRESHOLD_MS - 60_000),
     });
     const status = await getStatus(redis);
-    // 全是 stale → 等同于无在线 worker，应给出引导 hint
+    expect(status.data!.hint).toBeNull();
+  });
+
+  it('有待领取任务且没有在线 Worker 时才返回接入提示', async () => {
+    await agentRegister(redis, 'stale-only', 'mock', ['code']);
+    await redis.hset(keys.hash.agent('stale-only'), {
+      last_heartbeat: String(Date.now() - STALE_THRESHOLD_MS - 60_000),
+    });
+    await redis.hset(keys.hash.plan('active-plan'), {
+      plan_id: 'active-plan',
+      title: 'active plan',
+      project_path: '/tmp/active-plan',
+      task_count: '1',
+      status: 'submitted',
+      created_at: String(Date.now()),
+    });
+    await redis.hset(keys.hash.task('pending-task'), {
+      task_id: 'pending-task',
+      plan_id: 'active-plan',
+      project_path: '/tmp/active-plan',
+      status: 'pending',
+      type: 'code',
+      depends_on: '',
+    });
+    await redis.zadd(keys.zset.status.pending, Date.now(), 'pending-task');
+
+    const status = await getStatus(redis);
     expect(status.data!.hint).not.toBeNull();
+  });
+
+  it('只把在线或仍持有 running task 的 stale Agent 放在当前组，其余折叠为历史', async () => {
+    await agentRegister(redis, 'fresh-agent', 'mock', ['code']);
+    for (const agentId of ['stale-idle', 'stale-terminal', 'stale-running']) {
+      await agentRegister(redis, agentId, 'mock', ['code']);
+      await redis.hset(keys.hash.agent(agentId), {
+        last_heartbeat: String(Date.now() - STALE_THRESHOLD_MS - 60_000),
+      });
+    }
+    await redis.hset(keys.hash.agent('stale-terminal'), { current_task: 'terminal-task' });
+    await redis.hset(keys.hash.task('terminal-task'), { task_id: 'terminal-task', status: 'done' });
+    await redis.hset(keys.hash.agent('stale-running'), { current_task: 'running-task' });
+    await redis.hset(keys.hash.task('running-task'), { task_id: 'running-task', status: 'running' });
+
+    const status = await getStatus(redis);
+    expect(status.data!.agents).toHaveLength(4); // 旧字段保留全部注册历史
+    expect(status.data!.agent_groups.current.map((agent: { agent_id: string }) => agent.agent_id).sort())
+      .toEqual(['fresh-agent', 'stale-running']);
+    expect(status.data!.agent_groups.history.map((agent: { agent_id: string }) => agent.agent_id).sort())
+      .toEqual(['stale-idle', 'stale-terminal']);
+    expect(status.data!.agents.find((agent: { agent_id: string }) => agent.agent_id === 'stale-terminal'))
+      .toMatchObject({ current_task: 'terminal-task', current_task_status: 'done' });
+    expect(status.data).toMatchObject({
+      attention: { stale_running_agents: 1 },
+      history: { stale_agents: 2 },
+    });
+  });
+
+  it('Supervisor 停止时仍在执行的 Agent 保留 current_task 作异常可见投影', async () => {
+    await agentRegister(redis, 'shutdown-running-agent', 'mock', ['code']);
+    await redis.hset(keys.hash.task('shutdown-running-task'), {
+      task_id: 'shutdown-running-task',
+      plan_id: 'shutdown-plan',
+      status: 'running',
+      claimed_by: 'shutdown-running-agent',
+    });
+    await redis.zadd(keys.zset.status.running, Date.now() + 60_000, 'shutdown-running-task');
+    await redis.hset(keys.hash.agent('shutdown-running-agent'), {
+      status: 'busy',
+      current_task: 'shutdown-running-task',
+    });
+
+    await agentOffline(redis, 'shutdown-running-agent', 'supervisor_signal');
+
+    expect(await redis.hgetall(keys.hash.agent('shutdown-running-agent'))).toMatchObject({
+      status: 'offline',
+      current_task: 'shutdown-running-task',
+      last_task: 'shutdown-running-task',
+      offline_reason: 'supervisor_signal',
+    });
+    const status = await getStatus(redis);
+    expect(status.data!.agent_groups.current).toEqual([
+      expect.objectContaining({
+        agent_id: 'shutdown-running-agent',
+        status: 'offline',
+        current_task: 'shutdown-running-task',
+        current_task_status: 'running',
+      }),
+    ]);
+    expect(status.data).toMatchObject({ attention: { stale_running_agents: 1 } });
   });
 
   it('原始登记信息可审计（registered_at/last_heartbeat 保留）', async () => {

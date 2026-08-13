@@ -15,8 +15,10 @@ import type { Locale } from '../i18n/translations';
 import {
   acceptedProgress,
   countOnlineAgents,
+  getGlobalStatusSummary,
   getPlanAttention,
   getStatusHintMessage,
+  partitionAgents,
   validatePlanId,
   type PlanAttentionAction,
 } from '../view-model';
@@ -123,6 +125,11 @@ export function ProjectListView({
 
   const reviews = status.reviews ?? { ...EMPTY_REVIEWS, pending: status.tasks.done };
   const onlineAgents = countOnlineAgents(status.agents ?? []);
+  const summary = getGlobalStatusSummary(status);
+  const agentGroups = status.agent_groups ?? partitionAgents(status.agents ?? []);
+  const currentAgents = agentGroups.current;
+  const historicalAgents = agentGroups.history;
+  const resolvedAuditCount = summary.history.resolvedFailed + summary.history.resolvedRejected;
   const hintMessage = getStatusHintMessage(status.hint, locale);
 
   return (
@@ -140,8 +147,10 @@ export function ProjectListView({
         <Metric label={t('projectList.metricRunning')} value={status.tasks.running} tone="blue" />
         <Metric label={t('projectList.metricReviewPending')} value={reviews.pending} tone="amber" />
         <Metric label={t('projectList.metricAccepted')} value={reviews.accepted} tone="green" />
-        <Metric label={t('projectList.metricRejected')} value={reviews.rejected} tone="red" />
-        <Metric label={t('projectList.metricFailed')} value={status.tasks.failed} tone="red" />
+        <Metric label={t('projectList.metricRejected')} value={summary.attention.rejected} tone="red" />
+        <Metric label={t('projectList.metricFailed')} value={summary.attention.failed} tone="red" />
+        <Metric label={t('projectList.metricNeedsPmDecision')} value={summary.attention.needsPmDecision} tone="red" />
+        <Metric label={t('projectList.metricResolvedHistory')} value={resolvedAuditCount} tone="green" />
         <Metric label={t('projectList.metricOnlineAgents')} value={onlineAgents} tone="violet" />
         <Metric label={t('projectList.metricConflicts')} value={status.ownership_conflicts} tone="amber" />
       </section>
@@ -153,17 +162,27 @@ export function ProjectListView({
             <h2>{t('projectList.agentsHeading')}</h2>
           </div>
           <span className="section-summary">
-            {t('projectList.agentsSummary', { online: onlineAgents, total: status.agents.length })}
+            {t('projectList.agentsSummary', { online: onlineAgents, total: currentAgents.length })}
           </span>
         </div>
-        {status.agents.length === 0 ? (
-          <div className="empty-state">{t('projectList.agentsEmpty')}</div>
+        {currentAgents.length === 0 ? (
+          <div className="empty-state">{t('projectList.agentsCurrentEmpty')}</div>
         ) : (
           <div className="agent-list">
-            {status.agents.map((agent) => (
+            {currentAgents.map((agent) => (
               <AgentRow key={agent.agent_id} agent={agent} now={now} locale={locale} />
             ))}
           </div>
+        )}
+        {historicalAgents.length > 0 && (
+          <details className="agent-history">
+            <summary>{t('projectList.agentsHistorySummary', { count: historicalAgents.length })}</summary>
+            <div className="agent-list">
+              {historicalAgents.map((agent) => (
+                <AgentRow key={agent.agent_id} agent={agent} now={now} locale={locale} />
+              ))}
+            </div>
+          </details>
         )}
       </section>
 
@@ -285,7 +304,11 @@ function AgentRow({ agent, now, locale }: { agent: AgentInfo; now: number; local
       <span className={`status-chip status-${agent.status}`}>{getStatusLabel(agent.status, t)}</span>
       <div className="agent-task">
         <span>{t('projectList.currentTaskLabel')}</span>
-        <strong>{agent.current_task || t('projectList.currentTaskIdle')}</strong>
+        <strong>
+          {agent.current_task
+            ? `${agent.current_task}${agent.current_task_status ? ` · ${getStatusLabel(agent.current_task_status, t)}` : ''}`
+            : t('projectList.currentTaskIdle')}
+        </strong>
       </div>
       <time dateTime={toDateTime(agent.last_heartbeat)} title={formatTimestamp(agent.last_heartbeat, locale)}>
         {formatHeartbeat(agent.last_heartbeat, now, t)}

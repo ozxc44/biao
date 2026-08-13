@@ -1,15 +1,23 @@
 # Biao
 
-> 管理多个开发 Agent，并用真实证据证明任务已经完成。
+[简体中文](README.md) | [English](README.en.md)
 
-Biao 是一个本地优先的多 Agent 研发控制台。它不负责替代 Codex、Kimi 或其他编码 Agent，而是位于它们之上，统一管理计划、任务领取、文件所有权、租约、验证证据和 PM 验收。
+> **带上你的原配（harness），一起开团。 / Bring your own harness. Squad up.**
+
+**问题本质**：今天的每个模型都自带自己的 harness——Codex、Claude Code、ZCode、Kimi 各有各的 CLI 和运行时，但它们彼此并不认识。让两个不同 harness 的 Agent 安全地改同一个仓库、不互相覆盖、能互相验收，今天只能靠人肉盯。Biao 不是又一个 harness，而是**架在这些 harness 之上的协作平台**：你不换掉手里任何一个 Agent，把它们编进同一支队伍，由 Biao 统一管计划、管文件所有权、管验证证据、管 PM 验收。
+
+Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证据证明它真的完成了。
 
 ```text
-Codex / Kimi / 其他 CLI Agent / 自定义 Worker
-                       ↓
-              Biao 调度与验收层
-                       ↓
-              真实项目、测试与证据
+   Codex · Claude Code · ZCode · Kimi · 任意 CLI / HTTP Agent
+        └── 它们就是你的原配 harness，Biao 一个都不替换 ──┘
+                              ↓
+        ┌─────────────────────────────────────────────┐
+        │  Biao：计划 → 领取 → Ownership → Lease       │
+        │        → Verify → 独立验收 → PM Review        │
+        └─────────────────────────────────────────────┘
+                              ↓
+        真实项目代码 · 可复核的测试证据 · 完整审计轨迹
 ```
 
 ## 为什么使用 Biao
@@ -33,28 +41,64 @@ Biao 将完成链路固化为：
 
 ## 产品亮点
 
-- **多 Agent 并发治理**：DAG 依赖、优先级、指定执行者、文件 glob 所有权与冲突记录。
-- **结果可信**：任务声明的 Verify 必须逐项执行和上报；失败结果不能进入成功状态。
-- **执行与验收分离**：验收任务禁止由原任务执行者完成，最终还需要 PM Review。
-- **失败可闭环**：Worker 失败、独立验收失败或 PM 拒绝会保留原始审计，并生成受限的 repair 链；repair 的证据仍须经 PM 验收后才算真正修复。
-- **异构 Agent 中立**：内置 Codex、Kimi、通用 CLI Worker，也可通过 HTTP API 接入其他 Agent。
-- **长任务可靠运行**：心跳、Lease 自动续期、过期回收、阻塞/恢复、重置和撤销。
-- **本地优先**：Node.js + Redis + SQLite 即可运行，适合本机、局域网和私有部署。
-- **状态可审计**：Redis 负责实时调度，SQLite 保存任务、结果和验收元数据用于恢复。
-- **统一控制台**：清楚区分待领取、执行中、待验收、已验收、拒绝、失败、阻塞和撤销。
+Biao 不和任何 harness 竞争，它补的是 harness 之间的空白：**当不同模型的 Agent 必须在同一个真实项目里分工时，谁来定边界、谁来验收、失败谁来收口。** 下面是 Biao 把这层协作平台做实的几个支柱。
 
-与通用 Agent 框架相比，Biao 的重点不是 Agent 如何对话，而是多个执行者如何安全地修改真实项目；与单个 Coding Agent 相比，Biao 的重点不是替它写代码，而是调度、约束和验收不同 Agent 的工作。
+### 可信完成链路 · Verifiable Completion
+
+- **Verify 必跑、逐项上报**：任务声明的验证命令必须按序执行并回传每条命令的退出码与输出；任一失败不能进入成功状态。
+- **执行者 ≠ 验收者**：`acceptance` 任务禁止由原实现 Agent 领取，必须由独立 Agent 复核，再经 PM Review。
+- **`done` 不等于完成**：只有 PM Review 为 `accepted`（或失败经 repair `resolved`）才计入项目完成进度。Worker 心跳、退出码 0、生成了文件、上报了 `done`，都不能单独代表验收完成。
+
+> 对比单个 Coding Agent：它会"说完成了"，但没有独立验收层帮你证伪。
+
+### 无人盯盘的失败闭环 · Autonomous Fail-Safe Closure
+
+Worker 失败、Verify 失败或 PM 拒绝不会被丢进一个需要人盯的故障桶。Biao **保留原始失败/拒绝审计**，再生成一条受限的 repair 链：repair 继承原 ownership 与 Verify，交付后仍须经 PM Review；独立 `acceptance` 失败时 repair 指向**被验收的原实现**，避免"修复任务依赖失败验收"的死锁；达到 `max_retries` 才升级为 `needs_pm_decision`，不会无限盲目重跑。
+
+> 对比通用编排框架：多数只到"重试 N 次"为止，Biao 给出的是**可审计、可终止、可由 PM 收口**的闭环。
+
+### 文件级 Ownership 与并发安全 · Ownership Isolation
+
+任务以文件 glob 声明可改范围；`claim` 时取得 ownership，写文件前对每个路径再校验一次 `proceed / wait`。两个 Agent 同时改同一个文件会被显式阻塞或冲突记录，而不是默默互相覆盖。
+
+> 这是多 Agent 真正能并行的前提：没有 ownership 边界，并发就是竞态。
+
+### 异构 Agent 中立 · Bring Your Own Harness
+
+不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、自定义 Agent 做调研。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
+
+### 双层可恢复性 · Redis + SQLite
+
+Redis 负责实时调度（lease、ownership、队列），SQLite 保存任务、结果和验收元数据作为**灾难恢复投影**。Redis namespace 丢失时，可从 SQLite 审计恢复可安全重跑的状态；服务中断后任务和证据不丢。
+
+### 被动事件中枢 + 持久化 Question · Passive Hub
+
+平台不主动 push、不常驻 Reviewer、不自动验收。状态变化只写一次**持久、可补交、可确认**的 PM 事件，由 PM 主动轮询；Worker 遇到产品决策时不向人类会话提问，而是发一条 `BIAO_QUESTION`，平台原子创建 Question、释放 lease、置任务等待，PM 回答后才用新 claim 继续。
+
+> 对比 chat 式 Agent：没有"悄悄搁住任务等人回答"的灰色地带。
+
+### 本地优先与私有部署 · Local-First
+
+Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网和受控私有环境；`bootstrap.sh` 检测依赖、按授权安装、生成权限 `600` 的配置与随机 Token，不把凭据写进 argv、Shell 历史或版本库。
+
+---
+
+一句话定位：**harness 解决的是"一个 Agent 怎么把代码写好"，Biao 解决的是"多个不同 harness 的 Agent 怎么一起安全地把项目交付完"。**
 
 ## 系统要求
 
 - Node.js 20.19+ 或 22.12+
 - Redis
-- Codex Worker 需要系统中已安装并登录 `codex`
-- Kimi Worker 需要系统中已安装并登录 `kimi`
+- 内置 Worker：Codex Worker 需已安装并登录 `codex`；Kimi Worker 需已安装并登录 `kimi`
+- 其他 Agent（Claude Code、ZCode、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
 
 `bootstrap.sh` 会先检测 Node.js、npm、Redis 命令和 Redis 连通性。默认只检测，不修改系统；缺少依赖时会以退出码 `2` 停止。只有显式加 `--yes`，它才会调用 macOS Homebrew 或 Linux 的 apt、dnf、yum 安装缺失依赖；其中 Linux 可能要求管理员权限。本机 Redis 不可用时才会尝试启动本机服务，远程 Redis 只做连通性检查，绝不尝试远程安装或启动。若包管理器不可用、安装后的 Node.js 低于 20.19/22.12，或 Redis 仍无法连接，脚本会停止并说明原因。
 
-## Clone 后开箱即用
+## 开箱即用
+
+Biao 支持两种明确布局：从 Git clone 的**源码布局**，以及通过 npm 安装受信任 tarball 的**预构建布局**。不要混用两套命令，也不要直接解压 tarball 代替 `npm install`。
+
+### 源码 clone
 
 Agent 或开发者从 Git 获取仓库后，只需要执行一次 bootstrap：
 
@@ -78,7 +122,41 @@ bootstrap 会自动完成：
 6. 生成服务、安全复制 Token、交互式 PM、显式 opt-in 的 PM Agent 唤醒器、Supervisor、Codex、Kimi 和自定义 Worker 启动器；使用 `--pm-agent codex` 时直接接入内置 Codex PM 适配器；
 7. 生成供 Agent 阅读的 `.biao/PM_AGENT.md`。
 
-从 Git clone 的源码目录运行时，bootstrap 会安装依赖并完成构建；通过 `npm install <受信任的本地包.tgz>` 安装后运行时，它会校验完整的预构建运行时并跳过开发依赖安装与重复构建。不要把裸解压 tarball 当成安装，因为它不包含生产依赖。两种受支持布局只要缺少任一必需入口或网页静态资源都会立即停止，不会生成一个表面成功、实际不可启动的 `.biao/`。
+从 Git clone 的源码目录运行时，bootstrap 会安装依赖并完成构建。
+
+### 已安装 npm tarball
+
+tarball 只用于本地或受控私有分发。下面的命令在一个专用运行目录中安装包，并通过稳定的公共命令 `biao-bootstrap` 配置预构建运行时；请把路径替换成实际的受信任制品和工作区：
+
+```bash
+mkdir -p /path/to/biao-runtime
+cd /path/to/biao-runtime
+npm init -y
+npm install /absolute/path/to/vtp-biao-0.1.0.tgz
+
+./node_modules/.bin/biao-bootstrap --yes \
+  --workspace /path/to/workspace \
+  --project /path/to/workspace/my-project \
+  --pm-agent codex
+
+./.biao/doctor
+./.biao/start
+```
+
+预构建布局把两类内容明确分开：`node_modules/@vtp/biao` 只保存可替换的只读代码与网页静态资源；调用命令的当前目录下 `.biao/` 保存 `config.env`、Token、SQLite/数据以及启动器。启动器从外置 `.biao/config.env` 读取配置，再通过写死并安全引用的 packageRoot 绝对路径执行已安装代码，不会把 `node_modules` 当作可变数据目录。因此重新安装或升级 npm 包不会顺带删除运行状态。bootstrap 会校验服务、CLI、Worker、SQLite schema 与网页静态资源，并跳过开发依赖安装和重复构建。保持服务终端运行后，可在另一终端执行 `./.biao/copy-token`。
+
+需要把状态放在其它位置时使用显式 `--runtime-dir /absolute/biao-state`。预构建布局会拒绝 packageRoot 内或任意 `node_modules` 内的 runtime-dir，避免包升级时丢失数据。升级时先在同一个消费目录安装新版 tarball，再从该目录刷新启动器；已有配置、Token 和数据会原样保留，启动器改为指向新版 packageRoot：
+
+```bash
+cd /path/to/biao-runtime
+npm install /absolute/path/to/vtp-biao-new.tgz
+./node_modules/.bin/biao-bootstrap \
+  --workspace /path/to/workspace \
+  --project /path/to/workspace/my-project \
+  --upgrade
+```
+
+不要裸解压 tarball，因为它不包含生产依赖；任一必需入口缺失时 bootstrap 会立即停止，不会生成表面成功、实际不可启动的配置。
 
 生成的 `.biao/` 已被 Git 忽略，不会把本机路径或 Token 提交到仓库。
 
@@ -101,7 +179,7 @@ bootstrap 会自动完成：
 
 macOS 使用系统 `pbcopy`。Linux 需要 `wl-copy`、`xclip` 或 `xsel` 中任意一个；没有安全剪贴板工具时命令会给出安装指引并以非零状态退出，不会回退为把 Token 打印到终端。
 
-`doctor` 会检查 Node、npm、Redis 连通性、工作区，以及 Codex/Kimi 是否可用。Codex 和 Kimi 是可选项；至少配置一种实际执行器即可。`doctor` 成功只证明本机运行条件可用，不代表项目已验收；启动后可用 `.biao/pm-start --once` 完成一次只读的 health/status/intake 检查，它不会自动确认事件或验收任务。
+`doctor` 会检查 Node、npm、Redis 连通性、工作区，以及 Codex/Kimi 是否可用。默认情况下 Codex 和 Kimi 都是可选项；一旦 bootstrap 显式选择 `--pm-agent codex`，Codex CLI 就成为该安装的必需依赖，doctor 缺失时会失败。至少配置一种实际执行器即可。`doctor` 成功只证明本机运行条件可用，不代表项目已验收；启动后可用 `.biao/pm-start --once` 读取 health/status/intake，并完成一次幂等 reconcile。它不会自动确认事件或验收任务。
 
 推荐另开终端启动一个 Supervisor；它统一 PM 门铃和多个 Worker slot。空闲 slot 没有各自的 timer 或 claim 轮询，只在每个共享低频轮次中至多发送一次 presence heartbeat，避免看板把可用 Agent 误判为 stale：
 
@@ -128,7 +206,7 @@ BIAO_WORKER_SLOTS='[
 - `done + review pending` 的历史待验收，即使旧数据没有留下 `review_requested` 门铃；PM 应使用 `.biao/pm review list` 后逐项读取证据并决定接受或拒绝；
 - 有待执行任务但没有在线 Worker；先运行 `.biao/doctor`，再启动至少一个 Worker 或配置带 slot 的 Supervisor。
 
-入口只读状态和门铃，**绝不自动 ack、绝不自动验收**。需要持续低频监视时去掉 `--once`，例如 `.biao/pm-start --consumer pm --interval 60`；任务全部验收后 Supervisor 会自行停止。
+入口读取状态和门铃，并允许共享 Supervisor 做 lease/等待态等幂等恢复；若显式配置 Worker slot，也会在声明范围内调度。它**绝不自动 ack、绝不自动验收**。需要持续低频监视时去掉 `--once`，例如 `.biao/pm-start --consumer pm --interval 60`；任务全部验收后 Supervisor 会自行停止。
 
 `.biao/pm-intake` 仅保留给旧自动化或故障诊断；新 PM 会话始终从 `.biao/pm-start --once` 开始。之后 Agent 可使用统一 PM 命令：
 
@@ -191,23 +269,26 @@ BIAO_PM_AGENT_CMD='your-pm-agent-command' .biao/supervisor
 chmod 600 /secure/path/biao-token
 ./bootstrap.sh --yes --workspace /path --token-file /secure/path/biao-token
 
-# 已安装依赖时跳过安装；重新生成配置需要显式 --force
+# 已安装 npm 依赖时跳过 npm install；系统 Node/Redis 检测与 --yes 授权不受影响
 ./bootstrap.sh --yes --workspace /path --no-install --force
 
 # 升级已有 clone 的启动器和 PM 手册，不改现有 Token、Redis 或路径配置
 ./bootstrap.sh --workspace /path --no-install --no-build --upgrade
+
+# npm 安装版可显式把可变状态放到 node_modules 之外的固定目录
+./node_modules/.bin/biao-bootstrap --workspace /path --runtime-dir /absolute/biao-state
 ```
 
 已有 `.biao/config.env` 时 bootstrap 默认拒绝覆盖，防止 Token 和运行配置被意外替换。
 默认应让 bootstrap 生成随机 Token。需要由秘密管理器提供已有 Token 时，可使用 `--token-file`，或让秘密管理器注入专用的 `BIAO_BOOTSTRAP_TOKEN` 环境变量；不要使用内联环境变量赋值，也不要把 Token 放进命令参数、Shell 历史或版本库。Token 文件必须是普通、非符号链接、owner-only 文件（例如权限 `600`）。
 
-如果只想检测、不允许安装或启动服务，去掉 `--yes`：
+如果只想检测 Node、npm、Redis 工具与连通性，不允许安装、构建或写入 `.biao`，使用正式的只读模式（即使同时误传 `--yes` 也不会安装）：
 
 ```bash
-./bootstrap.sh --workspace /path/to/workspace
+./bootstrap.sh --check --redis-url redis://127.0.0.1:6379
 ```
 
-缺少依赖或本机 Redis 未运行时，它会以退出码 `2` 停止，并提示用 `--yes` 重新执行。远程 `--redis-url` 只做连通性检查，不会尝试启动远程服务。Windows 原生环境需手动准备依赖；WSL 按 Linux 路径处理。
+检查通过退出码为 `0`，缺少依赖或 Redis 不可连接时为 `2`；两种结果都不会安装、启动服务、运行 npm、构建或写配置。不带 `--check` 时，`--yes` 只控制缺失系统依赖的安装和本机 Redis 启动；依赖已经就绪后，bootstrap 仍会按正常流程构建并生成配置。远程 `--redis-url` 只做连通性检查，不会尝试启动远程服务。Windows 原生环境需手动准备依赖；WSL 按 Linux 路径处理。
 
 ## 快速开始
 
@@ -288,7 +369,7 @@ BIAO_KIMI_MODEL="kimi-code/k3" \
 node bin/kimi-worker.js
 ```
 
-Worker 默认常驻：队列为空时继续等待，可用 `Ctrl-C` 优雅停止。
+上面的 `node bin/*-worker.js` 是原始兼容入口，默认常驻并在队列为空时继续轮询，可用 `Ctrl-C` 优雅停止。生产环境优先使用 bootstrap 生成的 `.biao/worker-*`（空闲即退出），或用一个共享 `.biao/supervisor` 统一承载多个 Worker slot；不要为每个 Agent 启动一个长期空转的独立循环。
 
 ### 6. 查看和验收
 
@@ -450,11 +531,15 @@ Biao 提供四种接入方式。
 
 以下示例均使用仓库内的 `node bin/...` 或 bootstrap 生成的 `.biao/...` 入口；clone 后不需要也不假定系统已经全局安装了 `biao` 命令。完整的领取、ownership、Question 和上报契约见 [Worker 接入契约](docs/worker-integration.md)。
 
+生产环境优先直接运行 `.biao/worker-codex`、`.biao/worker-kimi`、`.biao/worker-custom` 或共享 `.biao/supervisor`。下面保留的原始 `node bin/...` 示例会从权限为 `600` 的 `.biao/config.env` 加载服务地址和 Token，不把 Token 写进命令行或 Shell 历史：
+
 ### 方式一：使用内置 Codex Worker
 
 ```bash
-BIAO_URL="http://127.0.0.1:7331" \
-BIAO_API_TOKEN="your-token" \
+set -a
+. .biao/config.env
+set +a
+
 BIAO_AGENT_ID="codex-backend-1" \
 BIAO_PREFERRED_PROJECT="/path/to/workspace/my-project" \
 node bin/codex-worker.js
@@ -465,8 +550,10 @@ Codex Worker 会自动完成：注册、心跳、领取、所有权检查、Leas
 ### 方式二：使用内置 Kimi Worker
 
 ```bash
-BIAO_URL="http://127.0.0.1:7331" \
-BIAO_API_TOKEN="your-token" \
+set -a
+. .biao/config.env
+set +a
+
 BIAO_AGENT_ID="kimi-frontend-1" \
 BIAO_PREFERRED_PROJECT="/path/to/workspace/my-project" \
 BIAO_KIMI_BIN="kimi" \
@@ -501,8 +588,10 @@ my-agent --project "$PWD" --prompt-file "$goal_md"
 ```bash
 chmod +x /path/to/my-biao-agent
 
-BIAO_URL="http://127.0.0.1:7331" \
-BIAO_API_TOKEN="your-token" \
+set -a
+. .biao/config.env
+set +a
+
 BIAO_AGENT_ID="custom-agent-1" \
 BIAO_EXEC_CMD="/path/to/my-biao-agent" \
 BIAO_PREFERRED_PROJECT="/path/to/workspace/my-project" \
@@ -539,6 +628,8 @@ Content-Type: application/json
 
 #### 1. 注册
 
+每个 Worker 进程先在客户端生成一个高熵 `registration_id`；同一次注册因断线重试时复用它，新进程则生成新值。示例使用 `reg_` 加 32 位随机十六进制：
+
 ```bash
 curl -X POST http://127.0.0.1:7331/register \
   -H "Authorization: Bearer $BIAO_API_TOKEN" \
@@ -546,19 +637,24 @@ curl -X POST http://127.0.0.1:7331/register \
   -d '{
     "agent_id": "remote-agent-1",
     "agent_type": "custom",
-    "capabilities": ["code", "review", "acceptance"]
+    "capabilities": ["code", "review", "acceptance"],
+    "registration_id": "reg_0123456789abcdef0123456789abcdef"
   }'
 ```
 
 #### 2. 发送心跳
 
-空闲时 `current_task` 传空字符串，执行时传任务 ID：
+保存注册响应中的 `data.registration_id`。它标识当前 Agent 进程的会话代次；推荐自定义 Worker 自己生成 128 bit 随机值并随 register 提交，使注册网络重试保持幂等。之后心跳、领取和离线都必须复用该值。新进程重新注册后，平台会拒绝旧代次继续改写同名 Agent。
+
+自定义 `registration_id` 和 `claim_request_id` 都必须为 16–128 位：首字符是字母或数字，其余字符只能是字母、数字、`_`、`-`。示例使用 `reg_` / `claim_` 加 32 位十六进制随机值。
+
+空闲时 `current_task` 传空字符串（也可省略），执行时传任务 ID：
 
 ```bash
 curl -X POST http://127.0.0.1:7331/heartbeat \
   -H "Authorization: Bearer $BIAO_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"agent_id":"remote-agent-1","current_task":""}'
+  -d '{"agent_id":"remote-agent-1","registration_id":"<registration_id returned by register>","current_task":""}'
 ```
 
 #### 3. 领取任务
@@ -569,11 +665,15 @@ curl -X POST http://127.0.0.1:7331/claim \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "remote-agent-1",
+    "registration_id": "<registration_id returned by register>",
+    "claim_request_id": "<new random id; reuse only for this request's transport retry>",
     "blocking": false,
     "preferred_types": ["code"],
     "preferred_project": "/path/to/workspace/my-project"
   }'
 ```
+
+`claim_request_id` 用来安全重放一次领取调用：每次新的领取都生成新的高熵 ID；只有同一次请求因断线或 5xx 重试时才复用。若服务端已经提交领取但响应丢失，平台会用它返回同一个任务和 `claim_token`，而不是让任务卡到 Lease 过期。
 
 领取成功后应保存以下字段：
 
@@ -638,6 +738,19 @@ curl -X POST http://127.0.0.1:7331/report \
 `result.md` / `result.json` 是推荐的可审计产物；内置 Worker 会写入 `work/<task_id>/`。自定义 Worker 一旦上报这两个路径，它们必须指向当前任务目录内对应的普通文件：`work/<task_id>/result.md` 与 `work/<task_id>/result.json`，不能跨任务、使用软链接或在上报后替换。`report` 的关键事实同时包括当前 `claim_token`、任务状态、逐项 `verify_results` 与可复核产物；文件存在本身不能替代成功证明。
 
 内置 Worker 的 `.progress.json` 只由外层调度器维护，执行 Agent 不得创建或覆盖。调度器以同目录临时文件原子替换并将权限固定为 `0600`，记录 `claimed → running → verifying → reporting → finished/failed` 阶段；只有 `result.*` 已写入且 report 已得到明确结果后才写终态。该文件不保存 claim token、API 凭据、Agent 原始输出或异常正文。它用于观察当前 Worker 尝试，不代表 PM 已验收，也不能替代 report。自定义 Worker 可采用同样的进度文件，但仍须以平台 report 和独立 PM Review 为准。
+
+#### 7. 正常退出时离线
+
+自定义 Worker 停止领取任务前必须收口当前会话；`registration_id` 仍使用注册响应中的原值：
+
+```bash
+curl -X POST http://127.0.0.1:7331/agent/offline \
+  -H "Authorization: Bearer $BIAO_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"remote-agent-1","registration_id":"<registration_id returned by register>","reason":"worker_exit"}'
+```
+
+该接口幂等并保留最后任务与离线原因作为审计；进程崩溃来不及调用时，才由心跳超时和 watchdog 回收。内置 Worker 与共享 Supervisor 已自动执行此步骤。
 
 ## Worker 运行参数
 
@@ -757,12 +870,12 @@ node bin/biao.js db restore --yes
 执行顺序：
 
 1. 停止所有 Biao Supervisor 和 Worker，避免恢复时产生新的 claim、lease 或写入；
-2. 运行 `node bin/biao.js db status`，核对 SQLite 中的 plan/task 数量和状态分布；
+2. 运行 `node bin/biao.js db status`，同时核对 SQLite 审计总数与 `可恢复投影`；输出会单列“排除但保留审计”的 plan/task 数量和原因；
 3. 确认目标 Biao Redis namespace 为空；非空目标以及活跃的 `running`、lease、ownership 都会被服务端拒绝；
 4. 显式运行 `node bin/biao.js db restore --yes`；没有 `--yes` 时 CLI 在发请求前以非零状态退出；
 5. 重新检查 plan/task 状态，再启动共享 Supervisor/Worker。
 
-恢复不会复活旧执行现场。SQLite 中历史 `running` 会转换成 fresh `pending` 等待重新领取，旧 lease、ownership 和 claim token 均失效。CLI 会保留服务端稳定错误码和消息并以非零状态退出，运维脚本不得把拒绝误判为恢复成功。完整边界可用 `node bin/biao.js db restore --help` 查看。
+恢复不会复活旧执行现场。恢复投影只包含配置的 `BIAO_WORKSPACE_ROOTS` 内项目；缺少项目路径、越过工作区边界的项目，以及未配置 roots 时位于操作系统临时目录的项目，会从 Redis 恢复投影中排除，但原 plan/task 仍完整保留在 SQLite 历史审计中。合法项目确实位于临时目录时，必须把它显式加入 `BIAO_WORKSPACE_ROOTS`，不能靠任务 ID 白名单绕过边界。SQLite 中可恢复的历史 `running` 会转换成 fresh `pending` 等待重新领取，旧 lease、ownership 和 claim token 均失效。CLI 会保留服务端稳定错误码和消息并以非零状态退出，运维脚本不得把拒绝误判为恢复成功。完整边界可用 `node bin/biao.js db restore --help` 查看。
 
 `watchdog --auto-fix` 只处理安全的过期运行任务和失联 Agent；它不自动验收，也不重置 repair 中的源任务。自动 repair 已在运行的失败任务由 repair 链接管，不应再作为“请 PM 手工重做”的重复提醒；超过 `max_retries` 的 `needs_pm_decision` 才需要 PM 决策。
 
@@ -836,7 +949,7 @@ PM 用 `intake → 处理 → ack` 主动轮询，平台保持被动。`ack` 只
 # 处理完成后幂等确认
 .biao/pm pm ack --consumer pm --event-id <id>
 
-# 低频 watch 模式（Ctrl-C 退出，默认 60s 一次）
+# 低频 watch 模式（默认 60s 一次；全部 Plan 闭环且 intake 为空时自动退出）
 .biao/pm pm watch --consumer pm --interval 60
 ```
 
@@ -848,7 +961,7 @@ PM 用 `intake → 处理 → ack` 主动轮询，平台保持被动。`ack` 只
 
 - 同一台机器、同一个 Biao 服务地址默认只允许一个实例（本机锁文件，**不用 Redis 全局锁**，不会误伤其他客户端机器）。
 
-- 每个轮次只共享读取一次 `/plans`、`/intake`、`/events`，并调用一次幂等 `POST /reconcile`；后者只回收过期 lease、恢复已满足条件的 `waiting_dependency` / `waiting_file_release`，绝不领取任务、回答 Question 或替 PM 决策。事件优先使用 `after` / `next_cursor`，旧服务自动兼容回退到毫秒 `since` + event-id 去重。
+- 每个轮次只共享读取一次 `/plans`、`/events`，并为每个显式受管 Plan 读取一次最小 `/intake`（未指定 Plan 时全局一次），再调用一次幂等 `POST /reconcile`；后者只回收过期 lease、恢复已满足条件的 `waiting_dependency` / `waiting_file_release`，绝不领取任务、回答 Question 或替 PM 决策。事件优先使用 `after` / `next_cursor`，旧服务自动兼容回退到毫秒 `since` + event-id 去重。
 - PM 的本机门铃只显示 Plan、事项类型和数量，**不展开任务、问题或事件 ID**；Supervisor **绝不自动 ack**。配置 `BIAO_PM_AGENT_CMD` 后，同一个进程会按需启动一次 PM Agent，并在命令退出后复查待办；未处理就撤销本机去重、下轮重试。PM Agent 仍须自己读取详情、验收或回答后，再显式 ack 对应事件。
 - 每个空闲 slot 不单独启动 timer 或 `/claim` 轮询；它只在每个共享轮次中至多发送一次 presence heartbeat，避免服务端把可用 Agent 误判为 stale。running slot 不重复发送这种 presence，由 Worker 自己维护带当前任务的 heartbeat/lease。
 - 同一轮中，完全相同的项目 + task type + plan 过滤条件会合并空 claim；不同能力的 Agent 仍各有一次领取机会，避免互相饿死。
@@ -952,6 +1065,8 @@ CLI、Worker 和网页控制台在启用认证时使用同一个 Token。一旦�
 
 ## 状态语义
 
+看板和 `/status` 明确区分**当前待处理**与**历史审计**：兼容字段 `tasks` / `reviews` 继续保留不可变原始总数；`attention` 只统计尚未闭环的 failed、rejected、`needs_pm_decision` 和仍持有 running task 的失联 Agent；`history` 单列已由 repair 解决的 failed/rejected 与历史 Agent。首页红色指标只使用 `attention`，不会把 `resolution_status=resolved` 的旧失败继续显示成当前故障。
+
 | 状态 | 含义 |
 | --- | --- |
 | `pending` | 等待符合条件的 Worker 领取 |
@@ -967,7 +1082,7 @@ CLI、Worker 和网页控制台在启用认证时使用同一个 Token。一旦�
 | `cancelled` | PM 撤销，不再调度 |
 | `superseded` | PM 显式退出升级前的 `done + pending review` 伪完成；原交付与审计保留，不再验收或调度 |
 
-Agent 的在线状态按心跳租约派生：心跳在 5 分钟阈值内的显示 `idle`/`busy`；超过阈值则派生为 `stale`（或已显式置 `offline`），**不会**因历史注册记录继续显示为 `idle/online`。原始登记信息（`registered_at`/`last_heartbeat`）始终保留可审计。心跳恢复后自动重新计入在线。
+Agent 的在线状态按心跳租约派生：心跳在 5 分钟阈值内的显示 `idle`/`busy`；超过阈值则派生为 `stale`。Worker 正常退出、Supervisor 收到停止信号或受管计划全部终结时，会调用平台的显式离线接口并保留 `last_task`、`registered_at`、`last_heartbeat`、离线时间与原因。若任务已经终结，接口会清除 `current_task`；若 Agent 子进程仍在执行真实 `running` 任务，则保留该指针、立即停止续租，让 `/status` 与 watchdog 持续可见并在 lease 过期后安全回收。只有这种失联运行态留在当前异常，其余 stale/offline 记录折叠到历史列表；新的注册或心跳会重新计入在线。
 
 重置已完成任务会清除旧结果、Verify 证据和 PM Review，重新执行后必须重新验收。`cancelled` 与 `superseded` 都是不可 reset 的终态；遗留伪完成应使用上面的显式 preview/confirm 流程，而不是先清空证据再复活。
 
@@ -985,6 +1100,10 @@ REPAIR_OWNERSHIP_TEST_REDIS_URL="redis://127.0.0.1:6379/6" \
 RESTORE_DOORBELL_TEST_REDIS_URL="redis://127.0.0.1:6379/7" \
 RESTORE_MAINTENANCE_TEST_REDIS_URL="redis://127.0.0.1:6379/8" \
 SUPERSEDE_TEST_REDIS_URL="redis://127.0.0.1:6379/9" \
+RUNTIME_RECONCILE_TEST_REDIS_URL="redis://127.0.0.1:6379/10" \
+STATUS_PROJECTION_TEST_REDIS_URL="redis://127.0.0.1:6379/11" \
+AGENT_EPOCH_TEST_REDIS_URL="redis://127.0.0.1:6379/12" \
+BLOCKING_CLAIM_TEST_REDIS_URL="redis://127.0.0.1:6379/15" \
 npm test
 npm --prefix web test -- --run
 npm run build
@@ -1017,3 +1136,7 @@ Biao 当前定位是本地和私有环境的多 Agent 研发控制台，而不�
 - 跨节点自动部署和弹性扩缩容。
 
 这些能力可以后续接入，但不影响当前本地多 Agent 调度、验证和验收闭环。
+
+### 私有分发策略
+
+当前 `package.json` 保持 `private: true` 与 `license: UNLICENSED`：仓库 clone 和 npm tarball 都只面向授权的本地/私有环境，不代表授予公众复制、修改或再分发许可。CI 只验证构建与私有制品完整性，不包含公开 npm publish 或 GitHub Release 发布流程；若未来需要开源或公开发布，必须先由所有者单独确定许可证、包名、版本与发布审批。

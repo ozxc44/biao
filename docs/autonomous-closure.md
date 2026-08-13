@@ -13,10 +13,12 @@ Biao 的目标不是让 PM 常驻看板，而是把每次状态变化变成可�
 | `waiting_dependency` | Worker / 共享 Supervisor | 否；前置闭环后重新领取 |
 | Worker failed、Verify failed、PM reject | 平台生成的 repair Worker | 否；平台写入 `repair_scheduled` 审计并排队，PM 等 repair 交付后的验收门铃 |
 | repair 达到 `max_retries` | PM | 是；根任务为 `needs_pm_decision` |
-| stale Worker / stale lease | watchdog 的安全恢复或 PM | 仅仍持有 running task 时提醒；空闲历史注册静默 |
+| stale Worker / stale lease | Worker/Supervisor 显式离线；异常中断再由 watchdog 安全恢复或 PM | 仅失联且仍持有 running task 时提醒；空闲与终态历史注册静默 |
 | 升级前遗留的 `done + pending review` 伪完成 | PM 显式 `supersede` | 否；撤下活跃验收门铃，保留原结果和审计 |
 
 门铃不带结果正文、Question 正文、Verify 输出或 ownership 明细。PM 收到最小 `plan/task/type/count` 后，再用 `.biao/pm task get`、`.biao/pm review`、`.biao/pm question get` 获取详情。
+
+`/status` 同时保留两种视图：`tasks` / `reviews` 是向后兼容的不可变审计总数；`attention` 是当前待处理 failed/rejected、`needs_pm_decision` 和 stale-running Agent；`history` 是已经 repair-resolved 的失败/拒绝与不再占用资源的历史 Agent。网页红色指标只消费 `attention`，但历史卡片和 SQLite 审计不会被删除。
 
 ## 正常交付和依赖门槛
 
@@ -106,13 +108,13 @@ resolution_action=inspect
 
 ## PM 的低频操作
 
-每个 PM 会话从一次只读入口开始：
+每个 PM 会话从统一入口开始：
 
 ```bash
 .biao/pm-start --once
 ```
 
-它会检查 health、status、最小 intake 以及一轮共享 Supervisor；不会自动 ack、不会自动 answer Question、不会自动 accept/reject。随后按具体事项执行：
+它会检查 health、status、最小 intake 以及一轮共享 Supervisor，并允许幂等恢复 lease/等待态；若显式配置 Worker slot，也会在声明范围内调度。它不会自动 ack、不会自动 answer Question、不会自动 accept/reject。随后按具体事项执行：
 
 ```bash
 # 最小门铃与持续事实
@@ -208,6 +210,7 @@ BIAO_WORKER_SLOTS='[
 - 同一机器、同一个 Biao 地址只允许一个本机 Supervisor 锁；其他客户端机器不受影响。
 - 一轮只共享读取计划、intake 和事件；完全相同的项目、能力和 Plan 范围只发一次空 claim。
 - 空闲 slot 没有独立 timer 或 claim poll；每个共享轮次至多发送一次 presence heartbeat，避免服务端误判 stale。running slot 不重复发送 presence，由 Worker 自己维护任务 heartbeat/lease。
+- 单 Worker 正常退出、Supervisor 收到停止信号或所有受管计划闭环时，生命周期所有者会调用 `POST /agent/offline`，记录离线原因/时间并保留最后任务、注册和心跳审计。任务已终结时清空当前任务投影；任务仍在执行时保留 `current_task`、停止续租，让失联运行态继续可见并在 lease 到期后由统一回收逻辑处理。异常崩溃来不及显式离线时才由心跳阈值与 watchdog 兜底。
 - Question 回答、任务恢复、依赖/ownership 就绪、完成/验收或新 pending 工作，只唤醒一次共享 retry-claim；不会把 Question 正文广播给 slot。
 - `--interval` 是低频上限，运行时最小为 10 秒；默认 60 秒。需要定时唤起可使用 `--once`，但 Biao 不会擅自安装 cron 或 launchd。
 
@@ -225,7 +228,7 @@ BIAO_WORKER_SLOTS='[
 .biao/pm db restore --yes
 ```
 
-非空目标或仍存在活跃 `running`、lease、ownership 时，服务端会拒绝恢复。SQLite 中历史 `running` 恢复为 fresh `pending`，不会续接旧进程；旧 lease、ownership 和 claim token 全部失效，Worker 必须重新领取。CLI 缺少 `--yes` 时不会发送请求，服务端拒绝时保持非零退出码与稳定错误信息。恢复后先核对状态，再重新启动共享 Supervisor/Worker。
+非空目标或仍存在活跃 `running`、lease、ownership 时，服务端会拒绝恢复。`db status` 会同时显示 SQLite 审计总数、可恢复投影，以及“排除但保留审计”的数量和原因。恢复投影仅接纳显式工作区内的项目；缺少项目路径、越过边界的项目，以及未配置 roots 时位于操作系统临时目录的项目不会投影回 Redis，但行记录不从 SQLite 删除。合法临时目录项目必须显式加入 `BIAO_WORKSPACE_ROOTS`。可恢复集合中的历史 `running` 才转换为 fresh `pending`，不会续接旧进程；旧 lease、ownership 和 claim token 全部失效，Worker 必须重新领取。CLI 缺少 `--yes` 时不会发送请求，服务端拒绝时保持非零退出码与稳定错误信息。恢复后先核对状态，再重新启动共享 Supervisor/Worker。
 
 ## 验收清单
 

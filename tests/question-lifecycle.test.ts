@@ -292,6 +292,9 @@ describe('Question HTTP 生命周期', () => {
     ]));
     const answered = body(await http('POST', `/question/${questionId}/answer`, { consumer: 'pm-a', answer: '还在' }));
     expect(answered.ok).toBe(true);
+    // Agent epoch 是进程生命周期，SQLite restore 不恢复旧 presence。
+    // Worker 必须新注册后才能领取恢复的任务。
+    await agentRegister(redis, 'worker-a', 'cli', ['code']);
     const reclaimed = await claim(redis, { agent_id: 'worker-a', blocking: false });
     expect(reclaimed.data).toMatchObject({ task_id: 'question-task', question_answer: '还在', question_checkpoint: 'resume=42' });
   });

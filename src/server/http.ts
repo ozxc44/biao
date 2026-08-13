@@ -14,6 +14,7 @@ import {
   planCreate,
   agentRegister,
   agentHeartbeat,
+  agentOffline,
   claim,
   report,
   ownershipCheck,
@@ -21,6 +22,7 @@ import {
   ownershipRelease,
   getTask,
   getTasks,
+  getPendingReviewTasks,
   cancelTask,
   supersedeTask,
   previewPlanSupersede,
@@ -64,6 +66,23 @@ import {
   QUESTION_CHECKPOINT_MAX_CHARS,
 } from '../communication/question-context.js';
 
+const INSTALL_PACKAGE_PLACEHOLDER = '__BIAO_PKG_POSIX__';
+
+function posixSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+export function renderInstallScript(template: string, packageDir: string): string {
+  if (!packageDir || /[\x00-\x1f\x7f]/.test(packageDir)) {
+    throw new Error('安装包路径不能为空或包含控制字符/换行');
+  }
+  const placeholderCount = template.split(INSTALL_PACKAGE_PLACEHOLDER).length - 1;
+  if (placeholderCount !== 1) {
+    throw new Error(`安装脚本模板 placeholder 数量必须为 1，实际为 ${placeholderCount}`);
+  }
+  return template.replace(INSTALL_PACKAGE_PLACEHOLDER, posixSingleQuote(packageDir));
+}
+
 /** API 目录（根路径，无 /api 前缀；同时兼容 /api 前缀访问） */
 const API_ENDPOINTS: Record<string, string> = {
   version: 'GET /version',
@@ -77,8 +96,10 @@ const API_ENDPOINTS: Record<string, string> = {
   report: 'POST /report',
   register: 'POST /register',
   heartbeat: 'POST /heartbeat',
+  agent_offline: 'POST /agent/offline',
   task_get: 'GET /task/:task_id',
   tasks_list: 'GET /tasks?plan_id=&status=&limit=',
+  reviews_pending: 'GET /reviews/pending?plan_id=',
   task_cancel: 'POST /task/:task_id/cancel',
   task_supersede: 'POST /task/:task_id/supersede',
   task_reset: 'POST /task/:task_id/reset',
@@ -118,6 +139,12 @@ const API_HINT = 'API 路径在根路径（无 /api 前缀，也兼容 /api 前�
 const nonEmptyString = { type: 'string', minLength: 1 } as const;
 const absolutePath = { type: 'string', minLength: 1, pattern: '^/' } as const;
 const safeIdentifier = { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' } as const;
+const registrationIdentifier = {
+  type: 'string',
+  minLength: 16,
+  maxLength: 128,
+  pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$',
+} as const;
 const taskParamsSchema = {
   type: 'object',
   required: ['task_id'],
@@ -183,6 +210,13 @@ function validateSupersedeRequestKeys(body: unknown, plan: boolean): string | un
   return unknown ? `supersede 请求包含未知字段：${unknown}` : undefined;
 }
 
+function validateExactRequestKeys(body: unknown, allowed: readonly string[]): string | undefined {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
+  const accepted = new Set(allowed);
+  const unknown = Object.keys(body as Record<string, unknown>).find((key) => !accepted.has(key));
+  return unknown ? `请求包含未知字段：${unknown}` : undefined;
+}
+
 const requestSchemas = {
   planCreate: {
     body: {
@@ -210,12 +244,14 @@ const requestSchemas = {
   claim: {
     body: {
       type: 'object',
-      required: ['agent_id'],
+      required: ['agent_id', 'registration_id', 'claim_request_id'],
       additionalProperties: false,
       properties: {
         agent_id: nonEmptyString,
+        registration_id: registrationIdentifier,
+        claim_request_id: registrationIdentifier,
         blocking: { type: 'boolean' },
-        timeout_ms: { type: 'integer', minimum: 0 },
+        timeout_ms: { type: 'integer', minimum: 0, maximum: 60_000 },
         preferred_types: {
           type: 'array',
           uniqueItems: true,
@@ -224,6 +260,51 @@ const requestSchemas = {
         preferred_phases: { type: 'array', uniqueItems: true, items: nonEmptyString },
         preferred_project: nonEmptyString,
         preferred_plan_ids: { type: 'array', uniqueItems: true, items: safeIdentifier },
+      },
+    },
+  },
+  register: {
+    body: {
+      type: 'object',
+      required: ['agent_id', 'agent_type'],
+      additionalProperties: false,
+      properties: {
+        agent_id: nonEmptyString,
+        agent_type: nonEmptyString,
+        capabilities: { type: 'array', uniqueItems: true, items: nonEmptyString },
+        endpoint: { type: 'string', minLength: 1, maxLength: 2048 },
+        projects: { type: 'array', uniqueItems: true, items: absolutePath },
+        // 兼容旧自定义 Worker：register 可以不传，平台生成后返回；
+        // 但后续 heartbeat/offline 必须携带返回值。
+        registration_id: registrationIdentifier,
+      },
+    },
+  },
+  heartbeat: {
+    body: {
+      type: 'object',
+      required: ['agent_id', 'registration_id'],
+      additionalProperties: false,
+      properties: {
+        agent_id: nonEmptyString,
+        registration_id: registrationIdentifier,
+        // 历史自定义 Worker 会显式传空串表示 idle。
+        current_task: { type: 'string', maxLength: 128 },
+      },
+    },
+  },
+  agentOffline: {
+    body: {
+      type: 'object',
+      required: ['agent_id', 'registration_id', 'reason'],
+      additionalProperties: false,
+      properties: {
+        agent_id: nonEmptyString,
+        registration_id: registrationIdentifier,
+        reason: {
+          type: 'string',
+          enum: ['worker_exit', 'worker_signal', 'plans_terminal', 'supervisor_signal', 'supervisor_exit'],
+        },
       },
     },
   },
@@ -614,11 +695,11 @@ export async function createHttpServer(
       };
     });
 
-    // GET /install → 返回安装脚本（模板在 scripts/install.sh，__BIAO_PKG__ 替换为包路径）
+    // GET /install → 返回安装脚本；包路径会按 POSIX shell 单引号规则注入唯一占位点。
     // 用户可见输出保持英文，避免非 UTF-8 locale 下管道执行时乱码
     app.get('/install', async (_req, reply) => {
       const tpl = readFileSync(join(biaoPkgDir, 'scripts', 'install.sh'), 'utf8');
-      const script = tpl.replaceAll('__BIAO_PKG__', biaoPkgDir);
+      const script = renderInstallScript(tpl, biaoPkgDir);
       reply.header('Content-Type', 'text/x-shellscript; charset=utf-8').send(script);
     });
 
@@ -639,27 +720,83 @@ export async function createHttpServer(
       }
     });
 
-    app.post('/register', async (req) => {
-      const { agent_id, agent_type, capabilities, endpoint } = req.body as {
+    app.post('/register', {
+      schema: requestSchemas.register,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, [
+          'agent_id', 'agent_type', 'capabilities', 'endpoint', 'projects', 'registration_id',
+        ]);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { agent_id, agent_type, capabilities, endpoint, projects, registration_id } = req.body as {
         agent_id: string;
         agent_type: string;
         capabilities?: string[];
         endpoint?: string;
+        projects?: string[];
+        registration_id?: string;
       };
-      return agentRegister(redis, agent_id, agent_type, capabilities ?? [], endpoint);
+      const validatedProjects = projects?.map((project) => resolveAndValidateWorkspacePath(project, config.workspaceRoots));
+      return agentRegister(redis, agent_id, agent_type, capabilities ?? [], endpoint, validatedProjects, registration_id);
     });
 
-    app.post('/heartbeat', async (req) => {
-      const { agent_id, current_task } = req.body as { agent_id: string; current_task?: string };
-      return agentHeartbeat(redis, agent_id, current_task);
+    app.post('/heartbeat', {
+      schema: requestSchemas.heartbeat,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, ['agent_id', 'registration_id', 'current_task']);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { agent_id, registration_id, current_task } = req.body as {
+        agent_id: string;
+        registration_id: string;
+        current_task?: string;
+      };
+      return agentHeartbeat(redis, agent_id, registration_id, current_task);
     });
 
-    app.post('/claim', { schema: requestSchemas.claim }, async (req) => {
+    app.post('/agent/offline', {
+      schema: requestSchemas.agentOffline,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, ['agent_id', 'registration_id', 'reason']);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { agent_id, registration_id, reason } = req.body as {
+        agent_id: string;
+        registration_id: string;
+        reason: Parameters<typeof agentOffline>[2];
+      };
+      return agentOffline(redis, agent_id, reason, registration_id);
+    });
+
+    app.post('/claim', {
+      schema: requestSchemas.claim,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, [
+          'agent_id', 'registration_id', 'claim_request_id', 'blocking', 'timeout_ms', 'preferred_types',
+          'preferred_phases', 'preferred_project', 'preferred_plan_ids',
+        ]);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req, reply) => {
       const body = { ...(req.body as Parameters<typeof claim>[1]) };
       if (body.preferred_project) {
         body.preferred_project = resolveAndValidateWorkspacePath(body.preferred_project, config.workspaceRoots);
       }
-      return claim(redis, body);
+      const abortController = new AbortController();
+      const abortClaim = () => {
+        if (!reply.raw.writableEnded) abortController.abort();
+      };
+      req.raw.once('aborted', abortClaim);
+      reply.raw.once('close', abortClaim);
+      try {
+        return await claim(redis, body, abortController.signal);
+      } finally {
+        req.raw.off('aborted', abortClaim);
+        reply.raw.off('close', abortClaim);
+      }
     });
 
     app.get('/task/:task_id', async (req) => {
@@ -678,6 +815,12 @@ export async function createHttpServer(
         if (!Number.isNaN(n)) opts.limit = n;
       }
       return getTasks(redis, opts);
+    });
+
+    // GET /reviews/pending?plan_id= —— 直接按当前待验收索引列出，不扫描/截断 done 历史
+    app.get('/reviews/pending', async (req) => {
+      const { plan_id } = req.query as { plan_id?: string };
+      return getPendingReviewTasks(redis, plan_id ? { plan_id } : {});
     });
 
     // POST /task/:task_id/cancel —— 撤销 pending 任务（对应 biao task cancel）

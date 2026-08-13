@@ -108,6 +108,55 @@ describe('db restore CLI 灾难恢复门槛', () => {
     expect(mock.requests).toEqual([{ method: 'POST', path: '/db/restore' }]);
   });
 
+  it('restore 明确显示保留在 SQLite 审计但未投影的项目与原因', async () => {
+    const mock = await mockRestoreService({
+      ok: true,
+      data: {
+        restored: 2,
+        by_status: { pending: 2 },
+        excluded: {
+          plan_count: 1,
+          task_count: 3,
+          by_reason: { system_temporary_project: { plans: 1, tasks: 3 } },
+        },
+      },
+    });
+
+    const outcome = await runCli(['db', 'restore', '--yes'], mock.url);
+
+    expect(outcome.code).toBe(0);
+    expect(outcome.stdout).toContain('未投影 1 个 plan / 3 个 task');
+    expect(outcome.stdout).toContain('system_temporary_project');
+    expect(outcome.stdout).toContain('SQLite 审计');
+  });
+
+  it('db status 区分归档总量、可恢复投影与排除原因', async () => {
+    const mock = await mockRestoreService({
+      ok: true,
+      data: {
+        task_count: 5,
+        plan_count: 2,
+        by_status: { pending: 5 },
+        restore_projection: {
+          restorable_tasks: 2,
+          restorable_plans: 1,
+          excluded: {
+            plan_count: 1,
+            task_count: 3,
+            by_reason: { outside_configured_workspace: { plans: 1, tasks: 3 } },
+          },
+        },
+      },
+    });
+
+    const outcome = await runCli(['db', 'status'], mock.url);
+
+    expect(outcome.code).toBe(0);
+    expect(outcome.stdout).toContain('可恢复投影: 1 plans / 2 tasks');
+    expect(outcome.stdout).toContain('排除但保留审计: 1 plans / 3 tasks');
+    expect(outcome.stdout).toContain('outside_configured_workspace');
+  });
+
   it('服务端拒绝时透传稳定错误码和消息并非零退出', async () => {
     const mock = await mockRestoreService({
       ok: false,

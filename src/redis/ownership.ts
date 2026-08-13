@@ -68,15 +68,20 @@ return released
  * 防止旧快照覆盖刚 report、Question block 或重新 claim 的状态。
  *
  * KEYS: task hash, lease, running zset, pending zset, failed zset, tasks stream,
- *       file ownership hash, owner-by-agent set, agent hash, events stream
- * ARGV: task_id, expected_agent_id, now_ms
+ *       file ownership hash, owner-by-agent set, agent hash, events stream,
+ *       runtime-reconcile dirty zset, plan registry, plan task registry,
+ *       plan revision hash, dirty-plan set, actionable-failed zset
+ * ARGV: task_id, expected_agent_id, now_ms, expected_plan_id
  */
 const RECLAIM_EXPIRED_TASK_CAS = `
 local task_id = ARGV[1]
 local expected_agent = ARGV[2]
 local now = tonumber(ARGV[3])
+local expected_plan_id = ARGV[4]
 
 if redis.call('HGET', KEYS[1], 'task_id') == false then return {'TASK_NOT_FOUND', '0'} end
+local plan_id = redis.call('HGET', KEYS[1], 'plan_id') or ''
+if plan_id ~= expected_plan_id then return {'PLAN_CHANGED', '0'} end
 if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'running' then return {'TASK_NOT_RUNNING', '0'} end
 if (redis.call('HGET', KEYS[1], 'claimed_by') or '') ~= expected_agent then return {'OWNER_CHANGED', '0'} end
 if redis.call('GET', KEYS[2]) ~= false then return {'LEASE_ACTIVE', '0'} end
@@ -117,6 +122,9 @@ redis.call('ZREM', KEYS[5], task_id)
 
 if retries > max_retries then
   redis.call('ZADD', KEYS[5], now, task_id)
+  -- failed 状态与补偿候选必须同一次提交；否则脚本返回前进程退出会永久漏建 repair。
+  redis.call('ZADD', KEYS[11], now, task_id)
+  redis.call('ZADD', KEYS[16], now, task_id)
   redis.call('HSET', KEYS[1],
     'status', 'failed',
     'retries', tostring(retries),
@@ -133,6 +141,7 @@ else
     'claimed_by', '',
     'claimed_at', '',
     'expire_at', '')
+  redis.call('ZREM', KEYS[16], task_id)
   redis.call('XADD', KEYS[6], '*', 'task_id', task_id, 'priority', tostring(priority))
   redis.call('XADD', KEYS[10], '*',
     'event_id', tostring(now) .. '_task_ready_' .. task_id .. '_lease_' .. tostring(retries),
@@ -143,6 +152,13 @@ else
     'reason', 'stale_lease_reclaimed',
     'timestamp', tostring(now))
 end
+
+-- 状态真相与长期轮询投影必须同一原子边界提交。进程在脚本返回后退出时，
+-- /status 仍能只重建这个 plan，而不会永久保留旧 aggregate。
+redis.call('SADD', KEYS[12], plan_id)
+redis.call('SADD', KEYS[13], task_id)
+redis.call('HINCRBY', KEYS[14], plan_id, 1)
+redis.call('SADD', KEYS[15], plan_id)
 
 if expected_agent ~= '' and (redis.call('HGET', KEYS[9], 'current_task') or '') == task_id then
   redis.call('HSET', KEYS[9], 'status', 'idle', 'current_task', '')
@@ -165,11 +181,15 @@ export async function lazyReclaimTaskIds(redis: Redis): Promise<string[]> {
   for (const taskId of expired) {
     // zset 是候选索引，不是状态真相。先取 expected owner 仅为了定位其反向索引；Lua
     // 脚本会再次核验 owner、lease 和 running 状态，任何并发状态变化都成为 no-op。
-    const expectedAgent = (await redis.hget(keys.hash.task(taskId), 'claimed_by')) ?? '';
+    const [expectedAgent, expectedPlanId] = await redis.hmget(
+      keys.hash.task(taskId),
+      'claimed_by',
+      'plan_id',
+    );
     if (!expectedAgent) continue;
     const raw = (await redis.eval(
       RECLAIM_EXPIRED_TASK_CAS,
-      10,
+      16,
       keys.hash.task(taskId),
       keys.string.lease(taskId),
       keys.zset.status.running,
@@ -180,9 +200,16 @@ export async function lazyReclaimTaskIds(redis: Redis): Promise<string[]> {
       keys.set.ownerByAgent(expectedAgent),
       keys.hash.agent(expectedAgent),
       keys.stream.events,
+      keys.runtimeReconcile.pending,
+      keys.planStatusProjection.planIds,
+      keys.planStatusProjection.taskIdsByPlan(expectedPlanId ?? ''),
+      keys.planStatusProjection.revisionByPlan,
+      keys.planStatusProjection.dirtyPlans,
+      keys.intakeActionableFailed.pending,
       taskId,
       expectedAgent,
       String(now),
+      expectedPlanId ?? '',
     )) as string[];
     if (String(raw[0]) === 'RECLAIMED') reclaimedTaskIds.push(taskId);
   }
@@ -238,15 +265,27 @@ export async function writeTaskToRedis(
     resolution_generation: '0',
     resolution_attempts: '0',
     repair_ownership_extension: '',
+    pm_repair_ownership_required: '',
+    pm_repair_ownership_intent: '',
     pm_rejection_resolution_mode: '',
     goal_md: body,
     project_path: projectPath,
     created_at: String(createdAt),
   };
 
-  await redis.hset(keys.hash.task(fm.task_id), hashData);
-  await redis.zadd(keys.zset.status.pending, score, fm.task_id);
-  await redis.xadd(keys.stream.tasks, '*', 'task_id', fm.task_id, 'priority', String(fm.priority ?? defaultPriority));
+  const transaction = redis.multi();
+  transaction.hset(keys.hash.task(fm.task_id), hashData);
+  transaction.zadd(keys.zset.status.pending, score, fm.task_id);
+  transaction.xadd(keys.stream.tasks, '*', 'task_id', fm.task_id, 'priority', String(fm.priority ?? defaultPriority));
+  transaction.sadd(keys.planStatusProjection.planIds, planId);
+  transaction.sadd(keys.planStatusProjection.taskIdsByPlan(planId), fm.task_id);
+  transaction.hincrby(keys.planStatusProjection.revisionByPlan, planId, 1);
+  transaction.sadd(keys.planStatusProjection.dirtyPlans, planId);
+  transaction.zrem(keys.intakeActionableFailed.pending, fm.task_id);
+  const outcomes = await transaction.exec();
+  if (!outcomes || outcomes.some(([error]) => error)) {
+    throw new Error(`failed to atomically publish task ${fm.task_id} and its plan projection marker`);
+  }
 }
 
 /** hash 转 TaskRecord */
@@ -266,6 +305,23 @@ export function hashToTaskRecord(hash: Record<string, string>): TaskRecord {
       }
     } catch {
       // 历史/损坏数据不能影响普通 task 读取；审计字段安全省略。
+    }
+  }
+  let pmRepairOwnershipIntent: RepairOwnershipExtension | undefined;
+  if (hash.pm_repair_ownership_intent) {
+    try {
+      const parsed = JSON.parse(hash.pm_repair_ownership_intent) as RepairOwnershipExtension;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const files = Array.isArray(parsed.files) && parsed.files.every((value) => typeof value === 'string')
+          ? parsed.files
+          : undefined;
+        const modules = Array.isArray(parsed.modules) && parsed.modules.every((value) => typeof value === 'string')
+          ? parsed.modules
+          : undefined;
+        if (files?.length || modules?.length) pmRepairOwnershipIntent = { ...(files ? { files } : {}), ...(modules ? { modules } : {}) };
+      }
+    } catch {
+      // 损坏 intent 由 reconcile fail closed；普通读取保留 required 标记但不猜内容。
     }
   }
   return {
@@ -321,6 +377,8 @@ export function hashToTaskRecord(hash: Record<string, string>): TaskRecord {
     superseded_by: hash.superseded_by || undefined,
     superseded_reason: hash.superseded_reason || undefined,
     repair_ownership_extension: repairOwnershipExtension,
+    pm_repair_ownership_required: hash.pm_repair_ownership_required === 'true',
+    pm_repair_ownership_intent: pmRepairOwnershipIntent,
   };
 }
 
@@ -525,7 +583,8 @@ export async function logConflict(
 
 /** 写 plan 元信息 */
 export async function writePlanToRedis(redis: Redis, plan: PlanFrontmatter, taskCount: number): Promise<void> {
-  await redis.hset(keys.hash.plan(plan.plan_id), {
+  const transaction = redis.multi();
+  transaction.hset(keys.hash.plan(plan.plan_id), {
     plan_id: plan.plan_id,
     title: plan.title,
     status: 'submitted',
@@ -538,4 +597,11 @@ export async function writePlanToRedis(redis: Redis, plan: PlanFrontmatter, task
     // PM consumer 路由标识：未声明时回退到默认值，保证旧 plan 兼容
     pm_consumer: plan.pm_consumer ?? DEFAULT_PM_CONSUMER,
   });
+  transaction.sadd(keys.planStatusProjection.planIds, plan.plan_id);
+  transaction.hincrby(keys.planStatusProjection.revisionByPlan, plan.plan_id, 1);
+  transaction.sadd(keys.planStatusProjection.dirtyPlans, plan.plan_id);
+  const outcomes = await transaction.exec();
+  if (!outcomes || outcomes.some(([error]) => error)) {
+    throw new Error(`failed to atomically publish plan ${plan.plan_id} and its projection marker`);
+  }
 }

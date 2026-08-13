@@ -22,17 +22,53 @@ function config(overrides: Partial<BiaoConfig> = {}): BiaoConfig {
 }
 
 function fakeRedis(): Redis {
-  return {
+  const strings = new Map<string, { value: string; expiresAt: number }>();
+  const currentValue = (key: string): string | undefined => {
+    const entry = strings.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+      strings.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  };
+  const client = {
     ping: async () => 'PONG',
     hgetall: async () => ({}),
+    // PM reset/review uses the same owner-token lock contract as production:
+    // SET key token PX ttl NX, renewal on a duplicate connection, and compare-delete.
+    set: async (key: string, value: string, ...args: Array<string | number>) => {
+      const nx = args.some((arg) => String(arg).toUpperCase() === 'NX');
+      if (nx && currentValue(key) !== undefined) return null;
+      const pxIndex = args.findIndex((arg) => String(arg).toUpperCase() === 'PX');
+      const ttl = pxIndex >= 0 ? Number(args[pxIndex + 1]) : 30_000;
+      strings.set(key, { value, expiresAt: Date.now() + ttl });
+      return 'OK';
+    },
+    get: async (key: string) => currentValue(key) ?? null,
     // 产品代码对未知/损坏门禁 fail closed；测试替身必须显式模拟 OPEN/ACQUIRED。
-    eval: async (script: string) => {
+    eval: async (script: string, _keyCount?: number, ...args: Array<string | number>) => {
       if (script.includes("return 'OPEN'")) return 'OPEN';
       if (script.includes("return 'ACQUIRED'")) return 'ACQUIRED';
+      if (script.includes('release-pm-review-lock-v1')) {
+        const [key, owner] = args.map(String);
+        if (currentValue(key) !== owner) return 0;
+        strings.delete(key);
+        return 1;
+      }
+      if (script.includes("redis.call('PEXPIRE', KEYS[1], ARGV[2])")) {
+        const [key, owner, ttl] = args.map(String);
+        if (currentValue(key) !== owner) return 0;
+        strings.set(key, { value: owner, expiresAt: Date.now() + Number(ttl) });
+        return 1;
+      }
       return 1;
     },
     zrem: async () => 1,
-  } as unknown as Redis;
+    duplicate: () => client,
+    disconnect: () => undefined,
+  };
+  return client as unknown as Redis;
 }
 
 describe('HTTP bearer authentication', () => {

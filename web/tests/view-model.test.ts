@@ -4,8 +4,10 @@ import {
   countOnlineAgents,
   getPlanAttention,
   getPlanResolutionSummary,
+  getGlobalStatusSummary,
   getStatusHintMessage,
   groupTasksForBoard,
+  partitionAgents,
   validatePlanId,
 } from '../src/view-model';
 import type { AgentInfo, PlanData, TaskSummary } from '../src/api';
@@ -55,6 +57,38 @@ describe('countOnlineAgents', () => {
     ];
 
     expect(countOnlineAgents(agents)).toBe(3);
+  });
+});
+
+describe('global status semantics', () => {
+  it('uses attention counts for current red metrics and keeps resolved audit totals separate', () => {
+    const status = {
+      tasks: { pending: 0, running: 0, done: 4, failed: 3 },
+      reviews: { pending: 0, accepted: 2, rejected: 2 },
+      attention: { failed: 0, rejected: 0, needs_pm_decision: 0, stale_running_agents: 0 },
+      history: { resolved_failed: 3, resolved_rejected: 2, stale_agents: 5 },
+      ownership_conflicts: 0,
+      plans: [],
+      agents: [],
+    };
+
+    expect(getGlobalStatusSummary(status)).toEqual({
+      attention: { failed: 0, rejected: 0, needsPmDecision: 0, staleRunningAgents: 0 },
+      history: { resolvedFailed: 3, resolvedRejected: 2, staleAgents: 5 },
+    });
+  });
+
+  it('partitions online and stale-running agents from idle or terminal stale history', () => {
+    const agents = [
+      agent('online', 'idle'),
+      { ...agent('stale-running', 'stale'), current_task: 't-running', current_task_status: 'running' },
+      { ...agent('stale-terminal', 'stale'), current_task: 't-done', current_task_status: 'done' },
+      agent('stale-idle', 'stale'),
+    ];
+
+    const groups = partitionAgents(agents);
+    expect(groups.current.map((item) => item.agent_id)).toEqual(['online', 'stale-running']);
+    expect(groups.history.map((item) => item.agent_id)).toEqual(['stale-terminal', 'stale-idle']);
   });
 });
 

@@ -12,12 +12,32 @@
 
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { hostname, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  accessSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const EXIT_CONFIG = 3;
 const EXIT_UNHANDLED = 4;
+const LOCK_CONTENTION = Symbol('lock-contention');
+const INTERNAL_LOCK_ARG = '--biao-internal-kernel-lock';
+const INTERNAL_LOCK_ENV = 'BIAO_PM_AGENT_KERNEL_LOCK_NONCE';
+const INTERNAL_LOCK_READ_FD = 3;
+const INTERNAL_LOCK_ACK_FD = 4;
+const INTERNAL_LOCK_FILE_FD = 5;
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_BIAO_URL = 'http://127.0.0.1:7331';
 const DEFAULT_CONSUMER = 'pm';
 const PM_ACTIONABLE_KINDS = new Set([
@@ -136,68 +156,174 @@ function canonicalEndpoint(biaoUrl) {
   return `${parsed.protocol}//${host}:${port}`;
 }
 
-function processIsAlive(pid) {
+function isExecutable(path) {
   try {
-    process.kill(pid, 0);
-    return true;
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
   } catch {
     return false;
   }
 }
 
 /**
- * 用 `wx` 实现本机原子锁；释放时校验 owner，避免旧进程误删后来者的锁。
- * 死 pid 的锁会由下一次触发安全接管；写入中的/损坏的锁一律保守地当作正在运行。
+ * 先用 O_NOFOLLOW 打开稳定 inode，再把这个 FD 交给内核锁 helper。
+ * helper 不再按路径二次打开，因此符号链接和检查后替换都不能改变锁目标。
  */
-function acquireLock(biaoUrl, consumer, lockDir) {
-  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-  const path = lockPath(biaoUrl, consumer, lockDir);
-  const owner = JSON.stringify({ pid: process.pid, host: hostname(), id: randomUUID(), startedAt: Date.now() });
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(path, 'wx', 0o600);
-      try {
-        writeFileSync(fd, owner, 'utf8');
-      } finally {
-        closeSync(fd);
-      }
-      return { acquired: true, path, owner };
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      let raw;
-      try {
-        raw = readFileSync(path, 'utf8').trim();
-      } catch {
-        continue;
-      }
-      let holder;
-      try {
-        holder = JSON.parse(raw);
-      } catch {
-        return { acquired: false, path };
-      }
-      if (!Number.isSafeInteger(holder?.pid) || holder.pid <= 0 || processIsAlive(holder.pid)) {
-        return { acquired: false, path };
-      }
-      try {
-        // 只删除刚才确认的死锁内容；并发接管者写入的新内容不会被删除。
-        if (readFileSync(path, 'utf8').trim() === raw) unlinkSync(path);
-      } catch {
-        // 下一次 wx 会再次判断；绝不覆盖未知锁。
-      }
-    }
+function openStableLockFile(biaoUrl, consumer, lockDir) {
+  const requestedDir = resolve(lockDir);
+  mkdirSync(requestedDir, { recursive: true, mode: 0o700 });
+  let directoryMetadata;
+  try {
+    directoryMetadata = lstatSync(requestedDir);
+  } catch (error) {
+    fail(`无法检查锁目录：${error?.code ?? 'unknown'}`);
   }
-  return { acquired: false, path };
+  if (directoryMetadata.isSymbolicLink()) fail('锁目录不得是符号链接');
+  if (!directoryMetadata.isDirectory()) fail('锁目录必须是目录');
+  const path = lockPath(biaoUrl, consumer, realpathSync(requestedDir));
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    if (error?.code === 'ELOOP') fail('锁文件不得是符号链接');
+    fail(`无法安全打开锁文件：${error?.code ?? 'unknown'}`);
+  }
+  try {
+    if (!fstatSync(fd).isFile()) fail('锁文件必须是普通文件');
+    return { fd, path };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
 }
 
-function releaseLock(lock) {
-  if (!lock.acquired) return;
-  try {
-    if (readFileSync(lock.path, 'utf8').trim() === lock.owner) unlinkSync(lock.path);
-  } catch {
-    // 已清理或被安全接管均无需报错。
+function kernelLockCommand(nonce) {
+  const childArgs = [SCRIPT_PATH, INTERNAL_LOCK_ARG, nonce];
+  if (process.platform === 'darwin') {
+    const executable = '/usr/bin/lockf';
+    if (!isExecutable(executable)) fail('macOS 缺少 /usr/bin/lockf，无法安全启动 PM Agent 本机锁');
+    return {
+      executable,
+      args: ['-s', '-t', '0', '-k', `/dev/fd/${INTERNAL_LOCK_FILE_FD}`, process.execPath, ...childArgs],
+      contentionCode: 75,
+    };
   }
+  if (process.platform === 'linux') {
+    const executable = ['/usr/bin/flock', '/bin/flock'].find(isExecutable);
+    if (!executable) fail('Linux 缺少 flock，无法安全启动 PM Agent 本机锁；请先安装 util-linux');
+    return {
+      executable,
+      args: ['-n', String(INTERNAL_LOCK_FILE_FD), process.execPath, ...childArgs],
+      contentionCode: 1,
+    };
+  }
+  fail(`当前系统 ${process.platform} 没有受支持的内核锁适配器（仅支持 macOS lockf / Linux flock）`);
+}
+
+/**
+ * holder 的唯一职责是在 helper 已持锁时确认 nonce，然后等待控制 pipe EOF。
+ * 它永远不解析 Biao 业务参数，不读 intake，也不启动 PM child。
+ */
+function runKernelLockHolder(argv) {
+  const index = argv.indexOf(INTERNAL_LOCK_ARG);
+  const nonce = argv[index + 1];
+  if (!nonce || !/^[0-9a-f-]{36}$/i.test(nonce)) fail('内部内核锁 holder 交接参数无效');
+
+  let pipeNonce;
+  try {
+    pipeNonce = readFileSync(INTERNAL_LOCK_READ_FD, 'utf8').trim();
+  } catch {
+    fail('内部内核锁交接缺少受控输入');
+  }
+  if (process.env[INTERNAL_LOCK_ENV] !== nonce || pipeNonce !== nonce) {
+    fail('内部内核锁 holder 交接验证失败');
+  }
+  try {
+    writeFileSync(INTERNAL_LOCK_ACK_FD, `${nonce}\n`, 'utf8');
+  } catch {
+    fail('内部内核锁 holder 无法确认持锁进程');
+  }
+  // 父进程正常完成或崩溃都会关闭该 pipe；EOF 让 helper 进程退出并释放锁。
+  try {
+    readFileSync(0);
+  } catch (error) {
+    fail(`内部内核锁 holder 控制管道异常：${error?.code ?? 'unknown'}`);
+  }
+  return 0;
+}
+
+async function acquireKernelLock(options) {
+  const nonce = randomUUID();
+  const lock = kernelLockCommand(nonce);
+  const lockFile = openStableLockFile(options.biaoUrl, options.consumer, options.lockDir);
+  let child;
+  try {
+    child = spawn(lock.executable, lock.args, {
+      shell: false,
+      stdio: ['pipe', 'inherit', 'inherit', 'pipe', 'pipe', lockFile.fd],
+      env: { ...process.env, [INTERNAL_LOCK_ENV]: nonce },
+    });
+  } finally {
+    closeSync(lockFile.fd);
+  }
+
+  let acknowledgement = '';
+  let acknowledged = false;
+  let settleAcquisition;
+  let rejectAcquisition;
+  const acquisition = new Promise((resolvePromise, rejectPromise) => {
+    settleAcquisition = resolvePromise;
+    rejectAcquisition = rejectPromise;
+  });
+  const closed = new Promise((resolvePromise) => {
+    child.once('close', (code, signal) => {
+      const result = { code, signal };
+      if (!acknowledged) {
+        if (code === lock.contentionCode && !signal) settleAcquisition(LOCK_CONTENTION);
+        else rejectAcquisition(new Error(
+          `内核锁命令未启动 holder（退出码 ${code ?? 'unknown'}${signal ? `，信号 ${signal}` : ''}）`,
+        ));
+      }
+      resolvePromise(result);
+    });
+  });
+  child.once('error', (error) => {
+    if (!acknowledged) rejectAcquisition(error);
+  });
+  child.stdio[4].setEncoding('utf8');
+  child.stdio[4].on('data', (chunk) => {
+    acknowledgement += chunk;
+    if (acknowledged || !acknowledgement.includes('\n')) return;
+    if (acknowledgement.trim() !== nonce) {
+      rejectAcquisition(new Error('内核锁 holder 返回了无效确认'));
+      return;
+    }
+    acknowledged = true;
+    settleAcquisition(undefined);
+  });
+  child.stdio[3].once('error', (error) => {
+    if (error?.code !== 'EPIPE' && !acknowledged) rejectAcquisition(error);
+  });
+  child.stdin.once('error', () => {
+    // release 时 holder 已退出可能产生 EPIPE，最终状态由 closed 结果判定。
+  });
+  child.stdio[3].end(`${nonce}\n`);
+
+  const acquired = await acquisition;
+  if (acquired === LOCK_CONTENTION) {
+    child.stdin.end();
+    await closed;
+    return undefined;
+  }
+  return {
+    async release() {
+      child.stdin.end();
+      const result = await closed;
+      if (result.signal || result.code !== 0) {
+        throw new Error(`内核锁 holder 异常退出（退出码 ${result.code ?? 'unknown'}${result.signal ? `，信号 ${result.signal}` : ''}）`);
+      }
+    },
+  };
 }
 
 async function readIntake({ biaoUrl, consumer }) {
@@ -262,6 +388,11 @@ function childEnvironment() {
   for (const key of safeKeys) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
+  // 这些都是 bootstrap 生成的非凭据定位信息。内置 adapter 必须知道外置 runtime
+  // 和受控 workspace；尤其 npm 安装布局中 packageRoot 内不会存在 `.biao`。
+  for (const key of ['BIAO_RUNTIME_DIR', 'BIAO_PREFERRED_PROJECT', 'BIAO_WORKSPACE_ROOTS']) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
   env.BIAO_PM_AGENT_WAKE = '1';
   env.BIAO_PM_AGENT_FETCH_DETAILS = 'required';
   env.BIAO_PM_AGENT_ACK = 'only_after_actual_handling';
@@ -272,10 +403,19 @@ function childEnvironment() {
 
 async function invokeAgent(command, payload) {
   await new Promise((resolve, reject) => {
-    // command 是本机用户显式提供的启动命令；shell 只用于支持带参数的命令字符串，
-    // 绝不把来自 Biao 的字段拼入命令行。
-    const child = spawn(command, [], {
-      shell: true,
+    // bootstrap 写入的是一个绝对 adapter 路径。若该完整字符串确实是文件，直接
+    // exec，避免路径中的空格或 shell 元字符被拆分；只有显式的“命令 + 参数”字符串
+    // 才保留 shell 兼容。来自 Biao 的字段从不进入命令行。
+    let directExecutable;
+    if (isAbsolute(command)) {
+      try {
+        if (statSync(command).isFile()) directExecutable = command;
+      } catch {
+        // 不是完整文件路径时按用户显式命令字符串处理，并由 shell 返回可诊断错误。
+      }
+    }
+    const child = spawn(directExecutable ?? command, [], {
+      shell: directExecutable === undefined,
       stdio: ['pipe', 'inherit', 'inherit'],
       env: childEnvironment(),
     });
@@ -298,44 +438,50 @@ async function invokeAgent(command, payload) {
   });
 }
 
+async function runLocked(options) {
+  const items = await readIntake(options);
+  const summary = summarizeActionable(items, options.planIds);
+  if (summary.count === 0) return 0;
+  if (!options.command) {
+    console.error('发现 PM 待处理事项，但未配置 PM Agent 命令；请设置 BIAO_PM_AGENT_CMD 或传入 --command。');
+    return EXIT_CONFIG;
+  }
+
+  const wakePayload = {
+    biaoUrl: options.biaoUrl,
+    consumer: options.consumer,
+    planIds: options.planIds,
+    kinds: summary.kinds,
+    count: summary.count,
+  };
+  await invokeAgent(options.command, wakePayload);
+  if (options.requireDrained) {
+    const remaining = summarizeActionable(await readIntake(options), options.planIds);
+    if (remaining.count > 0) {
+      console.error(`[pm-agent] PM Agent 已退出，但仍未处理 ${remaining.count} 个待办；共享 Supervisor 将在下轮重试。`);
+      return EXIT_UNHANDLED;
+    }
+  }
+  console.log(`[pm-agent] 已唤醒 PM Agent：kinds=${Object.keys(summary.kinds).join(',')} count=${summary.count}（详情须由 Agent 回平台读取）`);
+  return 0;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+  // 内部参数只能进入“纯 holder”路径，这个路径不存在任何业务调用。
+  // 即使外部调用者可伪造所有 argv/env/FD，也无法由此绕过锁执行 intake。
+  if (argv.includes(INTERNAL_LOCK_ARG)) return runKernelLockHolder(argv);
   if (argv.includes('--help') || argv.includes('-h')) {
     usage();
     return 0;
   }
   const options = readOptions(argv);
-  const lock = acquireLock(options.biaoUrl, options.consumer, options.lockDir);
-  if (!lock.acquired) return 0;
-
+  const lease = await acquireKernelLock(options);
+  if (!lease) return 0;
   try {
-    const items = await readIntake(options);
-    const summary = summarizeActionable(items, options.planIds);
-    if (summary.count === 0) return 0;
-    if (!options.command) {
-      console.error('发现 PM 待处理事项，但未配置 PM Agent 命令；请设置 BIAO_PM_AGENT_CMD 或传入 --command。');
-      return EXIT_CONFIG;
-    }
-
-    const wakePayload = {
-      biaoUrl: options.biaoUrl,
-      consumer: options.consumer,
-      planIds: options.planIds,
-      kinds: summary.kinds,
-      count: summary.count,
-    };
-    await invokeAgent(options.command, wakePayload);
-    if (options.requireDrained) {
-      const remaining = summarizeActionable(await readIntake(options), options.planIds);
-      if (remaining.count > 0) {
-        console.error(`[pm-agent] PM Agent 已退出，但仍未处理 ${remaining.count} 个待办；共享 Supervisor 将在下轮重试。`);
-        return EXIT_UNHANDLED;
-      }
-    }
-    console.log(`[pm-agent] 已唤醒 PM Agent：kinds=${Object.keys(summary.kinds).join(',')} count=${summary.count}（详情须由 Agent 回平台读取）`);
-    return 0;
+    return await runLocked(options);
   } finally {
-    releaseLock(lock);
+    await lease.release();
   }
 }
 

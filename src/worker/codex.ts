@@ -35,7 +35,7 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
     preclaimedTask: overrides.preclaimedTask,
     skipRegistration: overrides.skipRegistration,
     heartbeatWhenIdle: overrides.heartbeatWhenIdle,
-    async execute(task: ClaimedTask, projectPath: string) {
+    async execute(task: ClaimedTask, projectPath: string, signal?: AbortSignal) {
       const invocation = buildCodexInvocation(task, agentId);
       const run = await runAgentCli(
         process.env.BIAO_CODEX_BIN?.trim() || 'codex',
@@ -44,6 +44,7 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
         task.timeout_seconds ?? 1800,
         undefined,
         invocation.stdin,
+        signal,
       );
       const changedFiles = parseChangedFiles(run.stdout);
       return { run, changedFiles, backend: 'codex_exec', model: 'codex' };

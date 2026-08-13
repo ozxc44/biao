@@ -5,10 +5,11 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -28,7 +29,14 @@ function createTempDir(prefix: string): string {
 }
 
 function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\\"'\\\"'")}'`;
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function lockKeyForTest(biaoUrl: string, consumer: string): string {
+  const parsed = new URL(biaoUrl);
+  const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+  const endpoint = `${parsed.protocol}//${parsed.hostname.toLowerCase()}:${port}`;
+  return createHash('sha256').update(`${endpoint}\u0000${consumer}`).digest('hex').slice(0, 24);
 }
 
 function captureCommand(outputPath: string, opts: { startPath?: string; releasePath?: string } = {}): string {
@@ -43,6 +51,9 @@ function captureCommand(outputPath: string, opts: { startPath?: string; releaseP
       fetchDetails: process.env.BIAO_PM_AGENT_FETCH_DETAILS ?? null,
       ack: process.env.BIAO_PM_AGENT_ACK ?? null,
       automation: process.env.BIAO_PM_AGENT_AUTOMATION ?? null,
+      runtimeDir: process.env.BIAO_RUNTIME_DIR ?? null,
+      preferredProject: process.env.BIAO_PREFERRED_PROJECT ?? null,
+      workspaceRoots: process.env.BIAO_WORKSPACE_ROOTS ?? null,
     };
     appendFileSync(outputPath, JSON.stringify(record) + '\\n');
     if (startPath) writeFileSync(startPath, 'started');
@@ -51,6 +62,68 @@ function captureCommand(outputPath: string, opts: { startPath?: string; releaseP
     }
   `, 'utf8');
   return [process.execPath, child, outputPath, opts.startPath ?? '', opts.releasePath ?? ''].map(shellQuote).join(' ');
+}
+
+function captureFirstInvocationCommand(outputPath: string, startPath: string, releasePath: string): string {
+  const dir = createTempDir('biao-pm-agent-first-child-');
+  const child = join(dir, 'capture-first.mjs');
+  writeFileSync(child, `
+    import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+    const [outputPath, startPath, releasePath] = process.argv.slice(2);
+    const first = !existsSync(outputPath);
+    appendFileSync(outputPath, readFileSync(0, 'utf8').trim() + '\\n');
+    if (first) {
+      writeFileSync(startPath, 'started');
+      while (!existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+    }
+  `, 'utf8');
+  return [process.execPath, child, outputPath, startPath, releasePath].map(shellQuote).join(' ');
+}
+
+async function runForgedInternalHandoff(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  nonce: string,
+): Promise<{ code: number | null; stdout: string; stderr: string; acknowledgement: string }> {
+  const child = spawn(process.execPath, [script, '--biao-internal-kernel-lock', nonce, ...args], {
+    cwd: join(import.meta.dirname, '..'),
+    env: { ...process.env, ...env, BIAO_PM_AGENT_KERNEL_LOCK_NONCE: nonce },
+    stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let acknowledgement = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdio[4].setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  child.stdio[4].on('data', (chunk) => { acknowledgement += chunk; });
+  child.stdin.end();
+  child.stdio[3].end(`${nonce}\n`);
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  return { code, stdout, stderr, acknowledgement: acknowledgement.trim() };
+}
+
+function crashLockHolderOnceCommand(outputPath: string, crashMarkerPath: string): string {
+  const dir = createTempDir('biao-pm-agent-crash-child-');
+  const child = join(dir, 'crash-parent-once.mjs');
+  writeFileSync(child, `#!/usr/bin/env node
+    import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+    appendFileSync(${JSON.stringify(outputPath)}, readFileSync(0, 'utf8').trim() + '\\n');
+    if (!existsSync(${JSON.stringify(crashMarkerPath)})) {
+      writeFileSync(${JSON.stringify(crashMarkerPath)}, 'crashed');
+      process.kill(process.ppid, 'SIGKILL');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  `, { mode: 0o755 });
+  chmodSync(child, 0o755);
+  return child;
 }
 
 async function startIntakeServer(items: unknown[]): Promise<{ url: string; paths: string[] }> {
@@ -150,6 +223,80 @@ describe('PM Agent one-shot waker', () => {
     });
     expect(JSON.stringify(payload)).not.toContain('forbidden');
     expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+  });
+
+  it('显式 PM adapter 是含空格的绝对路径时不经 shell 拆分', async () => {
+    const { url } = await startIntakeServer([
+      { kind: 'review_requested', plan_id: 'p1', task_id: 'task-1' },
+    ]);
+    const dir = createTempDir('biao-pm-agent-direct-');
+    const commandDir = join(dir, "adapter directory with spaces and ' quote");
+    mkdirSync(commandDir);
+    const output = join(dir, 'direct-child.json');
+    const command = join(commandDir, 'pm adapter');
+    writeFileSync(command, `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(output)}, readFileSync(0, 'utf8'), 'utf8');
+`, { mode: 0o755 });
+    chmodSync(command, 0o755);
+
+    const result = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: command,
+    });
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(readFileSync(output, 'utf8'))).toMatchObject({
+      consumer: 'pm-a',
+      count: 1,
+      kinds: { review_requested: 1 },
+    });
+  });
+
+  it('把外置 runtime/workspace 传给内置 Codex adapter 并完成真实进程桥接', async () => {
+    const { url } = await startIntakeServer([
+      { kind: 'review_requested', plan_id: 'p1', task_id: 'task-1' },
+    ]);
+    const dir = createTempDir('biao-pm-adapter-bridge-');
+    const runtimeDir = join(dir, "consumer runtime with ' quote");
+    const workspace = join(dir, 'workspace');
+    const binDir = join(dir, 'bin');
+    mkdirSync(runtimeDir);
+    mkdirSync(workspace);
+    mkdirSync(binDir);
+    for (const launcher of ['pm', 'pm-start']) {
+      const path = join(runtimeDir, launcher);
+      writeFileSync(path, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      chmodSync(path, 0o755);
+    }
+    const capture = join(dir, 'codex-invocation.json');
+    const fakeCodex = join(binDir, 'codex');
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
+  argv: process.argv.slice(2),
+  stdin: readFileSync(0, 'utf8'),
+  cwd: process.cwd(),
+}), 'utf8');
+`, { mode: 0o755 });
+    chmodSync(fakeCodex, 0o755);
+    const adapter = join(import.meta.dirname, '..', 'scripts', 'codex-pm-agent.mjs');
+
+    const result = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: adapter,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: workspace,
+      BIAO_WORKSPACE_ROOTS: workspace,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}`,
+    });
+
+    expect(result.code).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[]; stdin: string; cwd: string };
+    const canonicalRuntime = realpathSync(runtimeDir);
+    expect(invoked.cwd).toBe(canonicalRuntime);
+    expect(invoked.argv[invoked.argv.indexOf('-C') + 1]).toBe(canonicalRuntime);
+    expect(invoked.argv).toContain(realpathSync(workspace));
+    expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm-start')));
+    expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm')));
   });
 
   it('有事项却没有显式 command 时给出可辨识配置失败，不启动 child', async () => {
@@ -259,6 +406,8 @@ describe('PM Agent one-shot waker', () => {
       await waitForFile(started);
       const second = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
         BIAO_PM_AGENT_CMD: command,
+        // 单独伪造环境 marker 不能让内层绕过内核锁。
+        BIAO_PM_AGENT_KERNEL_LOCK_NONCE: '00000000-0000-4000-8000-000000000000',
       });
       expect(second).toEqual({ code: 0, stdout: '', stderr: '' });
       expect(readRecords(output)).toHaveLength(1);
@@ -274,4 +423,98 @@ describe('PM Agent one-shot waker', () => {
       if (!first.killed && first.exitCode === null) first.kill('SIGTERM');
     }
   }, 10_000);
+
+  it('伪造完整 argv/env/fd3/fd4 内部交接也不能绕过正在持有的内核锁', async () => {
+    const { url, paths } = await startIntakeServer([{ kind: 'review_requested', plan_id: 'p1' }]);
+    const dir = createTempDir('biao-pm-agent-forged-handoff-');
+    const output = join(dir, 'child.jsonl');
+    const started = join(dir, 'child-started');
+    const release = join(dir, 'child-release');
+    const command = captureFirstInvocationCommand(output, started, release);
+    const args = ['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir];
+    const env = { ...process.env, BIAO_PM_AGENT_CMD: command, BIAO_PM_AGENT_LOCK_DIR: dir };
+    const first = spawn(process.execPath, [script, ...args], {
+      cwd: join(import.meta.dirname, '..'),
+      env,
+      stdio: 'ignore',
+    });
+
+    try {
+      await waitForFile(started);
+      const nonce = '00000000-0000-4000-8000-000000000000';
+      const forged = await runForgedInternalHandoff(args, env, nonce);
+      expect(forged).toEqual({ code: 0, stdout: '', stderr: '', acknowledgement: nonce });
+      expect(readRecords(output)).toHaveLength(1);
+      expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    } finally {
+      writeFileSync(release, 'release');
+      if (first.exitCode === null) {
+        await new Promise<void>((resolve) => first.once('close', () => resolve()));
+      }
+      if (!first.killed && first.exitCode === null) first.kill('SIGTERM');
+    }
+  }, 10_000);
+
+  it('历史锁文件的存在和内容不代表持锁，内核锁成功后保留稳定 inode', async () => {
+    const { url, paths } = await startIntakeServer([{ kind: 'review_requested', plan_id: 'p1' }]);
+    const dir = createTempDir('biao-pm-agent-stale-lock-');
+    const output = join(dir, 'child.jsonl');
+    const stalePath = join(dir, `biao-pm-agent-${lockKeyForTest(url, 'pm-a')}.lock`);
+    writeFileSync(stalePath, 'stale-content-that-is-not-an-owner-record', 'utf8');
+    const inode = statSync(stalePath).ino;
+
+    const result = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: captureCommand(output),
+    });
+
+    expect(result.code).toBe(0);
+    expect(readRecords(output)).toHaveLength(1);
+    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    expect(readFileSync(stalePath, 'utf8')).toBe('stale-content-that-is-not-an-owner-record');
+    expect(statSync(stalePath).ino).toBe(inode);
+  });
+
+  it('拒绝符号链接锁路径，不跟随到任意文件上持锁', async () => {
+    const { url, paths } = await startIntakeServer([{ kind: 'review_requested', plan_id: 'p1' }]);
+    const dir = createTempDir('biao-pm-agent-symlink-lock-');
+    const victim = join(dir, 'victim.txt');
+    const output = join(dir, 'child.jsonl');
+    const linkedLock = join(dir, `biao-pm-agent-${lockKeyForTest(url, 'pm-a')}.lock`);
+    writeFileSync(victim, 'must-not-be-used-as-lock', 'utf8');
+    symlinkSync(victim, linkedLock);
+
+    const result = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: captureCommand(output),
+    });
+
+    expect(result.code).toBe(3);
+    expect(result.stderr).toContain('符号链接');
+    expect(readRecords(output)).toEqual([]);
+    expect(paths).toEqual([]);
+    expect(readFileSync(victim, 'utf8')).toBe('must-not-be-used-as-lock');
+  });
+
+  it('受保护进程崩溃后由内核自动释放锁，下一次触发可立即接管', async () => {
+    const { url, paths } = await startIntakeServer([{ kind: 'review_requested', plan_id: 'p1' }]);
+    const dir = createTempDir('biao-pm-agent-crash-release-');
+    const output = join(dir, 'child.jsonl');
+    const crashMarker = join(dir, 'crashed-once');
+    const command = crashLockHolderOnceCommand(output, crashMarker);
+
+    const crashed = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: command,
+    });
+    expect(crashed.code).not.toBe(0);
+    expect(existsSync(crashMarker)).toBe(true);
+
+    const recovered = await runWaker(['--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: command,
+    });
+    expect(recovered.code).toBe(0);
+    expect(readRecords(output)).toHaveLength(2);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
+  });
 });

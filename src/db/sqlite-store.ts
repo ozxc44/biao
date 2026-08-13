@@ -5,8 +5,9 @@
  */
 
 import Database from 'better-sqlite3';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export interface PlanRow {
@@ -52,10 +53,14 @@ export interface TaskRow {
   pm_reviewed_by: string;
   pm_reviewed_at: string;
   pm_review_comment: string;
+  /** accepted 后 dependency/lineage 副作用已完成；空串表示仍需幂等补偿。 */
+  pm_accept_effects_applied?: string;
   pm_reject_reason: string;
   pm_fix_instructions: string;
   pm_rejection_resolution_mode?: string;
   repair_ownership_extension?: string;
+  pm_repair_ownership_required?: string;
+  pm_repair_ownership_intent?: string;
   failure_reason?: string;
   fix_for?: string;
   repair_root_task_id?: string;
@@ -104,10 +109,85 @@ export interface QuestionRow {
   answer: string;
 }
 
+export interface AgentRegistrationRow {
+  agent_id: string;
+  registration_id: string;
+  generation: number;
+  registration_source: 'client' | 'server';
+  agent_type: string;
+  capabilities: string;
+  endpoint: string;
+  projects: string;
+  registered_at: string;
+}
+
+export interface AgentRegistrationDecision {
+  outcome: 'created' | 'idempotent' | 'retired';
+  current: AgentRegistrationRow;
+  requested?: AgentRegistrationRow;
+}
+
+export type RestoreExclusionReason =
+  | 'outside_configured_workspace'
+  | 'system_temporary_project'
+  | 'missing_project_path';
+
+export interface RestoreExclusionSummary {
+  plan_count: number;
+  task_count: number;
+  by_reason: Partial<Record<RestoreExclusionReason, { plans: number; tasks: number }>>;
+}
+
+export interface SqliteStoreOptions {
+  /** 非空时只恢复这些显式工作区内的项目；允许操作者明确选择位于临时盘的合法项目。 */
+  restoreWorkspaceRoots?: string[];
+  /** roots 为空的默认安装模式下，排除系统临时目录项目但保留 SQLite 审计行。 */
+  excludeSystemTemporaryProjects?: boolean;
+  /** 测试/嵌入式环境可注入；生产默认来自操作系统临时目录元数据。 */
+  systemTemporaryRoots?: string[];
+}
+
+function normalizedPathForBoundary(path: string): string {
+  try {
+    // 存在的路径必须以最终真实位置为准，不能同时保留 lexical 路径；否则
+    // workspace/link -> outside 会因为 lexical 路径仍在 workspace 内而逃逸。
+    return realpathSync(path);
+  } catch {
+    // 项目可能已被移走；仍使用规范化后的绝对路径做可解释的保守判断。
+    return resolve(path);
+  }
+}
+
+function pathIsWithin(path: string, root: string): boolean {
+  const candidate = normalizedPathForBoundary(path);
+  const rootCandidate = normalizedPathForBoundary(root);
+  const rel = relative(rootCandidate, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+function defaultSystemTemporaryRoots(): string[] {
+  const roots = new Set<string>();
+  for (const value of [tmpdir(), process.env.TMPDIR, process.env.TMP, process.env.TEMP]) {
+    if (value?.trim()) roots.add(resolve(value));
+  }
+  // POSIX 同时存在每用户 TMPDIR 与公共临时根；这是操作系统类别，不是任务/夹具 ID 特例。
+  if (process.platform !== 'win32') {
+    roots.add(resolve('/tmp'));
+    roots.add(resolve('/var/tmp'));
+  }
+  return [...roots];
+}
+
 export class SqliteStore {
   private db: Database.Database;
+  private readonly restoreWorkspaceRoots?: string[];
+  private readonly excludeSystemTemporaryProjects: boolean;
+  private readonly systemTemporaryRoots: string[];
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, options: SqliteStoreOptions = {}) {
+    this.restoreWorkspaceRoots = options.restoreWorkspaceRoots?.map((root) => resolve(root));
+    this.excludeSystemTemporaryProjects = options.excludeSystemTemporaryProjects ?? false;
+    this.systemTemporaryRoots = (options.systemTemporaryRoots ?? defaultSystemTemporaryRoots()).map((root) => resolve(root));
     const fileBacked = dbPath !== ':memory:';
     if (fileBacked) {
       // Question 正文、项目路径和验收记录都属于本机私有审计数据。先以 0600 创建/
@@ -148,7 +228,7 @@ export class SqliteStore {
     if (!sql) {
       // 兜底：内联 schema（避免找不到文件导致启动失败）
       sql = `CREATE TABLE IF NOT EXISTS plans (plan_id TEXT PRIMARY KEY, title TEXT, status TEXT DEFAULT 'submitted', project_path TEXT, default_assignee TEXT DEFAULT 'auto', default_priority INTEGER DEFAULT 5, phases TEXT DEFAULT '[]', task_count INTEGER DEFAULT 0, created_at TEXT, submitted_at TEXT);
-CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, title TEXT, type TEXT, phase TEXT, status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 5, assignee TEXT DEFAULT 'auto', ownership_files TEXT, ownership_modules TEXT, depends_on TEXT, timeout_seconds INTEGER DEFAULT 3600, max_retries INTEGER DEFAULT 2, model_override TEXT, acceptance_for TEXT, verify TEXT DEFAULT '[]', claimed_by TEXT, claimed_at TEXT, expire_at TEXT, result_path TEXT, result_json_path TEXT, done_at TEXT, retries INTEGER DEFAULT 0, pm_review_status TEXT, pm_reviewed_by TEXT, pm_reviewed_at TEXT, pm_review_comment TEXT, pm_reject_reason TEXT, pm_fix_instructions TEXT, pm_rejection_resolution_mode TEXT, repair_ownership_extension TEXT, failure_reason TEXT, fix_for TEXT, repair_root_task_id TEXT, resolution_status TEXT, resolution_action TEXT, resolution_task_id TEXT, resolution_task_ids TEXT, resolved_by_task TEXT, resolution_generation INTEGER DEFAULT 0, resolution_attempts INTEGER DEFAULT 0, resolution_decision_reason TEXT, blocked_at TEXT, block_reason TEXT, blocked_question_id TEXT, blocked_lease_remaining TEXT, last_question_id TEXT, last_question_answer TEXT, cancelled_at TEXT, superseded_at TEXT, superseded_by TEXT, superseded_reason TEXT, supersede_preview_token TEXT, supersede_batch_size INTEGER, verify_results TEXT DEFAULT '[]', goal_md TEXT, created_at TEXT, updated_at TEXT, FOREIGN KEY (plan_id) REFERENCES plans(plan_id));
+CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, title TEXT, type TEXT, phase TEXT, status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 5, assignee TEXT DEFAULT 'auto', ownership_files TEXT, ownership_modules TEXT, depends_on TEXT, timeout_seconds INTEGER DEFAULT 3600, max_retries INTEGER DEFAULT 2, model_override TEXT, acceptance_for TEXT, verify TEXT DEFAULT '[]', claimed_by TEXT, claimed_at TEXT, expire_at TEXT, result_path TEXT, result_json_path TEXT, done_at TEXT, retries INTEGER DEFAULT 0, pm_review_status TEXT, pm_reviewed_by TEXT, pm_reviewed_at TEXT, pm_review_comment TEXT, pm_accept_effects_applied TEXT, pm_reject_reason TEXT, pm_fix_instructions TEXT, pm_rejection_resolution_mode TEXT, repair_ownership_extension TEXT, pm_repair_ownership_required TEXT, pm_repair_ownership_intent TEXT, failure_reason TEXT, fix_for TEXT, repair_root_task_id TEXT, resolution_status TEXT, resolution_action TEXT, resolution_task_id TEXT, resolution_task_ids TEXT, resolved_by_task TEXT, resolution_generation INTEGER DEFAULT 0, resolution_attempts INTEGER DEFAULT 0, resolution_decision_reason TEXT, blocked_at TEXT, block_reason TEXT, blocked_question_id TEXT, blocked_lease_remaining TEXT, last_question_id TEXT, last_question_answer TEXT, cancelled_at TEXT, superseded_at TEXT, superseded_by TEXT, superseded_reason TEXT, supersede_preview_token TEXT, supersede_batch_size INTEGER, verify_results TEXT DEFAULT '[]', goal_md TEXT, created_at TEXT, updated_at TEXT, FOREIGN KEY (plan_id) REFERENCES plans(plan_id));
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
     }
@@ -178,10 +258,13 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       model_override: 'TEXT',
       acceptance_for: 'TEXT',
       verify: "TEXT DEFAULT '[]'",
+      pm_accept_effects_applied: 'TEXT',
       pm_reject_reason: 'TEXT',
       pm_fix_instructions: 'TEXT',
       pm_rejection_resolution_mode: 'TEXT',
       repair_ownership_extension: 'TEXT',
+      pm_repair_ownership_required: 'TEXT',
+      pm_repair_ownership_intent: 'TEXT',
       failure_reason: 'TEXT',
       fix_for: 'TEXT',
       repair_root_task_id: 'TEXT',
@@ -229,6 +312,101 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       (this.db.prepare('PRAGMA table_info(questions)').all() as Array<{ name: string }>).map((column) => column.name),
     );
     if (!questionColumns.has('asked_event_id')) this.db.exec('ALTER TABLE questions ADD COLUMN asked_event_id TEXT');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS agent_registrations (
+      agent_id TEXT NOT NULL,
+      registration_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      registration_source TEXT NOT NULL,
+      agent_type TEXT,
+      capabilities TEXT,
+      endpoint TEXT,
+      projects TEXT,
+      registered_at TEXT,
+      PRIMARY KEY (agent_id, registration_id),
+      UNIQUE (agent_id, generation)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_registrations_current
+      ON agent_registrations(agent_id, generation DESC);`);
+  }
+
+  /**
+   * 将升级前 Redis 中的 epoch 历史一次性收编进 SQLite。
+   * SET 没有历史顺序，因此只保证 current 拿到最大 generation；其余全是 retired，
+   * 它们之间的相对顺序不影响 fencing。
+   */
+  seedAgentRegistrationHistory(
+    agentId: string,
+    registrationIds: string[],
+    current: Omit<AgentRegistrationRow, 'generation'> | undefined,
+  ): void {
+    const seed = this.db.transaction(() => {
+      const count = this.db.prepare(
+        'SELECT COUNT(*) AS count FROM agent_registrations WHERE agent_id = ?',
+      ).get(agentId) as { count: number };
+      if (count.count > 0) return;
+      const retired = [...new Set(registrationIds)]
+        .filter((id) => id && id !== current?.registration_id)
+        .sort();
+      const insert = this.db.prepare(`INSERT INTO agent_registrations
+        (agent_id, registration_id, generation, registration_source, agent_type, capabilities, endpoint, projects, registered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      let generation = 0;
+      for (const registrationId of retired) {
+        generation++;
+        insert.run(agentId, registrationId, generation, 'client', '', '', '', '', '');
+      }
+      if (current?.registration_id) {
+        generation++;
+        insert.run(
+          agentId, current.registration_id, generation, current.registration_source,
+          current.agent_type, current.capabilities, current.endpoint, current.projects, current.registered_at,
+        );
+      }
+    });
+    seed();
+  }
+
+  /** SQLite 先于 Redis 分配单调 generation，作为跨引擎的耐久 fencing 真相。 */
+  registerAgentEpoch(input: Omit<AgentRegistrationRow, 'generation'>): AgentRegistrationDecision {
+    const decide = this.db.transaction((): AgentRegistrationDecision => {
+      const rows = this.db.prepare(
+        'SELECT * FROM agent_registrations WHERE agent_id = ? ORDER BY generation DESC',
+      ).all(input.agent_id) as AgentRegistrationRow[];
+      const current = rows[0];
+      const existing = rows.find((row) => row.registration_id === input.registration_id);
+      if (existing && current && existing.generation < current.generation) {
+        return { outcome: 'retired', current, requested: existing };
+      }
+      if (existing) {
+        this.db.prepare(`UPDATE agent_registrations SET
+          registration_source=@registration_source, agent_type=@agent_type, capabilities=@capabilities,
+          endpoint=@endpoint, projects=@projects WHERE agent_id=@agent_id AND registration_id=@registration_id`
+        ).run(input);
+        return { outcome: 'idempotent', current: { ...existing, ...input }, requested: existing };
+      }
+      const row: AgentRegistrationRow = {
+        ...input,
+        generation: (current?.generation ?? 0) + 1,
+      };
+      this.db.prepare(`INSERT INTO agent_registrations
+        (agent_id, registration_id, generation, registration_source, agent_type, capabilities, endpoint, projects, registered_at)
+        VALUES (@agent_id, @registration_id, @generation, @registration_source, @agent_type, @capabilities, @endpoint, @projects, @registered_at)`
+      ).run(row);
+      return { outcome: 'created', current: row, requested: row };
+    });
+    return decide();
+  }
+
+  getAllAgentRegistrations(): AgentRegistrationRow[] {
+    return this.db.prepare(
+      'SELECT * FROM agent_registrations ORDER BY agent_id, generation',
+    ).all() as AgentRegistrationRow[];
+  }
+
+  getCurrentAgentRegistration(agentId: string): AgentRegistrationRow | undefined {
+    return this.db.prepare(
+      'SELECT * FROM agent_registrations WHERE agent_id = ? ORDER BY generation DESC LIMIT 1',
+    ).get(agentId) as AgentRegistrationRow | undefined;
   }
 
   /** 写入或更新 plan */
@@ -259,10 +437,13 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       model_override: task.model_override ?? '',
       acceptance_for: task.acceptance_for ?? '',
       verify: task.verify ?? '[]',
+      pm_accept_effects_applied: task.pm_accept_effects_applied ?? '',
       pm_reject_reason: task.pm_reject_reason ?? '',
       pm_fix_instructions: task.pm_fix_instructions ?? '',
       pm_rejection_resolution_mode: task.pm_rejection_resolution_mode ?? '',
       repair_ownership_extension: task.repair_ownership_extension ?? '',
+      pm_repair_ownership_required: task.pm_repair_ownership_required ?? '',
+      pm_repair_ownership_intent: task.pm_repair_ownership_intent ?? '',
       failure_reason: task.failure_reason ?? '',
       fix_for: task.fix_for ?? '',
       repair_root_task_id: task.repair_root_task_id ?? '',
@@ -294,7 +475,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
          (task_id, plan_id, title, type, phase, status, priority, assignee, ownership_files, ownership_modules, depends_on,
           timeout_seconds, max_retries, model_override, acceptance_for, verify, claimed_by, claimed_at, expire_at,
           result_path, result_json_path, done_at, retries, pm_review_status, pm_reviewed_by, pm_reviewed_at,
-          pm_review_comment, pm_reject_reason, pm_fix_instructions, pm_rejection_resolution_mode, repair_ownership_extension, failure_reason, fix_for, repair_root_task_id, resolution_status,
+          pm_review_comment, pm_accept_effects_applied, pm_reject_reason, pm_fix_instructions, pm_rejection_resolution_mode, repair_ownership_extension, pm_repair_ownership_required, pm_repair_ownership_intent, failure_reason, fix_for, repair_root_task_id, resolution_status,
           resolution_action, resolution_task_id, resolution_task_ids, resolved_by_task, resolution_generation, resolution_attempts, resolution_decision_reason,
           blocked_at, block_reason, blocked_question_id,
           blocked_lease_remaining, last_question_id, last_question_answer, cancelled_at, superseded_at, superseded_by, superseded_reason, supersede_preview_token, supersede_batch_size, verify_results, goal_md, created_at, updated_at)
@@ -302,7 +483,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
          (@task_id, @plan_id, @title, @type, @phase, @status, @priority, @assignee, @ownership_files, @ownership_modules, @depends_on,
           @timeout_seconds, @max_retries, @model_override, @acceptance_for, @verify, @claimed_by, @claimed_at, @expire_at,
           @result_path, @result_json_path, @done_at, @retries, @pm_review_status, @pm_reviewed_by, @pm_reviewed_at,
-          @pm_review_comment, @pm_reject_reason, @pm_fix_instructions, @pm_rejection_resolution_mode, @repair_ownership_extension, @failure_reason, @fix_for, @repair_root_task_id, @resolution_status,
+          @pm_review_comment, @pm_accept_effects_applied, @pm_reject_reason, @pm_fix_instructions, @pm_rejection_resolution_mode, @repair_ownership_extension, @pm_repair_ownership_required, @pm_repair_ownership_intent, @failure_reason, @fix_for, @repair_root_task_id, @resolution_status,
           @resolution_action, @resolution_task_id, @resolution_task_ids, @resolved_by_task, @resolution_generation, @resolution_attempts, @resolution_decision_reason,
           @blocked_at, @block_reason, @blocked_question_id,
           @blocked_lease_remaining, @last_question_id, @last_question_answer, @cancelled_at, @superseded_at, @superseded_by, @superseded_reason, @supersede_preview_token, @supersede_batch_size, @verify_results, @goal_md, @created_at, @updated_at)`,
@@ -324,9 +505,17 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
    * running 规范化为可重新领取的 pending；只清 claim/lease/block 上下文，保留
    * last_question_id/last_question_answer 作为下一位 Worker 的 durable PM 上下文。
    */
-  recoverRunningTasksForRestore(): number {
-    const recover = this.db.transaction(() => this.db.prepare(
-      `UPDATE tasks SET
+  recoverRunningTasksForRestore(taskIds?: string[]): number {
+    if (taskIds && taskIds.length === 0) return 0;
+    const recover = this.db.transaction(() => {
+      const batches = taskIds
+        ? Array.from({ length: Math.ceil(taskIds.length / 500) }, (_, index) => taskIds.slice(index * 500, (index + 1) * 500))
+        : [undefined];
+      let changes = 0;
+      for (const batch of batches) {
+        const scope = batch ? ` AND task_id IN (${batch.map(() => '?').join(',')})` : '';
+        changes += this.db.prepare(
+          `UPDATE tasks SET
          status = 'pending',
          claimed_by = '',
          claimed_at = '',
@@ -336,9 +525,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
          block_reason = '',
          blocked_question_id = '',
          blocked_lease_remaining = '',
-         updated_at = @updated_at
-       WHERE status = 'running'`,
-    ).run({ updated_at: new Date().toISOString() }).changes);
+         updated_at = ?
+       WHERE status = 'running'${scope}`,
+        ).run(new Date().toISOString(), ...(batch ?? [])).changes;
+      }
+      return changes;
+    });
     return recover();
   }
 
@@ -352,9 +544,67 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
     return this.db.prepare('SELECT * FROM plans').all() as PlanRow[];
   }
 
+  private restoreExclusionReason(plan: PlanRow): RestoreExclusionReason | undefined {
+    const projectPath = plan.project_path?.trim();
+    if (!projectPath) return 'missing_project_path';
+    if (this.restoreWorkspaceRoots && this.restoreWorkspaceRoots.length > 0) {
+      return this.restoreWorkspaceRoots.some((root) => pathIsWithin(projectPath, root))
+        ? undefined
+        : 'outside_configured_workspace';
+    }
+    if (this.excludeSystemTemporaryProjects && this.systemTemporaryRoots.some((root) => pathIsWithin(projectPath, root))) {
+      return 'system_temporary_project';
+    }
+    return undefined;
+  }
+
+  /** 恢复投影专用 plan；通用 getAllPlans 仍保留完整不可变审计。 */
+  getRestorablePlans(): PlanRow[] {
+    return this.getAllPlans()
+      .filter((plan) => this.restoreExclusionReason(plan) === undefined)
+      .sort((a, b) => a.plan_id.localeCompare(b.plan_id));
+  }
+
+  /** 恢复投影专用 task；只跟随可恢复 plan，不按 task ID/名称猜测。 */
+  getRestorableTasks(): TaskRow[] {
+    const planIds = new Set(this.getRestorablePlans().map((plan) => plan.plan_id));
+    return this.getAllTasks()
+      .filter((task) => planIds.has(task.plan_id))
+      .sort((a, b) => a.task_id.localeCompare(b.task_id));
+  }
+
+  getRestoreExclusionSummary(): RestoreExclusionSummary {
+    const plans = this.getAllPlans();
+    const taskCounts = new Map<string, number>();
+    for (const task of this.getAllTasks()) taskCounts.set(task.plan_id, (taskCounts.get(task.plan_id) ?? 0) + 1);
+    const summary: RestoreExclusionSummary = { plan_count: 0, task_count: 0, by_reason: {} };
+    for (const plan of plans) {
+      const reason = this.restoreExclusionReason(plan);
+      if (!reason) continue;
+      const tasks = taskCounts.get(plan.plan_id) ?? 0;
+      summary.plan_count++;
+      summary.task_count += tasks;
+      const bucket = summary.by_reason[reason] ?? { plans: 0, tasks: 0 };
+      bucket.plans++;
+      bucket.tasks += tasks;
+      summary.by_reason[reason] = bucket;
+    }
+    return summary;
+  }
+
   /** task 总数 */
   getTaskCount(): number {
     return (this.db.prepare('SELECT COUNT(*) as count FROM tasks').get() as { count: number }).count;
+  }
+
+  /** Redis 灾难恢复不能只看 task：Agent epoch 等空项目状态同样是安全真相。 */
+  hasDurableState(): boolean {
+    const row = this.db.prepare(`SELECT
+      EXISTS(SELECT 1 FROM plans LIMIT 1) OR
+      EXISTS(SELECT 1 FROM tasks LIMIT 1) OR
+      EXISTS(SELECT 1 FROM questions LIMIT 1) OR
+      EXISTS(SELECT 1 FROM agent_registrations LIMIT 1) AS present`).get() as { present: number };
+    return Boolean(row.present);
   }
 
   /** 按状态统计 task */

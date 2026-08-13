@@ -24,7 +24,22 @@ export interface AgentInfo {
   agent_type: string;
   status: string;
   current_task: string;
+  /** current_task 的真实任务状态；用于把已结束的旧指针折叠到历史。 */
+  current_task_status?: string;
   last_heartbeat: number;
+}
+
+export interface StatusAttention {
+  failed: number;
+  rejected: number;
+  needs_pm_decision: number;
+  stale_running_agents: number;
+}
+
+export interface StatusHistory {
+  resolved_failed: number;
+  resolved_rejected: number;
+  stale_agents: number;
 }
 
 export interface StatusData {
@@ -34,9 +49,17 @@ export interface StatusData {
     accepted: number;
     rejected: number;
   };
+  /** 当前需要处理的异常；旧 tasks/reviews 字段仍保留原始审计总数。 */
+  attention?: StatusAttention;
+  /** 已闭环失败/拒绝与历史 Agent 的独立统计。 */
+  history?: StatusHistory;
   ownership_conflicts: number;
   plans: PlanSummary[];
   agents: AgentInfo[];
+  agent_groups?: {
+    current: AgentInfo[];
+    history: AgentInfo[];
+  };
   hint?: {
     /** 稳定语义码；前端据此做本地化，message 仅作旧服务回退。 */
     code?: string;

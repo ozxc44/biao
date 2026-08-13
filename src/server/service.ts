@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { keys, pendingScore, runningScore, DEFAULT_PM_CONSUMER, isValidConsumerName } from '../redis/keys.js';
-import { SqliteStore, type TaskRow, type PlanRow } from '../db/sqlite-store.js';
+import { SqliteStore, type TaskRow, type PlanRow, type AgentRegistrationRow } from '../db/sqlite-store.js';
 import type {
   QuestionCreateRequest,
   QuestionAnswerRequest,
@@ -71,6 +71,95 @@ function normalizePmConsumer(raw: string | null | undefined): string {
   return consumer && isValidConsumerName(consumer) ? consumer : DEFAULT_PM_CONSUMER;
 }
 
+/**
+ * 修改 task hash 时同时维护所有长期轮询索引。
+ *
+ * `persistTaskFromRedis` 是 Redis -> SQLite 的耐久副本同步，不能承担 Redis 内部
+ * 投影正确性：进程可能在 HSET 成功后、调用 persist 前退出。这个 Lua 把 task 真相、
+ * plan/task 注册、revision/dirty 以及当前 failed intake 候选放在同一个 Redis 原子
+ * 边界。网络在 EVAL 返回时中断也只会形成“结果未知”，不会形成“真相已写但 dirty 未写”。
+ */
+const MUTATE_TASK_WITH_PLAN_PROJECTION = `
+-- mutate-task-with-plan-projection-v1
+local task_id = ARGV[1]
+local expected_plan_id = ARGV[2]
+local mode = ARGV[3]
+local now = ARGV[4]
+local existing_task_id = redis.call('HGET', KEYS[1], 'task_id')
+
+if mode == 'create' then
+  if existing_task_id then return {'TASK_EXISTS'} end
+elseif not existing_task_id then
+  return {'TASK_NOT_FOUND'}
+end
+
+local actual_plan_id = redis.call('HGET', KEYS[1], 'plan_id') or expected_plan_id
+if actual_plan_id ~= expected_plan_id then return {'PLAN_CHANGED', actual_plan_id} end
+
+for index = 5, #ARGV, 2 do
+  redis.call('HSET', KEYS[1], ARGV[index], ARGV[index + 1])
+end
+
+-- create 必须把 identity 一并写入；update 则再次验证 mutation 没有改写 identity。
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id or
+   (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= expected_plan_id then
+  return {'IDENTITY_INVALID'}
+end
+
+redis.call('SADD', KEYS[2], expected_plan_id)
+redis.call('SADD', KEYS[3], task_id)
+redis.call('HINCRBY', KEYS[4], expected_plan_id, 1)
+redis.call('SADD', KEYS[5], expected_plan_id)
+
+local status = redis.call('HGET', KEYS[1], 'status') or ''
+local resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+local actionable = resolution == 'needs_pm_decision' or
+  (status == 'failed' and resolution ~= 'repairing' and resolution ~= 'required' and
+   resolution ~= 'resolved' and resolution ~= 'cancelled')
+if actionable then
+  local score = tonumber(redis.call('HGET', KEYS[1], 'done_at') or '') or tonumber(now)
+  redis.call('ZADD', KEYS[6], score, task_id)
+else
+  redis.call('ZREM', KEYS[6], task_id)
+end
+return {mode == 'create' and 'CREATED' or 'UPDATED'}
+`;
+
+async function mutateTaskWithPlanProjection(
+  redis: Redis,
+  taskId: string,
+  planId: string,
+  fields: Record<string, string | number>,
+  mode: 'create' | 'update' = 'update',
+): Promise<'CREATED' | 'UPDATED' | 'TASK_EXISTS'> {
+  if ((fields.task_id !== undefined && String(fields.task_id) !== taskId) ||
+      (fields.plan_id !== undefined && String(fields.plan_id) !== planId)) {
+    throw new Error(`task/projection mutation cannot change identity task=${taskId} plan=${planId}`);
+  }
+  const flatFields = Object.entries(fields).flatMap(([field, value]) => [field, String(value)]);
+  const raw = (await redis.eval(
+    MUTATE_TASK_WITH_PLAN_PROJECTION,
+    6,
+    keys.hash.task(taskId),
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(planId),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    taskId,
+    planId,
+    mode,
+    String(Date.now()),
+    ...flatFields,
+  )) as string[];
+  const outcome = String(raw?.[0] ?? 'UNKNOWN');
+  if (outcome === 'TASK_EXISTS' && mode === 'create') return 'TASK_EXISTS';
+  if (outcome !== 'UPDATED' && outcome !== 'CREATED') {
+    throw new Error(`task/projection atomic mutation failed task=${taskId} outcome=${outcome}`);
+  }
+  return outcome;
+}
+
 /** SQLite 持久化单例（由 main.ts 注入，service 函数双写用）。null = 未启用 */
 let sqliteStore: SqliteStore | null = null;
 
@@ -85,6 +174,9 @@ export function getSqliteStore(): SqliteStore | null {
 }
 
 async function persistTaskFromRedis(redis: Redis, taskId: string): Promise<void> {
+  // Redis 内 task 真相与 plan/intake 投影必须已由各 mutation 的同一 Lua/MULTI 提交。
+  // 本函数只负责跨引擎的 SQLite 耐久副本；把 Redis dirty 放在这里会重新引入
+  // “真相已写、进程在 persist 前退出”的永久旧 aggregate 窗口。
   if (!sqliteStore) return;
   const h = await redis.hgetall(keys.hash.task(taskId));
   if (!h.task_id) return;
@@ -117,10 +209,13 @@ async function persistTaskFromRedis(redis: Redis, taskId: string): Promise<void>
     pm_reviewed_by: h.pm_reviewed_by ?? '',
     pm_reviewed_at: h.pm_reviewed_at ?? '',
     pm_review_comment: h.pm_review_comment ?? '',
+    pm_accept_effects_applied: h.pm_accept_effects_applied ?? '',
     pm_reject_reason: h.pm_reject_reason ?? '',
     pm_fix_instructions: h.pm_fix_instructions ?? '',
     pm_rejection_resolution_mode: h.pm_rejection_resolution_mode ?? '',
     repair_ownership_extension: h.repair_ownership_extension ?? '',
+    pm_repair_ownership_required: h.pm_repair_ownership_required ?? '',
+    pm_repair_ownership_intent: h.pm_repair_ownership_intent ?? '',
     failure_reason: h.failed_reason ?? '',
     fix_for: h.fix_for ?? '',
     repair_root_task_id: h.repair_root_task_id ?? '',
@@ -167,6 +262,11 @@ export async function getDbStatus(redis: Redis): Promise<ApiResponse<{
   task_count: number;
   plan_count: number;
   by_status: Record<string, number>;
+  restore_projection: {
+    restorable_tasks: number;
+    restorable_plans: number;
+    excluded: ReturnType<SqliteStore['getRestoreExclusionSummary']>;
+  };
   maintenance: DbMaintenanceStatus;
 } | null>> {
   if (!sqliteStore) {
@@ -203,6 +303,11 @@ export async function getDbStatus(redis: Redis): Promise<ApiResponse<{
       task_count: sqliteStore.getTaskCount(),
       plan_count: sqliteStore.getPlanCount(),
       by_status: sqliteStore.getTaskCountByStatus(),
+      restore_projection: {
+        restorable_tasks: sqliteStore.getRestorableTasks().length,
+        restorable_plans: sqliteStore.getRestorablePlans().length,
+        excluded: sqliteStore.getRestoreExclusionSummary(),
+      },
       maintenance: {
         state: maintenanceState,
         restore_lock: Boolean(lockValue),
@@ -647,14 +752,57 @@ async function withMutationPermitOrThrow<T>(redis: Redis, mutate: () => Promise<
   }
 }
 
+type MutationSectionResult =
+  | { ok: true; release: () => Promise<void> }
+  | { ok: false; error: { code: MaintenanceGateErrorCode; message: string } };
+
+/**
+ * claim 的阻塞等待不能占用全局 mutation permit；需要跨多个 helper 的候选扫描则
+ * 显式打开一个短 mutation section，并在进入 XREAD 前释放。
+ */
+async function acquireMutationSection(redis: Redis): Promise<MutationSectionResult> {
+  const leaveLocalMutation = enterLocalMutation();
+  let permit: MaintenanceGateResult;
+  try {
+    permit = await acquireMutationPermit(redis);
+  } catch (error) {
+    leaveLocalMutation();
+    throw error;
+  }
+  if (!permit.ok) {
+    leaveLocalMutation();
+    return permit;
+  }
+  let released = false;
+  return {
+    ok: true,
+    release: async () => {
+      if (released) return;
+      released = true;
+      try {
+        await releaseMutationPermit(redis, permit.owner);
+      } finally {
+        leaveLocalMutation();
+      }
+    },
+  };
+}
+
 /** 手动触发恢复（对应 biao db restore）—— 仅在 Biao namespace 为空时重建 */
-export async function dbRestoreManual(redis: Redis): Promise<ApiResponse<{ restored: number; by_status: Record<string, number> }>> {
+export async function dbRestoreManual(redis: Redis): Promise<ApiResponse<{
+  restored: number;
+  by_status: Record<string, number>;
+  excluded: ReturnType<SqliteStore['getRestoreExclusionSummary']>;
+}>> {
   if (!sqliteStore) {
     return { ok: false, data: null, error: { code: 'SQLITE_NOT_ENABLED', message: 'SQLite 持久化未启用' } };
   }
   try {
     const r = await dbRestore(redis, sqliteStore);
-    return { ok: true, data: { restored: r.restored, by_status: r.byStatus } };
+    return {
+      ok: true,
+      data: { restored: r.restored, by_status: r.byStatus, excluded: sqliteStore.getRestoreExclusionSummary() },
+    };
   } catch (e) {
     const error = e as Error & { code?: string };
     if (error.code === 'RESTORE_IN_PROGRESS' || error.code === 'RESTORE_FAILED' || error.code === 'RESTORE_WRITERS_ACTIVE' ||
@@ -824,8 +972,21 @@ function restoreProjectionMaterialKeys(projection: RestoreProjection): string[] 
     keys.stream.events,
     ...Object.values(keys.zset.status),
     keys.reviewRequested.pending,
+    keys.planStatusProjection.ready,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.dirtyPlans,
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.agentIds,
+    keys.planStatusProjection.agentIdsReady,
+    keys.intakeActionableFailed.pending,
+    keys.intakeActionableFailed.ready,
+    keys.intakeActionableFailed.backfillLock,
   ]);
-  for (const plan of projection.plans) material.add(keys.hash.plan(plan.plan_id));
+  for (const plan of projection.plans) {
+    material.add(keys.hash.plan(plan.plan_id));
+    material.add(keys.planStatusProjection.taskIdsByPlan(plan.plan_id));
+    material.add(keys.planStatusProjection.aggregateByPlan(plan.plan_id));
+  }
   for (const task of projection.tasks) material.add(keys.hash.task(task.task_id));
   for (const question of projection.questions) {
     material.add(keys.hash.question(question.question_id));
@@ -833,6 +994,10 @@ function restoreProjectionMaterialKeys(projection: RestoreProjection): string[] 
       material.add(keys.question.openByTask(question.task_id));
       material.add(keys.question.openMetaByTask(question.task_id));
     }
+  }
+  for (const registration of projection.agentRegistrations) {
+    material.add(keys.hash.agent(registration.agent_id));
+    material.add(agentRegistrationHistoryKey(registration.agent_id));
   }
   return [...material];
 }
@@ -868,6 +1033,7 @@ interface RestoreProjection {
   tasks: TaskRow[];
   plans: PlanRow[];
   questions: ReturnType<SqliteStore['getAllQuestions']>;
+  agentRegistrations: AgentRegistrationRow[];
   plansById: Map<string, PlanRow>;
   tasksById: Map<string, TaskRow>;
   pendingScoresByTaskId: Map<string, number>;
@@ -882,15 +1048,19 @@ interface MaintenanceRenewal {
 function prepareRestoreProjection(sqlite: SqliteStore): RestoreProjection {
   // 这一步先于 Redis 发布且自身是 SQLite 单事务。若后续 Redis 失败，pending 是比
   // 复活旧 running 更安全、并且可直接重试的 durable 真相。
-  sqlite.recoverRunningTasksForRestore();
-  const tasks = sqlite.getAllTasks();
-  const plans = sqlite.getAllPlans();
-  const questions = sqlite.getAllQuestions();
+  const tasks = sqlite.getRestorableTasks();
+  const plans = sqlite.getRestorablePlans();
+  sqlite.recoverRunningTasksForRestore(tasks.map((task) => task.task_id));
+  // running 规范化发生在 SQLite 事务中；重新读取恢复集合，避免投影携带旧 running 行。
+  const normalizedTasks = sqlite.getRestorableTasks();
+  const taskIds = new Set(normalizedTasks.map((task) => task.task_id));
+  const questions = sqlite.getAllQuestions().filter((question) => taskIds.has(question.task_id));
+  const agentRegistrations = sqlite.getAllAgentRegistrations();
 
-  const invalidStatusTask = tasks.find((task) => !RESTORABLE_TASK_STATUSES.has(task.status as TaskStatus));
+  const invalidStatusTask = normalizedTasks.find((task) => !RESTORABLE_TASK_STATUSES.has(task.status as TaskStatus));
   if (invalidStatusTask) throw invalidRestoredTaskStatus(invalidStatusTask);
 
-  const tasksById = new Map(tasks.map((task) => [task.task_id, task]));
+  const tasksById = new Map(normalizedTasks.map((task) => [task.task_id, task]));
   const plansById = new Map(plans.map((plan) => [plan.plan_id, plan]));
   const openQuestionByTask = new Map<string, string>();
   for (const question of questions) {
@@ -911,7 +1081,7 @@ function prepareRestoreProjection(sqlite: SqliteStore): RestoreProjection {
   }
 
   // 反向一致性：task 不能声称正在等 PM，却没有唯一、匹配的 open Question。
-  for (const task of tasks) {
+  for (const task of normalizedTasks) {
     const expectsOpenQuestion = task.block_reason === 'waiting_pm_reply' || Boolean(task.blocked_question_id);
     if (!expectsOpenQuestion) continue;
     const openQuestionId = openQuestionByTask.get(task.task_id) ?? '';
@@ -924,7 +1094,7 @@ function prepareRestoreProjection(sqlite: SqliteStore): RestoreProjection {
   // MULTI 中的命令运行时失败不会回滚其它命令。因此所有可控 ZADD
   // 参数必须在设置 durable barrier 之前完成预计算和校验。
   const pendingScoresByTaskId = new Map<string, number>();
-  for (const task of tasks) {
+  for (const task of normalizedTasks) {
     if (task.status !== 'pending') continue;
     const plan = plansById.get(task.plan_id);
     const score = pendingScore(restoredPriority(task, plan), restoredPendingTimestamp(task, plan));
@@ -933,11 +1103,12 @@ function prepareRestoreProjection(sqlite: SqliteStore): RestoreProjection {
   }
 
   const byStatus: Record<string, number> = {};
-  for (const task of tasks) byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
+  for (const task of normalizedTasks) byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
   return {
-    tasks,
+    tasks: normalizedTasks,
     plans,
     questions,
+    agentRegistrations,
     plansById,
     tasksById,
     pendingScoresByTaskId,
@@ -950,7 +1121,13 @@ async function publishRestoreProjection(
   restoreOwner: string,
   projection: RestoreProjection,
 ): Promise<{ restored: number; byStatus: Record<string, number> }> {
-  const { tasks, plans, questions, plansById, tasksById, pendingScoresByTaskId, byStatus } = projection;
+  const { tasks, plans, questions, agentRegistrations, plansById, tasksById, pendingScoresByTaskId, byStatus } = projection;
+  const taskStatesByPlan = new Map<string, PlanTaskState[]>();
+  for (const task of tasks) {
+    const states = taskStatesByPlan.get(task.plan_id) ?? [];
+    states.push(planTaskStateFromRow(task));
+    taskStatesByPlan.set(task.plan_id, states);
+  }
   const [seconds, microseconds] = await redis.time();
   const now = Number(seconds) * 1_000 + Math.floor(Number(microseconds) / 1_000);
   const transactionRedis = redis.duplicate();
@@ -962,6 +1139,7 @@ async function publishRestoreProjection(
 
     const transaction = transactionRedis.multi();
     for (const plan of plans) {
+      transaction.sadd(keys.planStatusProjection.planIds, plan.plan_id);
       transaction.hset(keys.hash.plan(plan.plan_id), {
         plan_id: plan.plan_id,
         title: plan.title ?? '',
@@ -974,6 +1152,11 @@ async function publishRestoreProjection(
         created_at: String(restoredPlanCreatedAt(plan)),
         pm_consumer: normalizePmConsumer(plan.pm_consumer),
       });
+      transaction.hset(
+        keys.planStatusProjection.aggregateByPlan(plan.plan_id),
+        planStatusProjectionHash(buildPlanStatusProjection(taskStatesByPlan.get(plan.plan_id) ?? [])),
+      );
+      transaction.hset(keys.planStatusProjection.revisionByPlan, plan.plan_id, '0');
     }
 
     for (const task of tasks) {
@@ -1012,10 +1195,13 @@ async function publishRestoreProjection(
         pm_reviewed_by: task.pm_reviewed_by ?? '',
         pm_reviewed_at: restoredTimestampString(task.pm_reviewed_at),
         pm_review_comment: task.pm_review_comment ?? '',
+        pm_accept_effects_applied: task.pm_accept_effects_applied ?? '',
         pm_reject_reason: task.pm_reject_reason ?? '',
         pm_fix_instructions: task.pm_fix_instructions ?? '',
         pm_rejection_resolution_mode: task.pm_rejection_resolution_mode ?? '',
         repair_ownership_extension: task.repair_ownership_extension ?? '',
+        pm_repair_ownership_required: task.pm_repair_ownership_required ?? '',
+        pm_repair_ownership_intent: task.pm_repair_ownership_intent ?? '',
         failed_reason: task.failure_reason ?? '',
         fix_for: task.fix_for ?? '',
         repair_root_task_id: task.repair_root_task_id ?? '',
@@ -1041,6 +1227,7 @@ async function publishRestoreProjection(
         supersede_batch_size: String(task.supersede_batch_size ?? 0),
         verify_results: task.verify_results ?? '[]',
       });
+      transaction.sadd(keys.planStatusProjection.taskIdsByPlan(task.plan_id), task.task_id);
       const statusKey = (keys.zset.status as Record<string, string>)[restoredStatus];
       const statusScore = restoredStatus === 'pending'
         ? pendingScoresByTaskId.get(task.task_id)!
@@ -1116,6 +1303,60 @@ async function publishRestoreProjection(
         );
       }
     }
+
+    // 还原所有 retired ID，但只把最高 generation 投影为当前 Agent。
+    // restore 不复活进程：当前代次以 offline 完成安全封口，新进程必须新注册。
+    const currentAgentRegistrations = new Map<string, AgentRegistrationRow>();
+    for (const registration of agentRegistrations) {
+      transaction.sadd(agentRegistrationHistoryKey(registration.agent_id), registration.registration_id);
+      const current = currentAgentRegistrations.get(registration.agent_id);
+      if (!current || registration.generation > current.generation) {
+        currentAgentRegistrations.set(registration.agent_id, registration);
+      }
+    }
+    for (const registration of currentAgentRegistrations.values()) {
+      transaction.sadd(keys.planStatusProjection.agentIds, registration.agent_id);
+      transaction.hset(keys.hash.agent(registration.agent_id), {
+        agent_id: registration.agent_id,
+        agent_type: registration.agent_type ?? '',
+        capabilities: registration.capabilities ?? '',
+        endpoint: registration.endpoint ?? '',
+        projects: registration.projects ?? '',
+        registration_id: registration.registration_id,
+        registration_generation: String(registration.generation),
+        registration_source: registration.registration_source,
+        registered_at: registration.registered_at ?? '',
+        last_heartbeat: registration.registered_at ?? '',
+        status: 'offline',
+        current_task: '',
+        offline_at: String(now),
+        offline_reason: 'restore',
+        claim_request_id: '',
+        claim_request_task_id: '',
+        claim_request_token: '',
+        claim_request_payload: '',
+      });
+    }
+
+    // ready 与 task/plan/aggregate 在同一个恢复发布事务中可见；成功恢复后的第一轮
+    // `/status` 不需要、也不允许再把完整 SQLite 历史从 Redis 扫一遍。
+    transaction.set(keys.planStatusProjection.ready, PLAN_STATUS_PROJECTION_VERSION);
+    // Agent epoch 会恢复为 offline 审计/fencing 投影，不复活任何进程。
+    transaction.set(keys.planStatusProjection.agentIdsReady, PLAN_STATUS_PROJECTION_VERSION);
+    // restore 已遍历全部 SQLite failed。把当前 actionable failed 与 ready 一起发布，
+    // 首轮 intake 不再回扫恢复后的 failed 历史。
+    for (const task of tasks) {
+      const resolutionStatus = task.resolution_status ?? '';
+      const actionable = resolutionStatus === 'needs_pm_decision' ||
+        (task.status === 'failed' && !['repairing', 'required', 'resolved', 'cancelled'].includes(resolutionStatus));
+      if (!actionable) continue;
+      transaction.zadd(
+        keys.intakeActionableFailed.pending,
+        parsePersistedTimestamp(task.done_at) ?? now,
+        task.task_id,
+      );
+    }
+    transaction.set(keys.intakeActionableFailed.ready, '1');
 
     const results = await transaction.exec();
     if (results === null) {
@@ -1467,6 +1708,9 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
       created++;
     }
 
+    // writeTaskToRedis / writePlanToRedis 各自把真相与 plan registry/revision/dirty 放在
+    // 同一 MULTI。这里不能再依赖一个循环结束后的“事后标脏”调用：进程可能在任意
+    // 一个 task 已发布后退出，而已发布的 task 必须立即可被投影增量重建。
     await writePlanToRedis(redis, plan, tasks.length);
 
     // SQLite 双写：plan + 所有 task（INSERT OR REPLACE，防 FLUSHALL 丢数据）
@@ -1529,10 +1773,13 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
           pm_reviewed_by: existing?.pm_reviewed_by ?? '',
           pm_reviewed_at: existing?.pm_reviewed_at ?? '',
           pm_review_comment: existing?.pm_review_comment ?? '',
+          pm_accept_effects_applied: existing?.pm_accept_effects_applied ?? '',
           pm_reject_reason: existing?.pm_reject_reason ?? '',
           pm_fix_instructions: existing?.pm_fix_instructions ?? '',
           pm_rejection_resolution_mode: existing?.pm_rejection_resolution_mode ?? '',
           repair_ownership_extension: existing?.repair_ownership_extension ?? '',
+          pm_repair_ownership_required: existing?.pm_repair_ownership_required ?? '',
+          pm_repair_ownership_intent: existing?.pm_repair_ownership_intent ?? '',
           fix_for: existing?.fix_for ?? '',
           repair_root_task_id: existing?.repair_root_task_id ?? '',
           resolution_status: existing?.resolution_status ?? '',
@@ -1583,7 +1830,217 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
   }
 }
 
+const AGENT_REGISTRATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+
+function generatedAgentRegistrationId(): string {
+  return `reg_${randomUUID().replaceAll('-', '')}`;
+}
+
+function agentRegistrationHistoryKey(agentId: string): string {
+  // 不放在 hash:agent:* 命名空间，避免旧版 SCAN/HGETALL 把 SET 误当 hash。
+  return `biao:v1:set:agent_registration_ids:${encodeURIComponent(agentId)}`;
+}
+
+// 单实例内把“SQLite generation 分配 -> Redis 发布”与生命周期最终授权串行化。
+// 跨进程部署仍需外部单写者；默认 Biao 运行模式只有一个 server 进程。
+const agentEpochCommitTails = new Map<string, Promise<void>>();
+
+async function withAgentEpochCommit<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = agentEpochCommitTails.get(agentId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  agentEpochCommitTails.set(agentId, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (agentEpochCommitTails.get(agentId) === tail) agentEpochCommitTails.delete(agentId);
+  }
+}
+
+function durableAgentEpochIsCurrent(agentId: string, registrationId: string): boolean {
+  const durableCurrent = sqliteStore?.getCurrentAgentRegistration(agentId);
+  // 空表兼容升级前仅存在于 Redis 的 server-generated epoch；一旦 SQLite 有该
+  // agent 的真相，任何不同 ID 都必须 fail closed，不能等 Redis 发布成功才 fencing。
+  return !durableCurrent || durableCurrent.registration_id === registrationId;
+}
+
+const REGISTER_AGENT_EPOCH = `
+local current_registration = redis.call('HGET', KEYS[1], 'registration_id') or ''
+local requested_registration = ARGV[6]
+local current_generation = tonumber(redis.call('HGET', KEYS[1], 'registration_generation') or '0') or 0
+local requested_generation = tonumber(ARGV[10]) or 0
+if requested_generation <= 0 then requested_generation = current_generation + 1 end
+
+-- SQLite 已经序列化分配 generation。Redis 提交即使反序，低代次也不能覆盖高代次。
+if current_generation > requested_generation then
+  return {'RETIRED', current_registration, tostring(current_generation)}
+end
+
+if current_registration == requested_registration then
+  -- 同一注册请求的传输重试只刷新非生命周期元数据；绝不清空已领任务、
+  -- 不复活已离线 epoch，也不改写 registered_at。
+  redis.call('HSET', KEYS[1],
+    'agent_id', ARGV[1],
+    'agent_type', ARGV[2],
+    'capabilities', ARGV[3],
+    'endpoint', ARGV[4],
+    'projects', ARGV[5],
+    'registration_generation', tostring(requested_generation))
+  redis.call('HDEL', KEYS[1], 'claim_request_payload')
+  redis.call('SADD', KEYS[2], requested_registration)
+  redis.call('SADD', KEYS[3], ARGV[1])
+  redis.call('SET', KEYS[4], ARGV[8])
+  return {'IDEMPOTENT', redis.call('HGET', KEYS[1], 'registered_at') or ARGV[7], tostring(requested_generation)}
+end
+
+if current_generation == requested_generation and current_registration ~= '' then
+  return {'RETIRED', current_registration, tostring(current_generation)}
+end
+
+-- 一个 ID 曾经成为过该 agent 的 epoch，一旦被新 epoch 取代就永久退役。
+-- 这会拦住“旧 register 响应丢失 -> 延迟重试 -> 夺回新会话”。
+if redis.call('SISMEMBER', KEYS[2], requested_registration) == 1 then
+  return {'RETIRED', current_registration}
+end
+
+redis.call('SADD', KEYS[2], requested_registration)
+redis.call('HSET', KEYS[1],
+  'agent_id', ARGV[1],
+  'agent_type', ARGV[2],
+  'capabilities', ARGV[3],
+  'endpoint', ARGV[4],
+  'projects', ARGV[5],
+  'registration_id', requested_registration,
+  'registration_generation', tostring(requested_generation),
+  'registration_source', ARGV[9],
+  'registered_at', ARGV[7],
+  'last_heartbeat', ARGV[7],
+  'status', 'idle',
+  'current_task', '',
+  'claim_request_id', '',
+  'claim_request_task_id', '',
+  'claim_request_token', '',
+  'offline_at', '',
+  'offline_reason', '')
+redis.call('HDEL', KEYS[1], 'claim_request_payload')
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('SET', KEYS[4], ARGV[8])
+return {'CREATED', ARGV[7], tostring(requested_generation)}
+`;
+
 /** agent register */
+async function agentRegisterUnlocked(
+  redis: Redis,
+  agentId: string,
+  agentType: string,
+  capabilities: string[],
+  endpoint?: string,
+  projects?: string[],
+  registrationId?: string,
+): Promise<ApiResponse<{ agent_id: string; registration_id: string; registration_generation: number; registered_at: number }>> {
+  const requestedRegistrationId = registrationId ?? generatedAgentRegistrationId();
+  if (!AGENT_REGISTRATION_ID_PATTERN.test(requestedRegistrationId)) {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        code: 'INVALID_REGISTRATION_ID',
+        message: 'registration_id 必须是 16~128 位安全标识符',
+      },
+    };
+  }
+  const now = Date.now();
+  let durableGeneration = 0;
+  if (sqliteStore) {
+    // 旧版只在 Redis 保存 epoch。首次新版 register 先收编该历史，
+    // 避免升级窗口内的旧请求因 SQLite 空表被当作新代次。
+    const [redisCurrent, redisHistory] = await Promise.all([
+      redis.hgetall(keys.hash.agent(agentId)),
+      redis.smembers(agentRegistrationHistoryKey(agentId)),
+    ]);
+    sqliteStore.seedAgentRegistrationHistory(
+      agentId,
+      redisHistory,
+      redisCurrent.registration_id ? {
+        agent_id: agentId,
+        registration_id: redisCurrent.registration_id,
+        registration_source: redisCurrent.registration_source === 'server' ? 'server' : 'client',
+        agent_type: redisCurrent.agent_type ?? '',
+        capabilities: redisCurrent.capabilities ?? '',
+        endpoint: redisCurrent.endpoint ?? '',
+        projects: redisCurrent.projects ?? '',
+        registered_at: redisCurrent.registered_at ?? String(now),
+      } : undefined,
+    );
+    const decision = sqliteStore.registerAgentEpoch({
+      agent_id: agentId,
+      registration_id: requestedRegistrationId,
+      registration_source: registrationId ? 'client' : 'server',
+      agent_type: agentType,
+      capabilities: capabilities.join(','),
+      endpoint: endpoint ?? '',
+      projects: (projects ?? []).join(','),
+      registered_at: String(now),
+    });
+    if (decision.outcome === 'retired') {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'AGENT_REGISTRATION_RETIRED',
+          message: `Agent ${agentId} 的该 registration_id 已被新会话取代，不能重新激活。`,
+        },
+      };
+    }
+    durableGeneration = decision.current.generation;
+  }
+  const raw = await redis.eval(
+    REGISTER_AGENT_EPOCH,
+    4,
+    keys.hash.agent(agentId),
+    agentRegistrationHistoryKey(agentId),
+    keys.planStatusProjection.agentIds,
+    keys.planStatusProjection.agentIdsReady,
+    agentId,
+    agentType,
+    capabilities.join(','),
+    endpoint ?? '',
+    (projects ?? []).join(','),
+    requestedRegistrationId,
+    String(now),
+    PLAN_STATUS_PROJECTION_VERSION,
+    registrationId ? 'client' : 'server',
+    String(durableGeneration),
+  );
+  if (!Array.isArray(raw)) throw new Error(`failed to register agent ${agentId}`);
+  const outcome = String(raw[0] ?? '');
+  if (outcome === 'RETIRED') {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        code: 'AGENT_REGISTRATION_RETIRED',
+        message: `Agent ${agentId} 的该 registration_id 已被新会话取代，不能重新激活。`,
+      },
+    };
+  }
+  if (outcome !== 'CREATED' && outcome !== 'IDEMPOTENT') {
+    throw new Error(`failed to register agent ${agentId}: ${outcome || 'UNKNOWN'}`);
+  }
+  return {
+    ok: true,
+    data: {
+      agent_id: agentId,
+      registration_id: requestedRegistrationId,
+      registration_generation: Number(raw[2] ?? durableGeneration),
+      registered_at: Number(raw[1] ?? now),
+    },
+  };
+}
+
 export async function agentRegister(
   redis: Redis,
   agentId: string,
@@ -1591,31 +2048,199 @@ export async function agentRegister(
   capabilities: string[],
   endpoint?: string,
   projects?: string[],
-): Promise<ApiResponse<{ agent_id: string }>> {
-  const now = Date.now();
-  await redis.hset(keys.hash.agent(agentId), {
-    agent_id: agentId,
-    agent_type: agentType,
-    capabilities: capabilities.join(','),
-    endpoint: endpoint ?? '',
-    projects: (projects ?? []).join(','),
-    registered_at: String(now),
-    last_heartbeat: String(now),
-    status: 'idle',
-    current_task: '',
-  });
-  return { ok: true, data: { agent_id: agentId } };
+  registrationId?: string,
+): Promise<ApiResponse<{ agent_id: string; registration_id: string; registration_generation: number; registered_at: number }>> {
+  return withAgentEpochCommit(agentId, () => agentRegisterUnlocked(
+    redis, agentId, agentType, capabilities, endpoint, projects, registrationId,
+  ));
 }
 
 /** heartbeat */
-export async function agentHeartbeat(redis: Redis, agentId: string, currentTask?: string): Promise<ApiResponse<unknown>> {
+async function agentHeartbeatUnlocked(
+  redis: Redis,
+  agentId: string,
+  registrationId: string | undefined,
+  currentTask?: string,
+): Promise<ApiResponse<unknown>> {
+  // 仅兼容仓库内通过 server-generated epoch 的直接 service 调用；HTTP schema
+  // 与显式 client epoch 仍必须携带，不存在网络边界降级。
+  let effectiveRegistrationId = registrationId;
+  if (!effectiveRegistrationId) {
+    const current = await redis.hgetall(keys.hash.agent(agentId));
+    if (current.registration_source === 'server') effectiveRegistrationId = current.registration_id;
+  }
+  if (!effectiveRegistrationId) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_REGISTRATION_REQUIRED', message: 'heartbeat 必须携带 register 返回的 registration_id' },
+    };
+  }
+  if (!AGENT_REGISTRATION_ID_PATTERN.test(effectiveRegistrationId)) {
+    return { ok: false, data: null, error: { code: 'INVALID_REGISTRATION_ID', message: 'registration_id 格式无效' } };
+  }
+  if (!durableAgentEpochIsCurrent(agentId, effectiveRegistrationId)) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_REGISTRATION_CHANGED', message: `Agent ${agentId} 已换用新会话；旧生命周期不能写心跳。` },
+    };
+  }
   const now = Date.now();
-  await redis.hset(keys.hash.agent(agentId), {
-    last_heartbeat: String(now),
-    current_task: currentTask ?? '',
-    status: currentTask ? 'busy' : 'idle',
-  });
+  const outcome = Number(await redis.eval(
+    `if (redis.call('HGET', KEYS[1], 'agent_id') or '') == '' then return 0 end
+     if (redis.call('HGET', KEYS[1], 'registration_id') or '') ~= ARGV[1] then return -1 end
+     if (redis.call('HGET', KEYS[1], 'status') or '') == 'offline' then return -2 end
+     redis.call('HSET', KEYS[1],
+       'last_heartbeat', ARGV[2],
+       'current_task', ARGV[3],
+       'status', ARGV[4])
+     return 1`,
+    1,
+    keys.hash.agent(agentId),
+    effectiveRegistrationId,
+    String(now),
+    currentTask ?? '',
+    currentTask ? 'busy' : 'idle',
+  ));
+  if (outcome === 0) {
+    return { ok: false, data: null, error: { code: 'AGENT_NOT_REGISTERED', message: `Agent ${agentId} 尚未注册` } };
+  }
+  if (outcome === -1) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_REGISTRATION_CHANGED', message: `Agent ${agentId} 已换用新会话；旧生命周期不能写心跳。` },
+    };
+  }
+  if (outcome === -2) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_ALREADY_OFFLINE', message: `Agent ${agentId} 的当前会话已离线，请用新 registration_id 重新注册。` },
+    };
+  }
+  if (outcome !== 1) throw new Error(`failed to heartbeat agent ${agentId}: ${outcome}`);
   return { ok: true, data: { agent_id: agentId, ts: now } };
+}
+
+export async function agentHeartbeat(
+  redis: Redis,
+  agentId: string,
+  registrationId: string | undefined,
+  currentTask?: string,
+): Promise<ApiResponse<unknown>> {
+  return withAgentEpochCommit(agentId, () => agentHeartbeatUnlocked(redis, agentId, registrationId, currentTask));
+}
+
+/**
+ * Agent 生命周期显式收口。保留注册/心跳与最后任务作审计，只清除“当前在线占用”投影。
+ * 重复退出幂等；未注册 agent 也返回成功，避免终态 Supervisor 为从未启动的 slot
+ * 反向创建一条伪审计记录。
+ */
+async function agentOfflineUnlocked(
+  redis: Redis,
+  agentId: string,
+  reason: 'worker_exit' | 'worker_signal' | 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit',
+  registrationId?: string,
+): Promise<ApiResponse<{ agent_id: string; offline: boolean }>> {
+  let effectiveRegistrationId = registrationId;
+  if (!effectiveRegistrationId) {
+    const current = await redis.hgetall(keys.hash.agent(agentId));
+    if (current.registration_source === 'server') effectiveRegistrationId = current.registration_id;
+  }
+  if (!effectiveRegistrationId) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_REGISTRATION_REQUIRED', message: 'offline 必须携带 register 返回的 registration_id' },
+    };
+  }
+  if (!AGENT_REGISTRATION_ID_PATTERN.test(effectiveRegistrationId)) {
+    return { ok: false, data: null, error: { code: 'INVALID_REGISTRATION_ID', message: 'registration_id 格式无效' } };
+  }
+  if (!durableAgentEpochIsCurrent(agentId, effectiveRegistrationId)) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'AGENT_REGISTRATION_CHANGED', message: `Agent ${agentId} 已重新注册；旧生命周期不能把新会话标记离线。` },
+    };
+  }
+  const key = keys.hash.agent(agentId);
+  const now = Date.now();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = await redis.hgetall(key);
+    if (!current.agent_id) return { ok: true, data: { agent_id: agentId, offline: false } };
+    const currentTask = current.current_task ?? '';
+    const taskKey = keys.hash.task(currentTask || '__none__');
+    // Supervisor 的 abort 只能停止调度，不能假定已发起的 Agent 执行立刻结束。
+    // 在同一 Lua 中复核 task 真实状态：仍为 running 时保留 current_task，使 /status
+    // 与 watchdog 能看见这个需要 lease 回收的执行；只有已终止时才清空当前指针。
+    const outcome = Number(await redis.eval(
+    `if (redis.call('HGET', KEYS[1], 'agent_id') or '') == '' then return 0 end
+     if (redis.call('HGET', KEYS[1], 'registration_id') or '') ~= ARGV[1] then return -1 end
+     if (redis.call('HGET', KEYS[1], 'status') or '') == 'offline' then return 3 end
+     local actual_task = redis.call('HGET', KEYS[1], 'current_task') or ''
+     if actual_task ~= ARGV[2] and actual_task ~= '' then return -2 end
+     local preserve_running = actual_task ~= '' and
+       (redis.call('HGET', KEYS[2], 'status') or '') == 'running'
+     if actual_task ~= '' then
+       redis.call('HSET', KEYS[1], 'last_task', actual_task)
+     end
+     if preserve_running then
+       redis.call('HSET', KEYS[1],
+         'status', 'offline',
+         'offline_at', ARGV[3],
+         'offline_reason', ARGV[4])
+       return 2
+     end
+     redis.call('HSET', KEYS[1],
+       'status', 'offline',
+       'current_task', '',
+       'offline_at', ARGV[3],
+       'offline_reason', ARGV[4])
+     return 1`,
+    2,
+    key,
+    taskKey,
+    effectiveRegistrationId,
+    currentTask,
+    String(now),
+    reason,
+    ));
+    if (outcome === 1 || outcome === 2 || outcome === 3) {
+      return { ok: true, data: { agent_id: agentId, offline: true } };
+    }
+    if (outcome === 0) return { ok: true, data: { agent_id: agentId, offline: false } };
+    if (outcome === -1) {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'AGENT_REGISTRATION_CHANGED',
+          message: `Agent ${agentId} 已重新注册；旧生命周期不能把新会话标记离线。`,
+        },
+      };
+    }
+    // current_task 在读取与 Lua 提交之间改变时，使用新真相有限重试；不能谎报成功。
+  }
+  return {
+    ok: false,
+    data: null,
+    error: {
+      code: 'AGENT_CURRENT_TASK_CHANGED',
+      message: `Agent ${agentId} 的 current_task 持续变化，未能原子标记离线。`,
+    },
+  };
+}
+
+export async function agentOffline(
+  redis: Redis,
+  agentId: string,
+  reason: 'worker_exit' | 'worker_signal' | 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit',
+  registrationId?: string,
+): Promise<ApiResponse<{ agent_id: string; offline: boolean }>> {
+  return withAgentEpochCommit(agentId, () => agentOfflineUnlocked(redis, agentId, reason, registrationId));
 }
 
 /**
@@ -1768,6 +2393,47 @@ function parseRepairOwnershipAudit(raw: string | undefined): NormalizedRepairOwn
   }
 }
 
+function serializedRepairOwnership(value: NormalizedRepairOwnership): string {
+  return JSON.stringify({ files: value.files, modules: value.modules });
+}
+
+/**
+ * reject 与 repair child 之间存在进程崩溃窗口。显式扩权必须由来源 reject 审计
+ * 自己携带，而不能从请求重试、child 或当前 ownership 猜测。required 是独立哨兵：
+ * 它让“本来没有扩权”和“声明有扩权但 intent 丢失”可以确定地区分。
+ */
+function persistedRepairOwnershipIntent(
+  auditTask: Record<string, string>,
+  ownershipSource: Record<string, string>,
+  root: Record<string, string>,
+): { value?: NormalizedRepairOwnership; error?: string } {
+  const required = auditTask.pm_repair_ownership_required ?? '';
+  const raw = auditTask.pm_repair_ownership_intent ?? '';
+  if (!required && !raw) return {};
+  if (required !== 'true') {
+    return { error: `repair_ownership_intent_marker_invalid:${auditTask.task_id}` };
+  }
+  if (!raw) return { error: `repair_ownership_intent_missing:${auditTask.task_id}` };
+  if (!ownershipSource.task_id || !root.task_id) {
+    return { error: `repair_ownership_intent_source_missing:${auditTask.task_id}` };
+  }
+  const parsed = parseRepairOwnershipAudit(raw);
+  if (!parsed) return { error: `repair_ownership_intent_invalid:${auditTask.task_id}` };
+  const delta = repairOwnershipDelta(ownershipSource, root, parsed);
+  if (!delta.value || serializedRepairOwnership(delta.value) !== serializedRepairOwnership(parsed)) {
+    return { error: `repair_ownership_intent_inconsistent:${auditTask.task_id}` };
+  }
+  return { value: delta.value };
+}
+
+function sameRepairOwnership(
+  left: NormalizedRepairOwnership | undefined,
+  right: NormalizedRepairOwnership | undefined,
+): boolean {
+  if (!left || !right) return !left && !right;
+  return serializedRepairOwnership(left) === serializedRepairOwnership(right);
+}
+
 function repairGoal(task: Record<string, string>, context: {
   source: 'worker_failed' | 'acceptance_failed' | 'pm_rejected';
   reason?: string;
@@ -1785,6 +2451,115 @@ function repairGoal(task: Record<string, string>, context: {
     ? `\n\n## PM 授权的所有权扩展\n\n本次 repair 由 PM 在原 ownership 基础上显式扩权；原任务 ownership 未修改。仅可使用下列新增范围，不得扩大到其他文件或模块。\n\n${context.repairOwnership.files.length ? `- files：${context.repairOwnership.files.map((item) => `\`${item}\``).join('、')}\n` : ''}${context.repairOwnership.modules.length ? `- modules：${context.repairOwnership.modules.map((item) => `\`${item}\``).join('、')}\n` : ''}`
     : '';
   return `# 修复任务：${task.title ?? task.task_id}\n\n## 背景\n\n原任务 \`${task.task_id}\` 因${sourceLabel}进入修复闭环。\n\n## 原因\n\n${context.reason?.trim() || '请先读取原任务的 result.md、result.json 与验证结果。'}\n\n## 失败验证摘要\n\n${failures}\n\n## 修复要求\n\n${context.instructions?.trim() || '定位根因，完成修复，并重新执行原任务声明的 verify。'}${repairOwnership}\n\n## 验收标准\n\n- [ ] 保留原失败/拒绝审计，不覆盖原任务记录\n- [ ] 修复后提交 result.md、result.json 与完整 verify_results\n- [ ] 修复交付仍需独立 PM Review accept 才能闭环`;
+}
+
+/**
+ * pending child 的 hash 可能来自旧版非原子发布断点。只有状态真相仍是 pending 且
+ * ZSET 缺 member 时才补入队并写一次 stream；已有 member 时绝不重复 XADD。
+ */
+async function ensurePendingTaskPublished(redis: Redis, task: Record<string, string>): Promise<boolean> {
+  if (!task.task_id || !task.plan_id || task.status !== 'pending') return false;
+  const score = pendingScore(Number(task.priority ?? 5), Number(task.created_at ?? Date.now()));
+  const published = Number(await redis.eval(
+    `if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= ARGV[1] then return 0 end
+     if (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= ARGV[4] then return 0 end
+     if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'pending' then return 0 end
+     redis.call('SADD', KEYS[4], ARGV[4])
+     if redis.call('SADD', KEYS[5], ARGV[1]) == 1 then
+       redis.call('HINCRBY', KEYS[6], ARGV[4], 1)
+       redis.call('SADD', KEYS[7], ARGV[4])
+     end
+     redis.call('ZREM', KEYS[8], ARGV[1])
+     local marked = (redis.call('HGET', KEYS[1], 'runtime_dispatch_published') or '') == 'true'
+     if redis.call('ZSCORE', KEYS[2], ARGV[1]) ~= false then
+       if not marked then redis.call('HSET', KEYS[1], 'runtime_dispatch_published', 'true') end
+       return 0
+     end
+     redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+     if not marked then
+       redis.call('XADD', KEYS[3], '*', 'task_id', ARGV[1], 'priority', ARGV[3])
+     end
+     redis.call('HSET', KEYS[1], 'runtime_dispatch_published', 'true')
+     if marked then return 2 end
+     return 1`,
+    8,
+    keys.hash.task(task.task_id),
+    keys.zset.status.pending,
+    keys.stream.tasks,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(task.plan_id),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    task.task_id,
+    String(score),
+    String(task.priority ?? 5),
+    task.plan_id,
+  ));
+  return published > 0;
+}
+
+async function ensureRepairScheduledEvent(
+  redis: Redis,
+  root: Record<string, string>,
+  repair: Record<string, string>,
+  generation: number,
+): Promise<void> {
+  if (!root.task_id || !repair.task_id) return;
+  const timestamp = Number(repair.created_at ?? Date.now());
+  await redis.eval(
+    `if (redis.call('HGET', KEYS[1], 'runtime_resolution_event_published') or '') == 'true' then return 0 end
+     redis.call('XADD', KEYS[2], '*',
+       'event_id', ARGV[1], 'type', 'repair_scheduled', 'task_id', ARGV[2],
+       'plan_id', ARGV[3], 'project_path', ARGV[4], 'consumer', 'worker',
+       'resolution_action', 'repair', 'repair_task_id', ARGV[5],
+       'timestamp', ARGV[6], 'acked', 'false')
+     redis.call('HSET', KEYS[1], 'runtime_resolution_event_published', 'true')
+     return 1`,
+    2,
+    keys.hash.task(repair.task_id),
+    keys.stream.events,
+    `${timestamp}_resolution_${root.task_id}_${generation}`,
+    root.task_id,
+    root.plan_id ?? repair.plan_id ?? '',
+    root.project_path ?? repair.project_path ?? '',
+    repair.task_id,
+    String(timestamp),
+  );
+}
+
+async function ensureAcceptanceReadyEvent(
+  redis: Redis,
+  root: Record<string, string>,
+  reverify: Record<string, string>,
+): Promise<void> {
+  if (!root.task_id || !reverify.task_id) return;
+  const timestamp = Number(reverify.created_at ?? Date.now());
+  const consumer = await resolvePmConsumer(redis, root.plan_id ?? '');
+  await redis.eval(
+    `if (redis.call('HGET', KEYS[1], 'runtime_acceptance_ready_published') or '') == 'true' then return 0 end
+     local added = redis.call('SADD', KEYS[2], ARGV[1])
+     if added == 0 then
+       redis.call('HSET', KEYS[1], 'runtime_acceptance_ready_published', 'true')
+       return 0
+     end
+     redis.call('XADD', KEYS[3], '*',
+       'event_id', ARGV[2], 'type', 'acceptance_ready', 'task_id', ARGV[1],
+       'plan_id', ARGV[3], 'project_path', ARGV[4], 'consumer', ARGV[5],
+       'timestamp', ARGV[6], 'acked', 'false')
+     redis.call('HSET', KEYS[1], 'runtime_acceptance_ready_published', 'true')
+     return 1`,
+    3,
+    keys.hash.task(reverify.task_id),
+    keys.acceptanceReady.fired,
+    keys.stream.events,
+    reverify.task_id,
+    `${timestamp}_acceptance_ready_${reverify.task_id}`,
+    root.plan_id ?? reverify.plan_id ?? '',
+    root.project_path ?? reverify.project_path ?? '',
+    consumer,
+    String(timestamp),
+  );
 }
 
 interface ResolutionResult {
@@ -1809,7 +2584,7 @@ async function markResolutionNeedsPmDecision(
   // 历史数据若已丢失当前指针，则仅从已记录 lineage 的末项恢复。
   const history = (root.resolution_task_ids ?? '').split(',').filter(Boolean);
   const latestTaskId = root.resolution_task_id || history.at(-1) || '';
-  await redis.hset(keys.hash.task(rootTaskId), {
+  await mutateTaskWithPlanProjection(redis, rootTaskId, root.plan_id ?? '', {
     resolution_status: 'needs_pm_decision',
     resolution_action: 'inspect',
     resolution_task_id: latestTaskId,
@@ -1925,7 +2700,8 @@ async function ensureRepairTask(
 
     const history = (root.resolution_task_ids ?? '').split(',').filter(Boolean);
     const awaitingReview = collidingTask.status === 'done' && !collidingTask.pm_review_status;
-    await redis.hset(keys.hash.task(rootTaskId), {
+    await ensurePendingTaskPublished(redis, collidingTask);
+    await mutateTaskWithPlanProjection(redis, rootTaskId, root.plan_id ?? expectedPlanId, {
       resolution_status: awaitingReview ? 'required' : 'repairing',
       resolution_action: awaitingReview ? 'reverify' : 'repair',
       resolution_task_id: repairTaskId,
@@ -1936,13 +2712,15 @@ async function ensureRepairTask(
       resolution_decision_reason: '',
     });
     if (sourceTaskId !== rootTaskId) {
-      await redis.hset(keys.hash.task(sourceTaskId), {
+      await mutateTaskWithPlanProjection(redis, sourceTaskId, source.plan_id ?? expectedPlanId, {
         resolution_status: awaitingReview ? 'required' : 'repairing',
         resolution_action: awaitingReview ? 'reverify' : 'repair',
         resolution_task_id: repairTaskId,
       });
       await persistTaskFromRedis(redis, sourceTaskId);
     }
+    await ensureRepairScheduledEvent(redis, root, collidingTask, generation);
+    await persistTaskFromRedis(redis, collidingTask.task_id);
     await persistTaskFromRedis(redis, rootTaskId);
     return {
       rootTaskId,
@@ -1953,7 +2731,7 @@ async function ensureRepairTask(
     };
   }
   // repair 本身绝不 depends_on 一个 failed/rejected task：失败来源是证据，不是 DAG 前置条件。
-  await redis.hset(keys.hash.task(repairTaskId), {
+  const repairCreateOutcome = await mutateTaskWithPlanProjection(redis, repairTaskId, expectedPlanId, {
     task_id: repairTaskId,
     plan_id: expectedPlanId,
     title: `修复：${source.title ?? sourceTaskId}`,
@@ -1989,13 +2767,17 @@ async function ensureRepairTask(
     resolved_by_task: '',
     resolution_generation: '0',
     resolution_attempts: '0',
-  });
-  await redis.zadd(keys.zset.status.pending, pendingScore(Math.min(10, Number(source.priority ?? root.priority ?? 5) + 1), now), repairTaskId);
-  await redis.xadd(keys.stream.tasks, '*', 'task_id', repairTaskId, 'priority', String(Math.min(10, Number(source.priority ?? root.priority ?? 5) + 1)));
+  }, 'create');
+  if (repairCreateOutcome === 'TASK_EXISTS') {
+    // 并发 reconcile 可能在我们确认“不存在”后先创建确定性 child。回到入口按
+    // immutable identity 校验并复用；绝不覆盖先到者，也不把正常竞争当故障。
+    return ensureRepairTask(redis, sourceTaskId, context);
+  }
+  await ensurePendingTaskPublished(redis, await redis.hgetall(keys.hash.task(repairTaskId)));
 
   const historicalIds = (root.resolution_task_ids ?? '').split(',').filter(Boolean);
   const nextIds = [...historicalIds, repairTaskId];
-  await redis.hset(keys.hash.task(rootTaskId), {
+  await mutateTaskWithPlanProjection(redis, rootTaskId, root.plan_id ?? expectedPlanId, {
     resolution_status: 'repairing',
     resolution_action: 'repair',
     resolution_task_id: repairTaskId,
@@ -2007,27 +2789,19 @@ async function ensureRepairTask(
   });
   // 非根 repair 也保留目前正在修复哪个分支，便于详情/恢复审计。
   if (sourceTaskId !== rootTaskId) {
-    await redis.hset(keys.hash.task(sourceTaskId), {
+    await mutateTaskWithPlanProjection(redis, sourceTaskId, source.plan_id ?? expectedPlanId, {
       resolution_status: 'repairing',
       resolution_action: 'repair',
       resolution_task_id: repairTaskId,
     });
   }
-  // repair 已进入 task stream，Worker/共享 Supervisor 会自行领取；它不是 PM
-  // 待办。PM 只在 repair 交付后的 review_requested 或重试耗尽时被提醒。
-  await redis.xadd(
-    keys.stream.events,
-    '*',
-    'event_id', `${now}_resolution_${rootTaskId}_${generation}`,
-    'type', 'repair_scheduled',
-    'task_id', rootTaskId,
-    'plan_id', root.plan_id ?? source.plan_id ?? '',
-    'project_path', root.project_path ?? source.project_path ?? '',
-    'consumer', 'worker',
-    'resolution_action', 'repair',
-    'repair_task_id', repairTaskId,
-    'timestamp', String(now),
-    'acked', 'false',
+  // repair 已进入 task stream，Worker/共享 Supervisor 会自行领取；事件和 child 上的
+  // publication marker 由同一 Lua 原子提交，避免并发/崩溃重复或漏写。
+  await ensureRepairScheduledEvent(
+    redis,
+    root,
+    await redis.hgetall(keys.hash.task(repairTaskId)),
+    generation,
   );
   await persistTaskFromRedis(redis, repairTaskId);
   await persistTaskFromRedis(redis, rootTaskId);
@@ -2038,6 +2812,328 @@ async function ensureRepairTask(
 export interface ResolutionReconciliation {
   repaired_task_ids: string[];
   needs_pm_decision_task_ids: string[];
+}
+
+/**
+ * 只有仍可能推进自动补偿的终态根才进入启动 backfill。普通 accepted/done 历史不应
+ * 进入常驻轮询；当前版本的 accept 写路径会原子登记自己的短生命周期 dirty candidate。
+ */
+function needsRuntimeReconcileBackfill(task: Record<string, string>): boolean {
+  if (!task.task_id || task.status === 'cancelled' || task.status === 'superseded') return false;
+  // 升级前可能已提交 accepted 审计、却在 dependency/lineage 副作用完成前退出；旧写
+  // 路径没有 dirty member，只能由首次历史 backfill 捕获。标记写成 true 后不会再入队。
+  if (
+    task.status === 'done' &&
+    task.pm_review_status === 'accepted' &&
+    task.pm_accept_effects_applied !== 'true'
+  ) return true;
+  const terminalFailure = task.status === 'failed' ||
+    (task.status === 'done' && task.pm_review_status === 'rejected');
+  if (!terminalFailure) return false;
+  return !['resolved', 'cancelled', 'needs_pm_decision'].includes(task.resolution_status ?? '');
+}
+
+async function readTaskHashesInChunks(
+  redis: Redis,
+  taskIds: Iterable<string>,
+): Promise<Array<Record<string, string>>> {
+  const ids = [...new Set(taskIds)];
+  const result: Array<Record<string, string>> = [];
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    result.push(...await Promise.all(
+      ids.slice(offset, offset + 500).map((taskId) => redis.hgetall(keys.hash.task(taskId))),
+    ));
+  }
+  return result;
+}
+
+/**
+ * intake failed 候选的唯一写入口。Lua 在提交点重读 hash，避免调用者较早的 HGETALL
+ * 快照与并发 resolution 决定交错，把 resolved/repairing 历史重新放回常驻索引。
+ */
+const SYNC_INTAKE_ACTIONABLE_FAILED = `
+  local task_id = redis.call('HGET', KEYS[1], 'task_id') or ''
+if task_id == '' then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return 0
+  end
+  local repair_root = redis.call('HGET', KEYS[1], 'repair_root_task_id') or ''
+  if repair_root ~= ARGV[3] then return -1 end
+  local status = redis.call('HGET', KEYS[1], 'status') or ''
+  local resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+  if repair_root ~= '' and repair_root ~= task_id then
+    local root_id = redis.call('HGET', KEYS[3], 'task_id') or ''
+    local root_resolution = redis.call('HGET', KEYS[3], 'resolution_status') or ''
+    if root_id == repair_root and (root_resolution == 'repairing' or root_resolution == 'required' or
+       root_resolution == 'resolved' or root_resolution == 'cancelled' or
+       root_resolution == 'needs_pm_decision') then
+      redis.call('ZREM', KEYS[2], ARGV[1])
+      return 0
+    end
+  end
+  local actionable = resolution == 'needs_pm_decision' or
+  (status == 'failed' and resolution ~= 'repairing' and resolution ~= 'required' and
+   resolution ~= 'resolved' and resolution ~= 'cancelled')
+if actionable then
+  local score = tonumber(redis.call('HGET', KEYS[1], 'done_at') or '') or tonumber(ARGV[2])
+  redis.call('ZADD', KEYS[2], score, ARGV[1])
+  return 1
+end
+redis.call('ZREM', KEYS[2], ARGV[1])
+return 0
+`;
+
+async function syncIntakeActionableFailed(redis: Redis, taskId: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const repairRoot = await redis.hget(keys.hash.task(taskId), 'repair_root_task_id') ?? '';
+    const result = Number(await redis.eval(
+      SYNC_INTAKE_ACTIONABLE_FAILED,
+      3,
+      keys.hash.task(taskId),
+      keys.intakeActionableFailed.pending,
+      keys.hash.task(repairRoot || '__none__'),
+      taskId,
+      String(Date.now()),
+      repairRoot,
+    ));
+    if (result !== -1) return result === 1;
+  }
+  // 指针持续变化时宁可保留候选供下一轮复核，也不能用旧 root 快照误删 PM 待办。
+  return false;
+}
+
+const RELEASE_INTAKE_FAILED_BACKFILL_LOCK = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+const RENEW_BACKFILL_LOCK = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+`;
+
+interface BackfillLockLease {
+  state: { lost: boolean; error?: Error };
+  stop: () => Promise<void>;
+}
+
+/**
+ * 扫描型 legacy backfill 可能超过初始 TTL。独立连接按 owner-token 低频续租；
+ * 发布仍必须在单 Lua 内比较 owner，因此续租只保证活 owner 可完成，不降低 fencing。
+ */
+function startBackfillLockRenewal(
+  redis: Redis,
+  lockKey: string,
+  owner: string,
+  ttlMs: number,
+  intervalMsOverride?: number,
+): BackfillLockLease {
+  const renewal = redis.duplicate();
+  const state: BackfillLockLease['state'] = { lost: false };
+  let running = false;
+  const renew = async () => {
+    if (running || state.lost) return;
+    running = true;
+    try {
+      const result = Number(await renewal.eval(RENEW_BACKFILL_LOCK, 1, lockKey, owner, String(ttlMs)));
+      if (result !== 1) state.lost = true;
+    } catch (error) {
+      state.lost = true;
+      state.error = error as Error;
+    } finally {
+      running = false;
+    }
+  };
+  const intervalMs = intervalMsOverride ?? Math.max(10, Math.floor(ttlMs / 3));
+  const timer = setInterval(() => { void renew(); }, intervalMs);
+  timer.unref();
+  return {
+    state,
+    stop: async () => {
+      clearInterval(timer);
+      while (running) await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
+      renewal.disconnect();
+    },
+  };
+}
+
+const DELETE_INTAKE_READY_IF_OWNER = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[2])
+`;
+
+async function waitForIntakeFailedBackfill(redis: Redis): Promise<void> {
+  for (let attempt = 0; attempt < 600; attempt++) {
+    if (await redis.get(keys.intakeActionableFailed.ready)) return;
+    if (!(await redis.exists(keys.intakeActionableFailed.backfillLock))) {
+      return ensureIntakeActionableFailedIndex(redis);
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error('intake actionable failed backfill timed out');
+}
+
+/**
+ * standalone `pmIntake` 的 legacy upgrade 边界。只合并候选、不清空 pending；ready 发布
+ * 后逐项 Lua 复核，因而 backfill 与并发 resolution 转换交错也不会遗留陈旧历史。
+ */
+async function ensureIntakeActionableFailedIndex(redis: Redis): Promise<void> {
+  if (await redis.get(keys.intakeActionableFailed.ready)) return;
+  const owner = randomUUID();
+  const ttlMs = 30_000;
+  const acquired = await redis.set(keys.intakeActionableFailed.backfillLock, owner, 'PX', ttlMs, 'NX');
+  if (acquired !== 'OK') return waitForIntakeFailedBackfill(redis);
+  const renewal = startBackfillLockRenewal(
+    redis,
+    keys.intakeActionableFailed.backfillLock,
+    owner,
+    ttlMs,
+  );
+
+  try {
+    if (await redis.get(keys.intakeActionableFailed.ready)) return;
+    const [failedIds, doneIds] = await Promise.all([
+      redis.zrange(keys.zset.status.failed, 0, -1),
+      // legacy done+rejected roots may also be persistent needs_pm_decision facts. This is
+      // one-time upgrade work only; ready steadystate never scans terminal history again.
+      redis.zrange(keys.zset.status.done, 0, -1),
+    ]);
+    // failed zset 只提供 legacy 候选 id；actionability 必须在 fenced 发布 Lua 中按
+    // 当前 hash 重读。这样 ready 可见时，pending 已经是同一原子快照，不存在先伪提醒
+    // 再逐项清理的窗口。
+    const candidateIds = [...new Set([
+      ...failedIds,
+      ...doneIds,
+      ...await redis.zrange(keys.intakeActionableFailed.pending, 0, -1),
+    ])];
+    if (renewal.state.lost) {
+      throw renewal.state.error ?? new Error('intake actionable failed backfill lease lost');
+    }
+    const publishKeys = [
+      keys.intakeActionableFailed.backfillLock,
+      keys.intakeActionableFailed.pending,
+      keys.intakeActionableFailed.ready,
+      ...candidateIds.map((taskId) => keys.hash.task(taskId)),
+    ];
+    // Lua receives candidate ids as argv and the parallel task hashes as KEYS.
+    const published = Number(await redis.eval(
+      `-- intake-actionable-failed-fenced-backfill-v1
+       if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+       local now = tonumber(ARGV[2])
+       local count = tonumber(ARGV[3]) or 0
+       for index = 1, count do
+         local task_id = ARGV[3 + index]
+         local task_key = KEYS[3 + index]
+         local id = redis.call('HGET', task_key, 'task_id') or ''
+         local status = redis.call('HGET', task_key, 'status') or ''
+         local resolution = redis.call('HGET', task_key, 'resolution_status') or ''
+         local actionable = id == task_id and (resolution == 'needs_pm_decision' or
+           (status == 'failed' and resolution ~= 'repairing' and resolution ~= 'required' and
+            resolution ~= 'resolved' and resolution ~= 'cancelled'))
+         if actionable then
+           local score = tonumber(redis.call('HGET', task_key, 'done_at') or '') or now
+           redis.call('ZADD', KEYS[2], score, task_id)
+         else
+           redis.call('ZREM', KEYS[2], task_id)
+         end
+       end
+       redis.call('SET', KEYS[3], '1')
+       return 1`,
+      publishKeys.length,
+      ...publishKeys,
+      owner,
+      String(Date.now()),
+      String(candidateIds.length),
+      ...candidateIds,
+    ));
+    if (published !== 1) {
+      await waitForIntakeFailedBackfill(redis);
+      return;
+    }
+  } catch (error) {
+    await redis.eval(
+      DELETE_INTAKE_READY_IF_OWNER,
+      2,
+      keys.intakeActionableFailed.backfillLock,
+      keys.intakeActionableFailed.ready,
+      owner,
+    ).catch(() => undefined);
+    throw new Error(`intake actionable failed backfill failed: ${(error as Error).message}`, { cause: error });
+  } finally {
+    await renewal.stop();
+    await redis.eval(
+      RELEASE_INTAKE_FAILED_BACKFILL_LOCK,
+      1,
+      keys.intakeActionableFailed.backfillLock,
+      owner,
+    ).catch(() => undefined);
+  }
+}
+
+/**
+ * marker 缺失（首次升级、Redis 清空、SQLite restore）时，从历史终态安全回建一次。
+ * 只做 ZADD、不清空现有 dirty，避免 backfill 与并发异常转换交错时误删新候选。
+ * candidates 先用 MULTI 合并；全部成功后才发布 marker。Redis MULTI 的单命令错误不
+ * 回滚其它命令，因此失败路径必须删除 marker，宁可下轮重扫也不能永久跳过 backfill。
+ */
+async function ensureRuntimeReconcileBackfill(
+  redis: Redis,
+  force = false,
+): Promise<string[]> {
+  if (!force && await redis.get(keys.runtimeReconcile.backfillReady)) {
+    return redis.zrange(keys.runtimeReconcile.pending, 0, -1);
+  }
+
+  const [failedIds, doneIds] = await Promise.all([
+    redis.zrange(keys.zset.status.failed, 0, -1),
+    redis.zrange(keys.zset.status.done, 0, -1),
+  ]);
+  const hashes = await readTaskHashesInChunks(redis, [...failedIds, ...doneIds]);
+  const candidates = hashes.filter(needsRuntimeReconcileBackfill).map((task) => task.task_id);
+  const now = Date.now();
+  const tx = redis.multi();
+  for (const taskId of candidates) tx.zadd(keys.runtimeReconcile.pending, now, taskId);
+  const outcomes = await tx.exec();
+  if (!outcomes || outcomes.some(([error]) => error)) {
+    await redis.del(keys.runtimeReconcile.backfillReady).catch(() => undefined);
+    throw new Error('runtime reconcile backfill 原子发布失败');
+  }
+  await redis.set(keys.runtimeReconcile.backfillReady, '1');
+  return redis.zrange(keys.runtimeReconcile.pending, 0, -1);
+}
+
+/**
+ * 候选清理也必须与 task 状态检查原子化：若新 reject/failure 在清理前已提交则保留；
+ * 若在清理后提交，其状态事务会重新 ZADD。这样不会出现“旧轮次删除新异常”的竞态。
+ */
+const CLEAN_RUNTIME_RECONCILE_CANDIDATE = `
+local status = redis.call('HGET', KEYS[1], 'status') or ''
+local review = redis.call('HGET', KEYS[1], 'pm_review_status') or ''
+local effects = redis.call('HGET', KEYS[1], 'pm_accept_effects_applied') or ''
+local resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+
+if status == 'done' and review == 'accepted' and effects ~= 'true' then
+  return 0
+end
+
+local terminal_failure = status == 'failed' or (status == 'done' and review == 'rejected')
+if terminal_failure and resolution ~= 'resolved' and resolution ~= 'cancelled' and resolution ~= 'needs_pm_decision' then
+  return 0
+end
+
+return redis.call('ZREM', KEYS[2], ARGV[1])
+`;
+
+async function cleanRuntimeReconcileCandidate(redis: Redis, taskId: string): Promise<void> {
+  await redis.eval(
+    CLEAN_RUNTIME_RECONCILE_CANDIDATE,
+    2,
+    keys.hash.task(taskId),
+    keys.runtimeReconcile.pending,
+    taskId,
+  );
 }
 
 /**
@@ -2082,18 +3178,18 @@ async function migrateLegacyNamedFixes(redis: Redis): Promise<void> {
       const historicalIds = (parent.resolution_task_ids ?? '').split(',').filter(Boolean);
       const resolutionTaskIds = [legacyFix.task_id, ...historicalIds]
         .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index);
-      await redis.hset(keys.hash.task(legacyFix.task_id), {
+      await mutateTaskWithPlanProjection(redis, legacyFix.task_id, legacyFix.plan_id ?? parent.plan_id ?? '', {
         fix_for: parentTaskId,
         repair_root_task_id: rootTaskId,
         resolution_status: 'repairing',
         resolution_action: 'repair',
         resolution_task_id: currentRepair.task_id,
       });
-      await redis.hset(keys.hash.task(currentRepair.task_id), {
+      await mutateTaskWithPlanProjection(redis, currentRepair.task_id, currentRepair.plan_id ?? parent.plan_id ?? '', {
         fix_for: legacyFix.task_id,
         repair_root_task_id: rootTaskId,
       });
-      await redis.hset(keys.hash.task(parentTaskId), {
+      await mutateTaskWithPlanProjection(redis, parentTaskId, parent.plan_id ?? '', {
         resolution_status: 'repairing',
         resolution_action: 'repair',
         resolution_task_ids: resolutionTaskIds.join(','),
@@ -2108,13 +3204,13 @@ async function migrateLegacyNamedFixes(redis: Redis): Promise<void> {
     // 或 needs_pm_decision 处理，避免升级过程干扰一个已经执行中的 Worker。
     if (parent.resolution_status) continue;
 
-    await redis.hset(keys.hash.task(legacyFix.task_id), {
+    await mutateTaskWithPlanProjection(redis, legacyFix.task_id, legacyFix.plan_id ?? parent.plan_id ?? '', {
       fix_for: parentTaskId,
       repair_root_task_id: rootTaskId,
       resolution_status: 'repairing',
       resolution_action: 'repair',
     });
-    await redis.hset(keys.hash.task(parentTaskId), {
+    await mutateTaskWithPlanProjection(redis, parentTaskId, parent.plan_id ?? '', {
       resolution_status: 'repairing',
       resolution_action: 'repair',
       resolution_task_id: legacyFix.task_id,
@@ -2135,12 +3231,18 @@ async function migrateLegacyNamedFixes(redis: Redis): Promise<void> {
  * 新任务或重复通知 PM。对于历史 repair 链，优先回到失败/拒绝的根任务，避免把同一个
  * 问题拆成多个并行修复者。
  */
-async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<ResolutionReconciliation> {
-  await migrateLegacyNamedFixes(redis);
-  const candidateIds = new Set([
-    ...(await redis.zrange(keys.zset.status.failed, 0, -1)),
-    ...(await redis.zrange(keys.zset.status.done, 0, -1)),
-  ]);
+async function reconcileResolutionBacklogUnlocked(
+  redis: Redis,
+  opts: { migrateLegacyNamedFixes?: boolean; candidateIds?: Iterable<string> } = {},
+): Promise<ResolutionReconciliation> {
+  if (opts.migrateLegacyNamedFixes !== false) await migrateLegacyNamedFixes(redis);
+  const candidateIds = opts.candidateIds === undefined
+    ? new Set([
+        ...(await redis.zrange(keys.zset.status.failed, 0, -1)),
+        ...(await redis.zrange(keys.zset.status.done, 0, -1)),
+      ])
+    : new Set(opts.candidateIds);
+  await recoverInterruptedResolutionContinues(redis, candidateIds);
   const repairedTaskIds: string[] = [];
   const needsPmDecisionTaskIds: string[] = [];
   const handledRoots = new Set<string>();
@@ -2197,6 +3299,44 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
       needsPmDecisionTaskIds.push(rootTaskId);
       continue;
     }
+    let recoveredRepairOwnership: NormalizedRepairOwnership | undefined;
+    if (source.status === 'done' && source.pm_review_status === 'rejected') {
+      let recovered: { value?: NormalizedRepairOwnership; error?: string } = {};
+      if (source.type === 'acceptance') {
+        const sourceIds = acceptanceSourceIds(source);
+        if (source.pm_rejection_resolution_mode === 'reverify') {
+          if (source.pm_repair_ownership_required || source.pm_repair_ownership_intent) {
+            recovered = { error: `repair_ownership_intent_forbidden:${source.task_id}` };
+          }
+        } else if (sourceIds.length !== 1) {
+          if (source.pm_repair_ownership_required || source.pm_repair_ownership_intent) {
+            recovered = { error: `repair_ownership_intent_source_ambiguous:${source.task_id}` };
+          }
+        } else {
+          const ownershipSource = await redis.hgetall(keys.hash.task(sourceIds[0]));
+          const ownershipRootId = ownershipSource.repair_root_task_id || ownershipSource.task_id;
+          const ownershipRoot = ownershipRootId === ownershipSource.task_id
+            ? ownershipSource
+            : await redis.hgetall(keys.hash.task(ownershipRootId));
+          recovered = persistedRepairOwnershipIntent(source, ownershipSource, ownershipRoot);
+        }
+      } else {
+        const ownershipRoot = rootTaskId === source.task_id
+          ? source
+          : await redis.hgetall(keys.hash.task(rootTaskId));
+        recovered = persistedRepairOwnershipIntent(source, source, ownershipRoot);
+      }
+      if (recovered.error) {
+        handledRoots.add(rootTaskId);
+        await markResolutionNeedsPmDecision(redis, rootTaskId, recovered.error);
+        if (source.type === 'acceptance') {
+          await markAcceptanceFailureResolution(redis, source.task_id, [], true);
+        }
+        if (!needsPmDecisionTaskIds.includes(rootTaskId)) needsPmDecisionTaskIds.push(rootTaskId);
+        continue;
+      }
+      recoveredRepairOwnership = recovered.value;
+    }
     // PM 显式选择 reverify-only 后，处置模式已作为拒绝审计持久化。即使进程在
     // “写 reject”与“创建 attempt”之间退出，启动补偿也必须继续创建 fresh
     // acceptance，而不能按旧默认退化成每个来源的 code repair。
@@ -2207,7 +3347,7 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
       !['resolved', 'cancelled', 'needs_pm_decision'].includes(source.resolution_status ?? '');
     if (directReverifyOnly) {
       if (!['required', 'repairing'].includes(source.resolution_status ?? '')) {
-        await redis.hset(keys.hash.task(source.task_id), {
+        await mutateTaskWithPlanProjection(redis, source.task_id, source.plan_id ?? '', {
           resolution_status: 'required',
           resolution_action: 'reverify',
           resolution_task_id: '',
@@ -2227,7 +3367,23 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
       else if (reverify.created) repairedTaskIds.push(rootTaskId);
       continue;
     }
-    if (source.resolution_status && !continuationRequired) continue;
+    if (source.resolution_status && !continuationRequired) {
+      // child/root 已写但调度索引或 SQLite 可能停在半发布断点；活跃 child 复用时
+      // 幂等补齐，避免 hash-only repair 永久不可领取、dirty 永久不收敛。
+      if (currentRepair.task_id && ['pending', 'running', 'blocked'].includes(currentRepair.status)) {
+        await ensurePendingTaskPublished(redis, currentRepair);
+        await ensureRepairScheduledEvent(
+          redis,
+          resolutionOwner,
+          currentRepair,
+          Number(resolutionOwner.resolution_generation ?? 1),
+        );
+        await persistTaskFromRedis(redis, currentRepair.task_id);
+        await persistTaskFromRedis(redis, resolutionOwner.task_id);
+        if (source.task_id !== resolutionOwner.task_id) await persistTaskFromRedis(redis, source.task_id);
+      }
+      continue;
+    }
     handledRoots.add(rootTaskId);
 
     if (
@@ -2253,6 +3409,7 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
             ? `历史独立验收任务 ${source.task_id} 失败，升级后补建来源修复闭环。`
             : `历史独立验收任务 ${source.task_id} 被 PM 拒绝，升级后补建来源修复闭环。${source.pm_reject_reason ? ` 原因：${source.pm_reject_reason}` : ''}`,
           instructions: source.pm_fix_instructions || undefined,
+          repairOwnership: recoveredRepairOwnership,
           decisionRootTaskId: source.repair_root_task_id || source.task_id,
         });
         if (resolution.repairTaskId) repairIds.push(resolution.repairTaskId);
@@ -2268,6 +3425,7 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
       source: source.status === 'done' && source.pm_review_status === 'rejected' ? 'pm_rejected' : 'worker_failed',
       reason: source.pm_reject_reason || source.failed_reason || '历史 failed/rejected 任务，升级后补建自动修复闭环。',
       instructions: source.pm_fix_instructions || undefined,
+      repairOwnership: recoveredRepairOwnership,
     });
     if (resolution.state === 'needs_pm_decision') needsPmDecisionTaskIds.push(rootTaskId);
     else if (resolution.repairTaskId) repairedTaskIds.push(rootTaskId);
@@ -2275,7 +3433,11 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
 
   // 处理“来源 repair 已在崩溃前 accepted、但 reverify task 尚未落盘”的窗口；
   // 已存在 attempt 时 ensureAcceptanceReverifyTask 会幂等复用。
-  const reverifyRecovery = await scheduleReadyAcceptanceReverifications(redis, 'startup-reconcile');
+  const reverifyRecovery = await scheduleReadyAcceptanceReverifications(
+    redis,
+    'startup-reconcile',
+    opts.candidateIds === undefined ? undefined : candidateIds,
+  );
   for (const taskId of reverifyRecovery.needsPmDecisionTaskIds) {
     if (!needsPmDecisionTaskIds.includes(taskId)) needsPmDecisionTaskIds.push(taskId);
   }
@@ -2287,11 +3449,97 @@ async function reconcileResolutionBacklogUnlocked(redis: Redis): Promise<Resolut
 }
 
 /**
+ * PM accepted 已经写入，但进程可能在 lineage / dependency 副作用完成前退出。
+ * 该补偿只重放仍被未闭合父任务引用的 accepted repair/reverify，不扫描或改写
+ * 已经闭合的历史 attempt；完成标记使重复 accept 与低频 reconcile 都是幂等的。
+ */
+async function replayAcceptedRepairSideEffects(
+  redis: Redis,
+  repairTaskId: string,
+  runtimeCandidateIds?: Iterable<string>,
+): Promise<{ resolvedTaskIds: string[]; requeuedDependencyIds: string[] }> {
+  const repair = await redis.hgetall(keys.hash.task(repairTaskId));
+  if (!repair.task_id || repair.status !== 'done' || repair.pm_review_status !== 'accepted') {
+    return { resolvedTaskIds: [], requeuedDependencyIds: [] };
+  }
+  if (repair.pm_accept_effects_applied === 'true') {
+    // Redis 副作用已提交但 SQLite 可能在上一轮失败；只重试 durable marker，不重复
+    // wake/XADD。成功后调用方才会清 dirty candidate。
+    await persistTaskFromRedis(redis, repairTaskId);
+    return { resolvedTaskIds: [], requeuedDependencyIds: [] };
+  }
+
+  const requeuedDependencyIds = new Set(
+    await wakeDependents(redis, repairTaskId, { allowAcceptance: true }),
+  );
+  const resolvedTaskIds = await resolveRepairLineage(redis, repairTaskId, runtimeCandidateIds);
+  for (const resolvedTaskId of resolvedTaskIds) {
+    for (const taskId of await wakeDependents(redis, resolvedTaskId, { allowAcceptance: true })) {
+      requeuedDependencyIds.add(taskId);
+    }
+  }
+  await redis.hset(keys.hash.task(repairTaskId), 'pm_accept_effects_applied', 'true');
+  // Redis 是运行态提交点，SQLite 是灾难恢复证据。两者无法跨引擎事务，但此顺序保证
+  // 任一中断只会导致下次幂等重放，不会把尚未执行的副作用错误记成已完成。
+  try {
+    await persistTaskFromRedis(redis, repairTaskId);
+  } catch (error) {
+    // 保留 Redis marker=true 与 dirty：下轮只重试 SQLite，不重复 dependency/event
+    // 副作用；调用方因异常不会执行 candidate 清理。
+    await redis.zadd(keys.runtimeReconcile.pending, Date.now(), repairTaskId);
+    throw error;
+  }
+  return { resolvedTaskIds, requeuedDependencyIds: [...requeuedDependencyIds] };
+}
+
+async function replayPendingAcceptedRepairSideEffects(
+  redis: Redis,
+  runtimeCandidateIds?: Iterable<string>,
+): Promise<string[]> {
+  const candidateIds = runtimeCandidateIds === undefined
+    ? [
+        ...(await redis.zrange(keys.zset.status.failed, 0, -1)),
+        ...(await redis.zrange(keys.zset.status.done, 0, -1)),
+      ]
+    : [...new Set(runtimeCandidateIds)];
+  const repairIds = new Set<string>();
+  for (const candidateId of candidateIds) {
+    const candidate = await redis.hgetall(keys.hash.task(candidateId));
+    if (!candidate.task_id) continue;
+    // 当前 PM accept 的 dirty member 就是待重放 task 本身；历史/restore 补偿则从
+    // 未闭合根的 resolution_task_id 找到 accepted repair/reverify。
+    if (
+      candidate.status === 'done' &&
+      candidate.pm_review_status === 'accepted' &&
+      candidate.pm_accept_effects_applied !== 'true'
+    ) repairIds.add(candidate.task_id);
+    if (
+      ['repairing', 'required'].includes(candidate.resolution_status ?? '') &&
+      candidate.resolution_task_id
+    ) repairIds.add(candidate.resolution_task_id);
+  }
+  const requeuedDependencyIds = new Set<string>();
+  for (const repairTaskId of repairIds) {
+    const replayed = await replayAcceptedRepairSideEffects(redis, repairTaskId, runtimeCandidateIds);
+    for (const taskId of replayed.requeuedDependencyIds) requeuedDependencyIds.add(taskId);
+  }
+  return [...requeuedDependencyIds];
+}
+
+/**
  * 启动补偿也会创建 repair/reverify 并双写 SQLite，因此直接调用必须与 HTTP writer
  * 使用同一跨进程门控。restore 内部已持有独占 owner，只调用上面的 unlocked 版本。
  */
 export async function reconcileResolutionBacklog(redis: Redis): Promise<ResolutionReconciliation> {
-  return withMutationPermitOrThrow(redis, () => reconcileResolutionBacklogUnlocked(redis));
+  return withMutationPermitOrThrow(redis, async () => {
+    // 显式 startup/restore 入口总是安全合并一次历史候选；常态 Supervisor 使用 marker
+    // 后只读 dirty zset，不会重复承担全量扫描成本。
+    const runtimeCandidateIds = await ensureRuntimeReconcileBackfill(redis, true);
+    const result = await reconcileResolutionBacklogUnlocked(redis);
+    await replayPendingAcceptedRepairSideEffects(redis, runtimeCandidateIds);
+    for (const taskId of runtimeCandidateIds) await cleanRuntimeReconcileCandidate(redis, taskId);
+    return result;
+  });
 }
 
 /** repair 已交付、尚待 PM Review 时，把失败来源统一标记为“待复验”。
@@ -2305,7 +3553,7 @@ async function markRepairAwaitingReview(redis: Redis, repairTaskId: string): Pro
     if (!parentId) break;
     const parent = await redis.hgetall(keys.hash.task(parentId));
     if (!parent.task_id) break;
-    await redis.hset(keys.hash.task(parentId), {
+    await mutateTaskWithPlanProjection(redis, parentId, parent.plan_id ?? '', {
       resolution_status: 'required',
       resolution_action: 'reverify',
       resolution_task_id: repairTaskId,
@@ -2400,7 +3648,13 @@ async function ensureAcceptanceReverifyTask(
       // 不可变历史，必须继续创建下一代；否则 reverify-only 拒绝会永远回放旧 task。
       const isActiveReverify = ['pending', 'running', 'blocked'].includes(current.status) ||
         (current.status === 'done' && !current.pm_review_status);
-      if (isActiveReverify) return { taskId: current.task_id, created: false };
+      if (isActiveReverify) {
+        await ensurePendingTaskPublished(redis, current);
+        await ensureAcceptanceReadyEvent(redis, root, current);
+        await persistTaskFromRedis(redis, current.task_id);
+        await persistTaskFromRedis(redis, root.task_id);
+        return { taskId: current.task_id, created: false };
+      }
     }
   }
 
@@ -2423,14 +3677,22 @@ async function ensureAcceptanceReverifyTask(
       await markResolutionNeedsPmDecision(redis, root.task_id, `reverify_task_id_collision:${reverifyTaskId}`);
       return { created: false, needsPmDecision: true };
     }
-    await redis.hset(keys.hash.task(root.task_id), {
+    await ensurePendingTaskPublished(redis, existing);
+    const history = (root.resolution_task_ids ?? '').split(',').filter(Boolean);
+    await mutateTaskWithPlanProjection(redis, root.task_id, root.plan_id ?? '', {
       resolution_status: 'required',
       resolution_action: 'reverify',
       resolution_task_id: reverifyTaskId,
+      // Child HSET may have succeeded immediately before a process crash. Adopting
+      // that deterministic child must also repair the durable reviewer-exclusion
+      // lineage; the pointer alone is insufficient for later reverify attempts.
+      resolution_task_ids: [...new Set([...history, reverifyTaskId])].join(','),
       resolution_generation: String(generation),
       resolved_by_task: '',
       resolution_decision_reason: '',
     });
+    await ensureAcceptanceReadyEvent(redis, root, existing);
+    await persistTaskFromRedis(redis, existing.task_id);
     await persistTaskFromRedis(redis, root.task_id);
     if (existing.status === 'done' && existing.pm_review_status === 'accepted') {
       const resolvedTaskIds = await resolveRepairLineage(redis, existing.task_id);
@@ -2444,7 +3706,7 @@ async function ensureAcceptanceReverifyTask(
 
   const now = Date.now();
   const priority = Math.min(10, Number(root.priority ?? 5) + 1);
-  await redis.hset(keys.hash.task(reverifyTaskId), {
+  const reverifyCreateOutcome = await mutateTaskWithPlanProjection(redis, reverifyTaskId, root.plan_id ?? '', {
     task_id: reverifyTaskId,
     plan_id: root.plan_id ?? '',
     title: `独立复验：${root.title ?? root.task_id}`,
@@ -2478,12 +3740,14 @@ async function ensureAcceptanceReverifyTask(
     resolved_by_task: '',
     resolution_generation: '0',
     resolution_attempts: '0',
-  });
-  await redis.zadd(keys.zset.status.pending, pendingScore(priority, now), reverifyTaskId);
-  await redis.xadd(keys.stream.tasks, '*', 'task_id', reverifyTaskId, 'priority', String(priority));
+  }, 'create');
+  if (reverifyCreateOutcome === 'TASK_EXISTS') {
+    return ensureAcceptanceReverifyTask(redis, acceptanceRootTaskId, resolvedByTaskId, options);
+  }
+  await ensurePendingTaskPublished(redis, await redis.hgetall(keys.hash.task(reverifyTaskId)));
 
   const history = (root.resolution_task_ids ?? '').split(',').filter(Boolean);
-  await redis.hset(keys.hash.task(root.task_id), {
+  await mutateTaskWithPlanProjection(redis, root.task_id, root.plan_id ?? '', {
     resolution_status: 'required',
     resolution_action: 'reverify',
     resolution_task_id: reverifyTaskId,
@@ -2492,22 +3756,11 @@ async function ensureAcceptanceReverifyTask(
     resolution_generation: String(generation),
     resolution_decision_reason: '',
   });
-  const consumer = await resolvePmConsumer(redis, root.plan_id ?? '');
-  const firstReady = await redis.sadd(keys.acceptanceReady.fired, reverifyTaskId);
-  if (firstReady === 1) {
-    await redis.xadd(
-      keys.stream.events,
-      '*',
-      'event_id', `${now}_acceptance_ready_${reverifyTaskId}`,
-      'type', 'acceptance_ready',
-      'task_id', reverifyTaskId,
-      'plan_id', root.plan_id ?? '',
-      'project_path', root.project_path ?? '',
-      'consumer', consumer,
-      'timestamp', String(now),
-      'acked', 'false',
-    );
-  }
+  await ensureAcceptanceReadyEvent(
+    redis,
+    root,
+    await redis.hgetall(keys.hash.task(reverifyTaskId)),
+  );
   await persistTaskFromRedis(redis, reverifyTaskId);
   await persistTaskFromRedis(redis, root.task_id);
   return { taskId: reverifyTaskId, created: true };
@@ -2547,11 +3800,14 @@ async function acceptanceReviewerConflictTask(
 async function scheduleReadyAcceptanceReverifications(
   redis: Redis,
   resolvedByTaskId: string,
+  runtimeCandidateIds?: Iterable<string>,
 ): Promise<{ createdTaskIds: string[]; needsPmDecisionTaskIds: string[] }> {
-  const candidateIds = [
-    ...(await redis.zrange(keys.zset.status.failed, 0, -1)),
-    ...(await redis.zrange(keys.zset.status.done, 0, -1)),
-  ];
+  const candidateIds = runtimeCandidateIds === undefined
+    ? [
+        ...(await redis.zrange(keys.zset.status.failed, 0, -1)),
+        ...(await redis.zrange(keys.zset.status.done, 0, -1)),
+      ]
+    : [...new Set(runtimeCandidateIds)];
   const roots = new Set<string>();
   for (const candidateId of candidateIds) {
     const candidate = await redis.hgetall(keys.hash.task(candidateId));
@@ -2592,7 +3848,7 @@ async function markAcceptanceFailureResolution(
   // 耗尽时没有新 repair id，不能因此清空指向末次失败 reverify 的指针。
   // 这个指针是 inspect/continue 必须的最短证据链。
   const latestTaskId = uniqueRepairTaskIds.at(-1) || root.resolution_task_id || rootHistory.at(-1) || '';
-  await redis.hset(keys.hash.task(rootTaskId), {
+  await mutateTaskWithPlanProjection(redis, rootTaskId, root.plan_id ?? '', {
     resolution_status: needsPmDecision ? 'needs_pm_decision' : 'repairing',
     resolution_action: needsPmDecision ? 'inspect' : 'reverify',
     resolution_task_id: latestTaskId,
@@ -2609,7 +3865,11 @@ async function markAcceptanceFailureResolution(
 }
 
 /** 已验收 repair 向上收敛其整个 fix 链；原 failed/rejected 历史保持不变。 */
-async function resolveRepairLineage(redis: Redis, repairTaskId: string): Promise<string[]> {
+async function resolveRepairLineage(
+  redis: Redis,
+  repairTaskId: string,
+  runtimeCandidateIds?: Iterable<string>,
+): Promise<string[]> {
   const resolved: string[] = [];
   let childId = repairTaskId;
   for (let depth = 0; depth < 32; depth++) {
@@ -2619,7 +3879,7 @@ async function resolveRepairLineage(redis: Redis, repairTaskId: string): Promise
     const parent = await redis.hgetall(keys.hash.task(parentId));
     if (!parent.task_id) break;
     const isAcceptanceReverify = child.type === 'acceptance' && child.repair_root_task_id === parentId;
-    await redis.hset(keys.hash.task(parentId), {
+    await mutateTaskWithPlanProjection(redis, parentId, parent.plan_id ?? '', {
       resolution_status: 'resolved',
       resolution_action: isAcceptanceReverify ? 'reverify' : 'repair',
       resolution_task_id: childId,
@@ -2629,7 +3889,7 @@ async function resolveRepairLineage(redis: Redis, repairTaskId: string): Promise
     resolved.push(parentId);
     childId = parentId;
   }
-  await scheduleReadyAcceptanceReverifications(redis, repairTaskId);
+  await scheduleReadyAcceptanceReverifications(redis, repairTaskId, runtimeCandidateIds);
   return resolved;
 }
 
@@ -2683,9 +3943,26 @@ export interface RuntimeReconciliationResult {
  * 低频节拍调用。Redis CAS 同时写一次 task_ready，重复/并发调用不会重复恢复或重复鸣铃。
  */
 async function reconcileRuntimeStateUnlocked(redis: Redis): Promise<ApiResponse<RuntimeReconciliationResult>> {
+  // marker 缺失时（升级/restore）安全回建一次；此后常规轮次只处理当前 dirty 候选，
+  // 不再对全部历史 done/failed 做三次扫描。
+  const runtimeCandidateIds = await ensureRuntimeReconcileBackfill(redis);
+  await reconcileResolutionBacklogUnlocked(redis, {
+    migrateLegacyNamedFixes: false,
+    candidateIds: runtimeCandidateIds,
+  });
+  const replayedDependencies = await replayPendingAcceptedRepairSideEffects(redis, runtimeCandidateIds);
   const reclaimed = await lazyReclaimTaskIds(redis);
   const failed = await finalizeReclaimedTasks(redis, reclaimed);
   const requeued = await reconcileBlockedWaiters(redis);
+  requeued.waiting_dependency = [
+    ...new Set([...replayedDependencies, ...requeued.waiting_dependency]),
+  ];
+
+  // lazy reclaim 可能在本轮新增 failed dirty；与初始快照一起按最新 task 状态原子清理。
+  // 新异常若与清理并发，其事务会在清理前被状态谓词保留，或在清理后重新 ZADD。
+  for (const taskId of new Set([...runtimeCandidateIds, ...failed])) {
+    await cleanRuntimeReconcileCandidate(redis, taskId);
+  }
   return {
     ok: true,
     data: {
@@ -2700,8 +3977,409 @@ export async function reconcileRuntimeState(redis: Redis): Promise<ApiResponse<R
   return withMutationPermit(redis, () => reconcileRuntimeStateUnlocked(redis));
 }
 
+const CLAIM_WITH_AGENT_EPOCH = `
+local registration_id = ARGV[1]
+local task_id = ARGV[2]
+local claim_token = ARGV[3]
+local now = ARGV[4]
+local expire_at = ARGV[5]
+local agent_id = ARGV[6]
+local plan_id = ARGV[7]
+local claim_request_id = ARGV[8]
+local claim_attempt_id = ARGV[9]
+local lease_ttl_ms = ARGV[10]
+
+if (redis.call('HGET', KEYS[12], 'request_id') or '') ~= claim_request_id or
+   (redis.call('HGET', KEYS[12], 'attempt_id') or '') ~= claim_attempt_id or
+   (redis.call('HGET', KEYS[12], 'status') or '') ~= 'active' then
+  return {'CLAIM_RESERVATION_LOST'}
+end
+if (redis.call('HGET', KEYS[5], 'agent_id') or '') == '' then return {'AGENT_NOT_REGISTERED'} end
+if (redis.call('HGET', KEYS[5], 'registration_id') or '') ~= registration_id then
+  return {'AGENT_REGISTRATION_CHANGED'}
+end
+if (redis.call('HGET', KEYS[5], 'status') or '') == 'offline' then return {'AGENT_ALREADY_OFFLINE'} end
+local current_task = redis.call('HGET', KEYS[5], 'current_task') or ''
+if current_task ~= '' then return {'AGENT_BUSY', current_task} end
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_NOT_FOUND'} end
+if (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id then return {'TASK_CHANGED'} end
+if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'pending' then return {'TASK_NOT_PENDING'} end
+if not redis.call('ZSCORE', KEYS[3], task_id) then return {'TASK_NOT_PENDING'} end
+if not redis.call('SET', KEYS[2], claim_token, 'PX', lease_ttl_ms, 'NX') then return {'LEASE_CHANGED'} end
+
+redis.call('ZREM', KEYS[3], task_id)
+redis.call('ZADD', KEYS[4], tonumber(expire_at), task_id)
+redis.call('HSET', KEYS[1],
+  'status', 'running',
+  'claimed_at', now,
+  'claimed_by', agent_id,
+  'expire_at', expire_at,
+  -- pending -> running 是新交付轮次；任何旧/损坏的 review 字段必须在同一 claim
+  -- CAS 内清空，不能等 report 后才消除“运行中但已 accepted”的矛盾状态。
+  'pm_review_status', '',
+  'pm_reviewed_by', '',
+  'pm_reviewed_at', '',
+  'pm_review_comment', '',
+  'pm_accept_effects_applied', '',
+  'pm_reject_reason', '',
+  'pm_fix_instructions', '',
+  'pm_rejection_resolution_mode', '')
+redis.call('HSET', KEYS[5],
+  'current_task', task_id,
+  'status', 'busy',
+  'claim_request_id', claim_request_id,
+  'claim_request_task_id', task_id,
+  'claim_request_token', claim_token)
+-- 旧版本曾在 Agent hash 复制完整 goal/question 正文；新 claim 主动清除该副本。
+redis.call('HDEL', KEYS[5], 'claim_request_payload')
+redis.call('SADD', KEYS[6], plan_id)
+redis.call('SADD', KEYS[7], task_id)
+redis.call('HINCRBY', KEYS[8], plan_id, 1)
+redis.call('SADD', KEYS[9], plan_id)
+redis.call('ZREM', KEYS[10], task_id)
+redis.call('XADD', KEYS[11], '*',
+  'event_id', now .. '_claim_' .. task_id,
+  'type', 'task_claimed',
+  'task_id', task_id,
+  'agent_id', agent_id,
+  'plan_id', plan_id)
+redis.call('DEL', KEYS[12])
+return {'CLAIMED'}
+`;
+
+const REPLAY_AGENT_CLAIM = `
+if (redis.call('HGET', KEYS[1], 'agent_id') or '') == '' then return {'AGENT_NOT_REGISTERED'} end
+if (redis.call('HGET', KEYS[1], 'registration_id') or '') ~= ARGV[1] then
+  return {'AGENT_REGISTRATION_CHANGED'}
+end
+if (redis.call('HGET', KEYS[1], 'status') or '') == 'offline' then return {'AGENT_ALREADY_OFFLINE'} end
+if (redis.call('HGET', KEYS[1], 'claim_request_id') or '') ~= ARGV[2] then return {'NO_REPLAY'} end
+local task_id = redis.call('HGET', KEYS[1], 'claim_request_task_id') or ''
+local claim_token = redis.call('HGET', KEYS[1], 'claim_request_token') or ''
+if task_id == '' or claim_token == '' then return {'NO_REPLAY'} end
+if (redis.call('HGET', KEYS[1], 'current_task') or '') ~= task_id then return {'NO_REPLAY'} end
+if (redis.call('HGET', KEYS[2], 'task_id') or '') ~= task_id or
+   (redis.call('HGET', KEYS[2], 'status') or '') ~= 'running' or
+   (redis.call('HGET', KEYS[2], 'claimed_by') or '') ~= ARGV[3] then return {'NO_REPLAY'} end
+if (redis.call('GET', KEYS[3]) or '') ~= claim_token then return {'NO_REPLAY'} end
+return {'REPLAY', task_id, claim_token}
+`;
+
+const CLAIM_RESERVATION_TTL_MS = 3_000;
+const DEFAULT_BLOCKING_CLAIM_TIMEOUT_MS = 30_000;
+const MAX_BLOCKING_CLAIM_TIMEOUT_MS = 60_000;
+
+const RESERVE_AGENT_CLAIM = `
+-- RESERVE_AGENT_CLAIM_TEST_MARKER
+if (redis.call('HGET', KEYS[1], 'agent_id') or '') == '' then return {'AGENT_NOT_REGISTERED'} end
+if (redis.call('HGET', KEYS[1], 'registration_id') or '') ~= ARGV[1] then
+  return {'AGENT_REGISTRATION_CHANGED'}
+end
+if (redis.call('HGET', KEYS[1], 'status') or '') == 'offline' then return {'AGENT_ALREADY_OFFLINE'} end
+local current_task = redis.call('HGET', KEYS[1], 'current_task') or ''
+if current_task ~= '' then return {'AGENT_BUSY', current_task} end
+
+local existing_registration = redis.call('HGET', KEYS[2], 'registration_id') or ''
+if existing_registration ~= '' and existing_registration ~= ARGV[1] then
+  redis.call('DEL', KEYS[2])
+end
+local existing_request = redis.call('HGET', KEYS[2], 'request_id') or ''
+local existing_attempt = redis.call('HGET', KEYS[2], 'attempt_id') or ''
+local existing_status = redis.call('HGET', KEYS[2], 'status') or ''
+if existing_request == ARGV[2] and existing_status == 'empty' then return {'EMPTY'} end
+if existing_request == ARGV[2] and existing_status == 'active' then
+  if existing_attempt == ARGV[3] then return {'OWNER'} end
+  return {'WAIT'}
+end
+if existing_request ~= '' and existing_status == 'active' then return {'IN_FLIGHT'} end
+redis.call('HSET', KEYS[2],
+  'registration_id', ARGV[1],
+  'request_id', ARGV[2],
+  'attempt_id', ARGV[3],
+  'status', 'active')
+redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[4]))
+return {'OWNER'}
+`;
+
+const COMPLETE_EMPTY_AGENT_CLAIM = `
+if (redis.call('HGET', KEYS[1], 'request_id') or '') ~= ARGV[1] or
+   (redis.call('HGET', KEYS[1], 'attempt_id') or '') ~= ARGV[2] or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= 'active' then return 0 end
+redis.call('HSET', KEYS[1], 'status', 'empty')
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
+return 1
+`;
+
+const RENEW_AGENT_CLAIM_RESERVATION = `
+-- RENEW_AGENT_CLAIM_RESERVATION_TEST_MARKER
+if (redis.call('HGET', KEYS[1], 'registration_id') or '') ~= ARGV[1] or
+   (redis.call('HGET', KEYS[1], 'request_id') or '') ~= ARGV[2] or
+   (redis.call('HGET', KEYS[1], 'attempt_id') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= 'active' then return 0 end
+return redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+`;
+
+function startClaimReservationRenewal(
+  redis: Redis,
+  reservationKey: string,
+  registrationId: string,
+  claimRequestId: string,
+  claimAttemptId: string,
+  ttlMs: number,
+): { owned: () => boolean; stop: () => Promise<void> } {
+  let owned = true;
+  let inFlight = Promise.resolve();
+  const renew = () => {
+    inFlight = inFlight.then(async () => {
+      if (!owned) return;
+      try {
+        const renewed = Number(await redis.eval(
+          RENEW_AGENT_CLAIM_RESERVATION,
+          1,
+          reservationKey,
+          registrationId,
+          claimRequestId,
+          claimAttemptId,
+          String(ttlMs),
+        ));
+        if (renewed !== 1) owned = false;
+      } catch {
+        // 续租结果未知时 fail closed；最终 Lua 仍会以 attempt token 再 fencing。
+        owned = false;
+      }
+    });
+  };
+  const timer = setInterval(renew, Math.max(250, Math.floor(ttlMs / 3)));
+  timer.unref?.();
+  return {
+    owned: () => owned,
+    stop: async () => {
+      clearInterval(timer);
+      await inFlight;
+    },
+  };
+}
+
+function agentEpochError(
+  agentId: string,
+  code: 'AGENT_REGISTRATION_REQUIRED' | 'INVALID_REGISTRATION_ID' | 'AGENT_NOT_REGISTERED' |
+    'AGENT_REGISTRATION_CHANGED' | 'AGENT_ALREADY_OFFLINE' | 'AGENT_BUSY',
+  detail = '',
+): { code: string; message: string } {
+  const messages = {
+    AGENT_REGISTRATION_REQUIRED: 'claim 必须携带 register 返回的 registration_id',
+    INVALID_REGISTRATION_ID: 'registration_id 格式无效',
+    AGENT_NOT_REGISTERED: `Agent ${agentId} 尚未注册`,
+    AGENT_REGISTRATION_CHANGED: `Agent ${agentId} 已换用新会话；旧生命周期不能领取任务。`,
+    AGENT_ALREADY_OFFLINE: `Agent ${agentId} 的当前会话已离线，请重新注册。`,
+    AGENT_BUSY: `agent ${agentId} 已有 running task ${detail}，完成或 report 后才能领新任务`,
+  } as const;
+  return { code, message: messages[code] };
+}
+
+async function rebuildClaimPayload(redis: Redis, taskId: string, claimToken: string): Promise<ClaimedTask | undefined> {
+  const taskHash = await redis.hgetall(keys.hash.task(taskId));
+  if (!taskHash.task_id) return undefined;
+  const task = hashToTaskRecord(taskHash);
+  const questionId = taskHash.last_question_id ?? '';
+  const questionAnswer = taskHash.last_question_answer ?? '';
+  const questionCheckpoint = questionId
+    ? (await redis.hget(keys.hash.question(questionId), 'checkpoint')) ?? ''
+    : '';
+  return {
+    task_id: task.task_id,
+    title: task.title,
+    type: task.type,
+    phase: task.phase,
+    priority: task.priority ?? 5,
+    ownership_files: task.ownership?.files ?? [],
+    goal_md: task.goal_md,
+    timeout_seconds: task.timeout_seconds ?? 1800,
+    claim_token: claimToken,
+    verify: task.verify ?? [],
+    project_path: task.project_path,
+    plan_id: task.plan_id,
+    ...(questionAnswer ? { question_answer: questionAnswer } : {}),
+    ...(questionId ? { question_id: questionId } : {}),
+    ...(questionCheckpoint ? { question_checkpoint: questionCheckpoint } : {}),
+  };
+}
+
 /** claim（核心，对应 06 号 md 完整流程） */
-async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiResponse<ClaimedTask | null>> {
+async function claimUnlocked(
+  redis: Redis,
+  req: ClaimRequest,
+  signal?: AbortSignal,
+): Promise<ApiResponse<ClaimedTask | null>> {
+  if (req.timeout_ms !== undefined &&
+      (!Number.isSafeInteger(req.timeout_ms) || req.timeout_ms < 0 || req.timeout_ms > MAX_BLOCKING_CLAIM_TIMEOUT_MS)) {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        code: 'INVALID_CLAIM_TIMEOUT',
+        message: `timeout_ms 必须是 0-${MAX_BLOCKING_CLAIM_TIMEOUT_MS} 的整数`,
+      },
+    };
+  }
+  const blockingTimeoutMs = Math.max(1, req.timeout_ms ?? DEFAULT_BLOCKING_CLAIM_TIMEOUT_MS);
+  if (signal?.aborted) {
+    return { ok: false, data: null, error: { code: 'CLAIM_ABORTED', message: 'claim 等待已由客户端取消' } };
+  }
+  // 先快速失败，避免旧 epoch 触发回收/候选扫描；真正授权仍在领取 Lua 内
+  // 与 task + presence 状态写入同一原子边界二次校验。
+  const registeredAgent = await redis.hgetall(keys.hash.agent(req.agent_id));
+  if (!registeredAgent.agent_id) {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_NOT_REGISTERED') };
+  }
+  // 仅供仓库内旧的直接 service 调用过渡：这些调用通过未显式传 ID 的
+  // agentRegister 由服务端生成 epoch。HTTP claim schema 仍强制客户端携带，不存在
+  // 外部降级路径；显式 client epoch 也绝不允许省略。
+  const registrationId = req.registration_id
+    ?? (registeredAgent.registration_source === 'server' ? registeredAgent.registration_id : undefined);
+  if (!registrationId) {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_REGISTRATION_REQUIRED') };
+  }
+  if (!AGENT_REGISTRATION_ID_PATTERN.test(registrationId)) {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'INVALID_REGISTRATION_ID') };
+  }
+  if (!durableAgentEpochIsCurrent(req.agent_id, registrationId)) {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_REGISTRATION_CHANGED') };
+  }
+  if (registeredAgent.registration_id !== registrationId) {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_REGISTRATION_CHANGED') };
+  }
+  if (registeredAgent.status === 'offline') {
+    return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_ALREADY_OFFLINE') };
+  }
+  const claimRequestId = req.claim_request_id ?? `internal_${randomUUID().replaceAll('-', '')}`;
+  if (!AGENT_REGISTRATION_ID_PATTERN.test(claimRequestId)) {
+    return { ok: false, data: null, error: { code: 'INVALID_CLAIM_REQUEST_ID', message: 'claim_request_id 格式无效' } };
+  }
+
+  // 先走幂等重放快路，不扫 pending/running，也不触发 lease 回收。
+  // 脚本在同一原子读中复核 epoch + task + lease，只重放仍然有效的原 claim。
+  const tryReplayClaim = async (): Promise<ApiResponse<ClaimedTask | null> | undefined> => {
+    const replayRaw = await withAgentEpochCommit(req.agent_id, async () => {
+      if (!durableAgentEpochIsCurrent(req.agent_id, registrationId)) return ['AGENT_REGISTRATION_CHANGED'];
+      const latestAgent = await redis.hgetall(keys.hash.agent(req.agent_id));
+      const replayTaskId = latestAgent.claim_request_task_id || '__none__';
+      return redis.eval(
+        REPLAY_AGENT_CLAIM,
+        3,
+        keys.hash.agent(req.agent_id),
+        keys.hash.task(replayTaskId),
+        keys.string.lease(replayTaskId),
+        registrationId,
+        claimRequestId,
+        req.agent_id,
+      );
+    });
+    if (Array.isArray(replayRaw) && String(replayRaw[0] ?? '') === 'AGENT_REGISTRATION_CHANGED') {
+      return { ok: false, data: null, error: agentEpochError(req.agent_id, 'AGENT_REGISTRATION_CHANGED') };
+    }
+    if (!Array.isArray(replayRaw) || String(replayRaw[0] ?? '') !== 'REPLAY') return undefined;
+    const replayTaskId = String(replayRaw[1] ?? '');
+    const replayToken = String(replayRaw[2] ?? '');
+    const replayed = replayTaskId && replayToken
+      ? await rebuildClaimPayload(redis, replayTaskId, replayToken)
+      : undefined;
+    if (!replayed) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'CLAIM_REPLAY_CORRUPT', message: '已提交 claim 的幂等重放索引损坏，拒绝重新领取' },
+      };
+    }
+    return { ok: true, data: replayed };
+  };
+  const initialReplay = await tryReplayClaim();
+  if (initialReplay) return initialReplay;
+
+  // 同一 Agent 的 claim 先取得短 TTL 单飞 reservation。相同 request 的并发重试
+  // 等待 owner 提交后走 replay；owner 崩溃则 reservation 自动过期，由重试接管。
+  const claimAttemptId = `attempt_${randomUUID().replaceAll('-', '')}`;
+  const reservationKey = keys.hash.claimReservation(req.agent_id);
+  const reservationTtlMs = Math.max(
+    CLAIM_RESERVATION_TTL_MS,
+    req.blocking === true ? blockingTimeoutMs + CLAIM_RESERVATION_TTL_MS : 0,
+  );
+  const reservationDeadline = Date.now() + reservationTtlMs + 750;
+  while (true) {
+    const replay = await tryReplayClaim();
+    if (replay) return replay;
+    const reservationMutation = await withMutationPermit(redis, async () => ({
+      ok: true,
+      data: await withAgentEpochCommit(req.agent_id, async () => {
+        if (!durableAgentEpochIsCurrent(req.agent_id, registrationId)) return ['AGENT_REGISTRATION_CHANGED'];
+        return redis.eval(
+          RESERVE_AGENT_CLAIM,
+          2,
+          keys.hash.agent(req.agent_id),
+          reservationKey,
+          registrationId,
+          claimRequestId,
+          claimAttemptId,
+          String(reservationTtlMs),
+        );
+      }),
+    }));
+    if (!reservationMutation.ok) {
+      return { ok: false, data: null, error: reservationMutation.error };
+    }
+    const reserved = reservationMutation.data;
+    const reservationOutcome = Array.isArray(reserved) ? String(reserved[0] ?? '') : '';
+    if (reservationOutcome === 'OWNER') break;
+    if (reservationOutcome === 'EMPTY') return { ok: true, data: null };
+    if (reservationOutcome === 'AGENT_BUSY') {
+      const finalReplay = await tryReplayClaim();
+      if (finalReplay) return finalReplay;
+    }
+    if (['AGENT_NOT_REGISTERED', 'AGENT_REGISTRATION_CHANGED', 'AGENT_ALREADY_OFFLINE', 'AGENT_BUSY'].includes(reservationOutcome)) {
+      return {
+        ok: false,
+        data: null,
+        error: agentEpochError(
+          req.agent_id,
+          reservationOutcome as 'AGENT_NOT_REGISTERED' | 'AGENT_REGISTRATION_CHANGED' | 'AGENT_ALREADY_OFFLINE' | 'AGENT_BUSY',
+          String((reserved as unknown[])[1] ?? ''),
+        ),
+      };
+    }
+    if (reservationOutcome === 'IN_FLIGHT') {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'AGENT_CLAIM_IN_PROGRESS', message: `Agent ${req.agent_id} 正在处理另一个 claim 请求` },
+      };
+    }
+    if (reservationOutcome !== 'WAIT') throw new Error(`failed to reserve claim: ${reservationOutcome || 'UNKNOWN'}`);
+    if (Date.now() >= reservationDeadline) {
+      const finalReplay = await tryReplayClaim();
+      if (finalReplay) return finalReplay;
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'CLAIM_IN_PROGRESS', message: '相同 claim_request_id 仍在提交中，请使用同一 ID 重试' },
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  const reservationRenewal = startClaimReservationRenewal(
+    redis, reservationKey, registrationId, claimRequestId, claimAttemptId, reservationTtlMs,
+  );
+  let mutationSection: { release: () => Promise<void> } | undefined;
+  try {
+  const initialSection = await acquireMutationSection(redis);
+  if (!initialSection.ok) return { ok: false, data: null, error: initialSection.error };
+  mutationSection = initialSection;
+
+  // 先固定当前 stream 游标，再扫调度真相。游标之后、XREAD 之前发布的任务会在
+  // XREAD(cursor) 中立即可见；使用 `$` 会把这段窗口内的铃永久跳过。
+  const latestTaskEvents = await redis.xrevrange(keys.stream.tasks, '+', '-', 'COUNT', 1);
+  const blockingStreamCursor = latestTaskEvents[0]?.[0] ?? '0-0';
+
   // 懒回收本身会释放文件 ownership。仅在实际有回收时检查 file waiter，避免每次
   // 无关 claim 扫描 blocked 队列；Question / dependency 等其它阻塞原因绝不受此影响。
   const reclaimedTaskIds = await lazyReclaimTaskIds(redis);
@@ -2713,6 +4391,10 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
   for (const tid of runningIds) {
     const owner = await redis.hget(keys.hash.task(tid), 'claimed_by');
     if (owner === req.agent_id) {
+      // 两个同 request 的 HTTP 请求并发时，第一个可能在本请求的
+      // 首次快路之后才提交；在报 busy 前再读一次，同 ID 仍能安全重放。
+      const concurrentReplay = await tryReplayClaim();
+      if (concurrentReplay) return concurrentReplay;
       return {
         ok: false,
         data: null,
@@ -2724,10 +4406,11 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
     }
   }
 
-  const agent = await redis.hgetall(keys.hash.agent(req.agent_id));
-  const agentType = agent.agent_type ?? '';
+  const agentType = registeredAgent.agent_type ?? '';
+  let terminalClaimError: { code: string; message: string } | undefined;
 
   const tryCandidates = async (): Promise<ClaimedTask | null> => {
+    if (!reservationRenewal.owned()) return null;
     // Stream 只做唤醒通道；zset/hash 才是调度真相源，过滤不会消费或丢弃任务。
     const pendingIds = await redis.zrange(keys.zset.status.pending, 0, -1);
     const candidates: TaskRecord[] = [];
@@ -2744,6 +4427,7 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
     );
 
     for (const task of candidates) {
+      if (!reservationRenewal.owned()) return null;
       const assignee = task.assignee || 'auto';
       if (assignee !== 'auto' && assignee !== req.agent_id && assignee !== agentType) continue;
       if (req.preferred_types?.length && !req.preferred_types.includes(task.type)) continue;
@@ -2753,6 +4437,7 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
       // 其它 plan 领走再由客户端退回，否则会短暂占有 lease / ownership。
       if (req.preferred_plan_ids?.length && !req.preferred_plan_ids.includes(task.plan_id)) continue;
       if (!(await checkDependencies(redis, task)).ok) continue;
+      if (!reservationRenewal.owned()) return null;
 
       // 领取阶段即阻止普通自验收与 reverify 自验收；后者还要排除 repair/旧验收执行者。
       if (await acceptanceReviewerConflictTask(redis, task, req.agent_id)) continue;
@@ -2760,12 +4445,10 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
       const claimToken = generateToken();
       const leaseKey = keys.string.lease(task.task_id);
       const timeoutSeconds = task.timeout_seconds ?? 1800;
-      const acquired = await redis.set(leaseKey, claimToken, 'EX', timeoutSeconds, 'NX');
-      if (acquired !== 'OK') continue;
-
       const ownershipFiles = task.ownership?.files ?? [];
       if (ownershipFiles.length > 0) {
         const baseSha = await getGitHeadSha(task.project_path).catch(() => '');
+        if (!reservationRenewal.owned()) return null;
         const ownershipAcquired = await activateOwnership(
           redis,
           req.agent_id,
@@ -2784,49 +4467,21 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
           );
           continue;
         }
+        if (!reservationRenewal.owned()) return null;
       }
 
       const now = Date.now();
       const expireAt = now + timeoutSeconds * 1000;
-      const tx = redis.multi();
-      tx.zrem(keys.zset.status.pending, task.task_id);
-      tx.zadd(keys.zset.status.running, runningScore(expireAt), task.task_id);
-      tx.hset(keys.hash.task(task.task_id), {
-        status: 'running',
-        claimed_at: String(now),
-        claimed_by: req.agent_id,
-        expire_at: String(expireAt),
-      });
-      tx.hset(keys.hash.agent(req.agent_id), 'current_task', task.task_id, 'status', 'busy');
-      tx.xadd(
-        keys.stream.events,
-        '*',
-        'event_id',
-        `${now}_claim_${task.task_id}`,
-        'type',
-        'task_claimed',
-        'task_id',
-        task.task_id,
-        'agent_id',
-        req.agent_id,
-        'plan_id',
-        task.plan_id,
-      );
-      await tx.exec();
-
-      sqliteStore?.updateTaskFields(task.task_id, {
-        status: 'running',
-        claimed_by: req.agent_id,
-        claimed_at: String(now),
-        expire_at: String(expireAt),
-      });
-
-      // last_question_* 是 task hash 的运行时上下文，不在 TaskRecord 投影中；
-      // 领取已经提交后再读一次，避免引用候选收集循环中已离开作用域的 hash。
-      const questionId = await redis.hget(keys.hash.task(task.task_id), 'last_question_id');
-      const questionAnswer = await redis.hget(keys.hash.task(task.task_id), 'last_question_answer');
-
-      return {
+      // 问题回答上下文在 task 回到 pending 时已固定。首次响应在内存构造；Redis
+      // 只原子保存 task/token/request_id，重放时从 task/question 真相重建，避免在
+      // Agent hash 再复制 goal_md 与 Question 正文。
+      const taskHashForPayload = await redis.hgetall(keys.hash.task(task.task_id));
+      const questionId = taskHashForPayload.last_question_id ?? '';
+      const questionAnswer = taskHashForPayload.last_question_answer ?? '';
+      const questionCheckpoint = questionId
+        ? (await redis.hget(keys.hash.question(questionId), 'checkpoint')) ?? ''
+        : '';
+      const claimPayload: ClaimedTask = {
         task_id: task.task_id,
         title: task.title,
         type: task.type,
@@ -2839,36 +4494,190 @@ async function claimUnlocked(redis: Redis, req: ClaimRequest): Promise<ApiRespon
         verify: task.verify ?? [],
         project_path: task.project_path,
         plan_id: task.plan_id,
-        // 若该任务是因 Question 被回答而回到 pending，附带回答上下文（PM 的答复 + checkpoint）。
-        // candidates 里的 TaskRecord 不保留该运行时字段，因此从 task hash 读取。
-        question_answer: questionAnswer || undefined,
-        question_id: questionId || undefined,
-        question_checkpoint: questionId
-          ? (await redis.hget(keys.hash.question(questionId), 'checkpoint')) || undefined
-          : undefined,
+        ...(questionAnswer ? { question_answer: questionAnswer } : {}),
+        ...(questionId ? { question_id: questionId } : {}),
+        ...(questionCheckpoint ? { question_checkpoint: questionCheckpoint } : {}),
       };
+      if (!reservationRenewal.owned()) return null;
+      const rawClaim = await withAgentEpochCommit(req.agent_id, async () => {
+        if (!durableAgentEpochIsCurrent(req.agent_id, registrationId)) return ['AGENT_REGISTRATION_CHANGED'];
+        return redis.eval(
+        CLAIM_WITH_AGENT_EPOCH,
+        12,
+        keys.hash.task(task.task_id),
+        leaseKey,
+        keys.zset.status.pending,
+        keys.zset.status.running,
+        keys.hash.agent(req.agent_id),
+        keys.planStatusProjection.planIds,
+        keys.planStatusProjection.taskIdsByPlan(task.plan_id),
+        keys.planStatusProjection.revisionByPlan,
+        keys.planStatusProjection.dirtyPlans,
+        keys.intakeActionableFailed.pending,
+        keys.stream.events,
+        reservationKey,
+        registrationId,
+        task.task_id,
+        claimToken,
+        String(now),
+        String(expireAt),
+        req.agent_id,
+        task.plan_id,
+        claimRequestId,
+        claimAttemptId,
+        String(timeoutSeconds * 1000),
+        );
+      });
+      const claimOutcome = Array.isArray(rawClaim) ? String(rawClaim[0] ?? '') : '';
+      if (claimOutcome !== 'CLAIMED') {
+        // 领取未提交时，只释放本 request 创建的 lease/所有权；不删别人的新状态。
+        // reservation 已丢失表示 TTL takeover 可能已由同一 agent/task 继承 ownership；
+        // 旧 attempt 此时不能按 agent/task 粗粒度释放新 owner 的合法占用。
+        if (ownershipFiles.length > 0 && claimOutcome !== 'CLAIM_RESERVATION_LOST') {
+          await releaseOwnershipByAgent(redis, req.agent_id, task.task_id);
+        }
+        await redis.eval(
+          "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+          1,
+          leaseKey,
+          claimToken,
+        );
+        if (['AGENT_NOT_REGISTERED', 'AGENT_REGISTRATION_CHANGED', 'AGENT_ALREADY_OFFLINE', 'AGENT_BUSY'].includes(claimOutcome)) {
+          terminalClaimError = agentEpochError(
+            req.agent_id,
+            claimOutcome as 'AGENT_NOT_REGISTERED' | 'AGENT_REGISTRATION_CHANGED' | 'AGENT_ALREADY_OFFLINE' | 'AGENT_BUSY',
+            String((rawClaim as unknown[])[1] ?? ''),
+          );
+          return null;
+        }
+        // task/lease 已被其它合法转换改变，继续尝试下一候选。
+        continue;
+      }
+
+      sqliteStore?.updateTaskFields(task.task_id, {
+        status: 'running',
+        claimed_by: req.agent_id,
+        claimed_at: String(now),
+        expire_at: String(expireAt),
+      });
+
+      return claimPayload;
     }
     return null;
   };
 
   const immediate = await tryCandidates();
-  if (immediate || req.blocking !== true) return { ok: true, data: immediate };
+  if (terminalClaimError) return { ok: false, data: null, error: terminalClaimError };
+  if (immediate || req.blocking !== true) {
+    if (!immediate) {
+      // TTL takeover 可能已在旧 owner 扫描期间完成提交；最终一次 replay 防止旧请求
+      // 把成功领取误报为空。
+      const finalReplay = await tryReplayClaim();
+      if (finalReplay) return finalReplay;
+      await redis.eval(
+        COMPLETE_EMPTY_AGENT_CLAIM, 1, reservationKey,
+        claimRequestId, claimAttemptId, String(CLAIM_RESERVATION_TTL_MS),
+      );
+    }
+    return { ok: true, data: immediate };
+  }
 
-  // 阻塞模式只等待一次有界唤醒，唤醒后重新按 zset 真实优先级选择。
-  await redis.xread(
-    'COUNT',
+  // 退出短 mutation section 前把 reservation 刷到完整的、有上限的等待 TTL；
+  // 随后停止续租，确保纯等待阶段没有后台 writer。
+  if (!reservationRenewal.owned()) {
+    return { ok: false, data: null, error: { code: 'CLAIM_RESERVATION_LOST', message: 'claim reservation 已失效' } };
+  }
+  const reservationRefreshed = Number(await redis.eval(
+    RENEW_AGENT_CLAIM_RESERVATION,
     1,
-    'BLOCK',
-    Math.max(1, req.timeout_ms ?? 30000),
-    'STREAMS',
-    keys.stream.tasks,
-    '$',
+    reservationKey,
+    registrationId,
+    claimRequestId,
+    claimAttemptId,
+    String(reservationTtlMs),
+  ));
+  if (reservationRefreshed !== 1) {
+    return { ok: false, data: null, error: { code: 'CLAIM_RESERVATION_LOST', message: 'claim reservation 已失效' } };
+  }
+  await reservationRenewal.stop();
+  await mutationSection.release();
+  mutationSection = undefined;
+
+  // XREAD BLOCK 会冻结一条 Redis FIFO 连接。只把有界等待放到一次性连接上；
+  // claim/epoch/lease/empty completion 等控制面读写始终留在主连接。
+  const blockingWaiter = redis.duplicate();
+  let waiterDisconnected = false;
+  let aborted = signal?.aborted === true;
+  const disconnectWaiter = () => {
+    if (waiterDisconnected) return;
+    waiterDisconnected = true;
+    blockingWaiter.disconnect();
+  };
+  const abortWaiter = () => {
+    aborted = true;
+    disconnectWaiter();
+  };
+  signal?.addEventListener('abort', abortWaiter, { once: true });
+  try {
+    if (!aborted) {
+      try {
+        await blockingWaiter.xread(
+          'COUNT',
+          1,
+          'BLOCK',
+          blockingTimeoutMs,
+          'STREAMS',
+          keys.stream.tasks,
+          blockingStreamCursor,
+        );
+      } catch (error) {
+        if (!aborted) throw error;
+      }
+    }
+  } finally {
+    signal?.removeEventListener('abort', abortWaiter);
+    disconnectWaiter();
+  }
+  if (aborted) {
+    // waiter 已释放后，在新的短 permit 中结束本次 reservation，避免断线客户端让
+    // 同 Agent 的下一次 claim 被一个最长 63 秒的幽灵 IN_FLIGHT 卡住。
+    const abortCleanupSection = await acquireMutationSection(redis);
+    if (abortCleanupSection.ok) {
+      mutationSection = abortCleanupSection;
+      await redis.eval(
+        COMPLETE_EMPTY_AGENT_CLAIM,
+        1,
+        reservationKey,
+        claimRequestId,
+        claimAttemptId,
+        String(CLAIM_RESERVATION_TTL_MS),
+      );
+    }
+    return { ok: false, data: null, error: { code: 'CLAIM_ABORTED', message: 'claim 等待已由客户端取消' } };
+  }
+
+  const finalSection = await acquireMutationSection(redis);
+  if (!finalSection.ok) return { ok: false, data: null, error: finalSection.error };
+  mutationSection = finalSection;
+  const afterWake = await tryCandidates();
+  if (terminalClaimError) return { ok: false, data: null, error: terminalClaimError };
+  if (!afterWake) await redis.eval(
+    COMPLETE_EMPTY_AGENT_CLAIM, 1, reservationKey,
+    claimRequestId, claimAttemptId, String(CLAIM_RESERVATION_TTL_MS),
   );
-  return { ok: true, data: await tryCandidates() };
+  return { ok: true, data: afterWake };
+  } finally {
+    await mutationSection?.release();
+    await reservationRenewal.stop();
+  }
 }
 
-export async function claim(redis: Redis, req: ClaimRequest): Promise<ApiResponse<ClaimedTask | null>> {
-  return withMutationPermit(redis, () => claimUnlocked(redis, req));
+export async function claim(
+  redis: Redis,
+  req: ClaimRequest,
+  signal?: AbortSignal,
+): Promise<ApiResponse<ClaimedTask | null>> {
+  return claimUnlocked(redis, req, signal);
 }
 
 /** report（核心） */
@@ -3108,10 +4917,23 @@ async function reportUnlocked(
             verify_results: JSON.stringify(req.verify_results ?? []),
             done_at: String(now),
             failed_reason: '',
+            // 每次成功 report 都开启新的 review round。即使历史/人工修复留下了
+            // pending+accepted 的异常组合，新交付也不能继承旧 PM 决定。
+            pm_review_status: '',
+            pm_reviewed_by: '',
+            pm_reviewed_at: '',
+            pm_review_comment: '',
+            pm_accept_effects_applied: '',
+            pm_reject_reason: '',
+            pm_fix_instructions: '',
+            pm_rejection_resolution_mode: '',
             ...suspiciousFields,
           });
         } else {
           tx.zadd(keys.zset.status.failed, now, req.task_id);
+          // failed 真相与补偿候选同一个 WATCH/MULTI 提交；即使随后在 repair 创建前
+          // 退出，共享 Supervisor 也能从 dirty 索引恢复，且不必扫描历史 failed。
+          tx.zadd(keys.runtimeReconcile.pending, now, req.task_id);
           tx.hset(taskKey, {
             status: 'failed',
             result_path: resultPath,
@@ -3119,7 +4941,19 @@ async function reportUnlocked(
             verify_results: JSON.stringify(req.verify_results ?? []),
             done_at: String(now),
             failed_reason: reportFailureReason,
+            pm_review_status: '',
+            pm_reviewed_by: '',
+            pm_reviewed_at: '',
+            pm_review_comment: '',
+            pm_accept_effects_applied: '',
           });
+        }
+        if (req.status !== 'done') {
+          // report failed 的 hash 与 actionable intake member 同一 Redis 提交；后续自动
+          // repair 会经 persistTaskFromRedis/Lua 原子移除。这样崩溃在 repair 前也不漏 PM。
+          tx.zadd(keys.intakeActionableFailed.pending, now, req.task_id);
+        } else {
+          tx.zrem(keys.intakeActionableFailed.pending, req.task_id);
         }
         // 事件写入（兼容 + 语义化）：
         //   - task_completed：保留旧事件类型，旧 CLI/SSE 消费者不中断（含 result_status）。
@@ -3177,11 +5011,34 @@ async function reportUnlocked(
             'false',
           );
         }
-        tx.hset(keys.hash.agent(agentId), 'current_task', '', 'status', 'idle');
-        if ((await tx.exec()) !== null) {
-          committedAt = now;
-          break;
+        // report 的 claim token 只授权收口这一个 task，不授权覆盖同名 Agent
+        // 已开始的新生命周期。只在 presence 仍指向本 task 时才清理。
+        tx.eval(
+          `if (redis.call('HGET', KEYS[1], 'current_task') or '') == ARGV[1] then
+             redis.call('HSET', KEYS[1], 'current_task', '', 'status', 'idle')
+             return 1
+           end
+           return 0`,
+          1,
+          keys.hash.agent(agentId),
+          req.task_id,
+        );
+        tx.sadd(keys.planStatusProjection.planIds, currentTaskHash.plan_id);
+        tx.sadd(keys.planStatusProjection.taskIdsByPlan(currentTaskHash.plan_id), req.task_id);
+        tx.hincrby(keys.planStatusProjection.revisionByPlan, currentTaskHash.plan_id, 1);
+        tx.sadd(keys.planStatusProjection.dirtyPlans, currentTaskHash.plan_id);
+        const outcomes = await tx.exec();
+        if (outcomes === null) continue;
+        const commandError = outcomes.find(([error]) => error)?.[0];
+        if (commandError) {
+          // Redis MULTI 不会因单条命令失败而回滚：task 终态可能已写入，而 dirty
+          // 候选写入失败。清掉一次性 backfill marker，让下一轮从耐久真相补回闭环。
+          await redis.del(keys.runtimeReconcile.backfillReady).catch(() => undefined);
+          await redis.del(keys.planStatusProjection.ready).catch(() => undefined);
+          throw new Error(`任务 ${req.task_id} 的 report 状态提交失败: ${commandError.message}`);
         }
+        committedAt = now;
+        break;
       } finally {
         // EXEC 自动清理 watch；显式清理覆盖返回/重试路径。
         await isolated.unwatch().catch(() => undefined);
@@ -3634,12 +5491,144 @@ async function withdrawReviewDoorbell(
   }
 }
 
+const COMMIT_SUPERSEDE_BATCH = `
+-- commit-supersede-round-fenced-v1
+local count = tonumber(ARGV[1]) or 0
+local now = ARGV[2]
+local reason = ARGV[3]
+local superseded_by = ARGV[4]
+local batch_plan_id = ARGV[5]
+local preview_token = ARGV[6]
+local plan_lock_token = ARGV[7]
+local guard_count = tonumber(ARGV[8]) or 0
+local revision_guard_count = tonumber(ARGV[9]) or 0
+local expected_plan_count = tonumber(ARGV[10]) or 0
+
+if batch_plan_id ~= '' and redis.call('GET', KEYS[12]) ~= plan_lock_token then
+  return {'PLAN_LOCK_LOST'}
+end
+if batch_plan_id ~= '' and redis.call('SCARD', KEYS[7]) ~= expected_plan_count then
+  return {'PREVIEW_CHANGED', 'plan_count'}
+end
+
+-- 所有候选先做 owner-token fencing 与 delivery round CAS，再做任何写入；批量操作
+-- 因而只能全成或全败，旧 preview 不会部分覆盖后来的 review/reset。
+for item = 0, count - 1 do
+  local key_index = 13 + item * 3
+  local arg_index = 11 + item * 7
+  local task_key = KEYS[key_index]
+  local task_id = ARGV[arg_index]
+  local plan_id = ARGV[arg_index + 1]
+  local done_at = ARGV[arg_index + 2]
+  local review_status = ARGV[arg_index + 3]
+  local resolution_status = ARGV[arg_index + 4]
+  local lock_token = ARGV[arg_index + 6]
+  if redis.call('GET', KEYS[key_index + 2]) ~= lock_token then return {'TASK_LOCK_LOST', task_id} end
+  if (redis.call('HGET', task_key, 'task_id') or '') ~= task_id or
+     (redis.call('HGET', task_key, 'plan_id') or '') ~= plan_id or
+     (redis.call('HGET', task_key, 'status') or '') ~= 'done' or
+     (redis.call('HGET', task_key, 'done_at') or '') ~= done_at or
+     (redis.call('HGET', task_key, 'pm_review_status') or '') ~= review_status or
+     (redis.call('HGET', task_key, 'resolution_status') or '') ~= resolution_status or
+     string.match(review_status, '^%s*$') == nil or
+     string.match(resolution_status, '^%s*$') == nil then
+    return {'ROUND_CHANGED', task_id}
+  end
+end
+
+-- preview 还包含非候选 task 与跨 plan 的活跃依赖者。它们不需要被写锁占有，但最终
+-- Lua 必须逐字段复核；在预览重算和提交之间出现的新 blocker 会让整批 fail closed。
+for item = 0, guard_count - 1 do
+  local key_index = 13 + count * 3 + item
+  local arg_index = 11 + count * 7 + item * 9
+  if (redis.call('HGET', KEYS[key_index], 'task_id') or '') ~= ARGV[arg_index] or
+     (redis.call('HGET', KEYS[key_index], 'plan_id') or '') ~= ARGV[arg_index + 1] or
+     (redis.call('HGET', KEYS[key_index], 'status') or '') ~= ARGV[arg_index + 2] or
+     (redis.call('HGET', KEYS[key_index], 'done_at') or '') ~= ARGV[arg_index + 3] or
+     (redis.call('HGET', KEYS[key_index], 'pm_review_status') or '') ~= ARGV[arg_index + 4] or
+     (redis.call('HGET', KEYS[key_index], 'resolution_status') or '') ~= ARGV[arg_index + 5] or
+     (redis.call('HGET', KEYS[key_index], 'depends_on') or '') ~= ARGV[arg_index + 6] or
+     (redis.call('HGET', KEYS[key_index], 'superseded_at') or '') ~= ARGV[arg_index + 7] or
+     (redis.call('HGET', KEYS[key_index], 'supersede_preview_token') or '') ~= ARGV[arg_index + 8] then
+    return {'PREVIEW_CHANGED', ARGV[arg_index]}
+  end
+end
+
+for item = 0, revision_guard_count - 1 do
+  local arg_index = 11 + count * 7 + guard_count * 9 + item * 2
+  if (redis.call('HGET', KEYS[8], ARGV[arg_index]) or '') ~= ARGV[arg_index + 1] then
+    return {'PREVIEW_CHANGED', ARGV[arg_index]}
+  end
+end
+
+for item = 0, count - 1 do
+  local key_index = 13 + item * 3
+  local arg_index = 11 + item * 7
+  local task_key = KEYS[key_index]
+  local task_ids_key = KEYS[key_index + 1]
+  local task_id = ARGV[arg_index]
+  local plan_id = ARGV[arg_index + 1]
+  local project_path = ARGV[arg_index + 5]
+  redis.call('ZREM', KEYS[1], task_id)
+  redis.call('ZADD', KEYS[2], tonumber(now), task_id)
+  redis.call('HSET', task_key,
+    'status', 'superseded',
+    'superseded_at', now,
+    'superseded_by', superseded_by,
+    'superseded_reason', reason)
+  if batch_plan_id ~= '' then
+    redis.call('HSET', task_key,
+      'supersede_preview_token', preview_token,
+      'supersede_batch_size', tostring(count))
+  end
+  redis.call('ZREM', KEYS[3], task_id)
+  redis.call('SREM', KEYS[4], task_id)
+  redis.call('HDEL', KEYS[5], task_id)
+  redis.call('SREM', KEYS[6], task_id)
+  redis.call('SADD', KEYS[7], plan_id)
+  redis.call('SADD', task_ids_key, task_id)
+  redis.call('HINCRBY', KEYS[8], plan_id, 1)
+  redis.call('SADD', KEYS[9], plan_id)
+  redis.call('ZREM', KEYS[10], task_id)
+  redis.call('XADD', KEYS[11], '*',
+    'event_id', now .. '_task_superseded_' .. task_id,
+    'type', 'task_superseded',
+    'task_id', task_id,
+    'plan_id', plan_id,
+    'project_path', project_path,
+    'from_status', 'done',
+    'superseded_by', superseded_by,
+    'reason', reason,
+    'timestamp', now)
+end
+if batch_plan_id ~= '' then
+  redis.call('XADD', KEYS[11], '*',
+    'event_id', now .. '_plan_superseded_' .. batch_plan_id,
+    'type', 'plan_tasks_superseded',
+    'plan_id', batch_plan_id,
+    'task_count', tostring(count),
+    'preview_token', preview_token,
+    'superseded_by', superseded_by,
+    'reason', reason,
+    'timestamp', now)
+end
+return {'COMMITTED'}
+`;
+
 async function applySupersedeBatch(
   redis: Redis,
   hashes: Record<string, string>[],
   req: TaskSupersedeRequest,
-  planBatch?: { planId: string; previewToken: string },
-): Promise<void> {
+  locks: Map<string, PmDecisionLock>,
+  planBatch?: {
+    planId: string;
+    previewToken: string;
+    planLockToken: string;
+    previewGuards: Record<string, string>[];
+    planRevisionGuards: Array<[string, string]>;
+    planCount: number;
+  },
+): Promise<'COMMITTED' | 'LOCK_LOST' | 'ROUND_CHANGED'> {
   const now = Date.now();
   const reason = req.reason.trim();
   const supersededBy = req.superseded_by.trim();
@@ -3648,62 +5637,74 @@ async function applySupersedeBatch(
     reviewEvents.set(hash.task_id, await redis.hget(keys.reviewRequested.eventByTask, hash.task_id) ?? '');
   }
 
-  const tx = redis.multi();
-  for (const hash of hashes) {
-    tx.zrem(keys.zset.status.done, hash.task_id);
-    tx.zadd(keys.zset.status.superseded, now, hash.task_id);
-    // 只增加 terminal/audit 字段；done_at、result_path、verify_results 以及任何 PM 审计均不覆盖。
-    tx.hset(keys.hash.task(hash.task_id), {
-      status: 'superseded',
-      superseded_at: String(now),
-      superseded_by: supersededBy,
-      superseded_reason: reason,
-      ...(planBatch ? {
-        supersede_preview_token: planBatch.previewToken,
-        supersede_batch_size: String(hashes.length),
-      } : {}),
-    });
-    tx.zrem(keys.reviewRequested.pending, hash.task_id);
-    tx.srem(keys.reviewRequested.fired, hash.task_id);
-    tx.hdel(keys.reviewRequested.eventByTask, hash.task_id);
-    tx.srem(keys.acceptanceReady.fired, hash.task_id);
-    tx.xadd(
-      keys.stream.events,
-      '*',
-      'event_id', `${now}_task_superseded_${hash.task_id}`,
-      'type', 'task_superseded',
-      'task_id', hash.task_id,
-      'plan_id', hash.plan_id ?? '',
-      'project_path', hash.project_path ?? '',
-      'from_status', 'done',
-      'superseded_by', supersededBy,
-      'reason', reason,
-      'timestamp', String(now),
-    );
-  }
-  if (planBatch) {
-    tx.xadd(
-      keys.stream.events,
-      '*',
-      'event_id', `${now}_plan_superseded_${planBatch.planId}`,
-      'type', 'plan_tasks_superseded',
-      'plan_id', planBatch.planId,
-      'task_count', String(hashes.length),
-      'preview_token', planBatch.previewToken,
-      'superseded_by', supersededBy,
-      'reason', reason,
-      'timestamp', String(now),
-    );
-  }
-  const outcomes = await tx.exec();
-  if (!outcomes || outcomes.some(([error]) => error)) {
-    throw new Error(`failed to persist supersede batch plan=${planBatch?.planId ?? hashes[0]?.plan_id ?? ''}`);
+  const dynamicKeys = hashes.flatMap((hash) => [
+    keys.hash.task(hash.task_id),
+    keys.planStatusProjection.taskIdsByPlan(hash.plan_id ?? ''),
+    keys.string.pmReviewLock(hash.task_id),
+  ]);
+  const taskArgs = hashes.flatMap((hash) => [
+    hash.task_id,
+    hash.plan_id ?? '',
+    hash.done_at ?? '',
+    hash.pm_review_status ?? '',
+    hash.resolution_status ?? '',
+    hash.project_path ?? '',
+    locks.get(hash.task_id)?.token ?? '',
+  ]);
+  const guardKeys = (planBatch?.previewGuards ?? []).map((hash) => keys.hash.task(hash.task_id));
+  const guardArgs = (planBatch?.previewGuards ?? []).flatMap((hash) => [
+    hash.task_id,
+    hash.plan_id ?? '',
+    hash.status ?? '',
+    hash.done_at ?? '',
+    hash.pm_review_status ?? '',
+    hash.resolution_status ?? '',
+    hash.depends_on ?? '',
+    hash.superseded_at ?? '',
+    hash.supersede_preview_token ?? '',
+  ]);
+  const revisionArgs = (planBatch?.planRevisionGuards ?? []).flat();
+  const result = (await redis.eval(
+    COMMIT_SUPERSEDE_BATCH,
+    12 + dynamicKeys.length + guardKeys.length,
+    keys.zset.status.done,
+    keys.zset.status.superseded,
+    keys.reviewRequested.pending,
+    keys.reviewRequested.fired,
+    keys.reviewRequested.eventByTask,
+    keys.acceptanceReady.fired,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    keys.stream.events,
+    keys.string.planSupersedeLock(planBatch?.planId ?? ''),
+    ...dynamicKeys,
+    ...guardKeys,
+    String(hashes.length),
+    String(now),
+    reason,
+    supersededBy,
+    planBatch?.planId ?? '',
+    planBatch?.previewToken ?? '',
+    planBatch?.planLockToken ?? '',
+    String(guardKeys.length),
+    String(planBatch?.planRevisionGuards.length ?? 0),
+    String(planBatch?.planCount ?? 0),
+    ...taskArgs,
+    ...guardArgs,
+    ...revisionArgs,
+  )) as string[];
+  const outcome = String(result?.[0] ?? 'UNKNOWN');
+  if (outcome !== 'COMMITTED') {
+    return outcome.includes('LOCK') ? 'LOCK_LOST' : 'ROUND_CHANGED';
   }
 
   for (const hash of hashes) {
     await persistTaskFromRedis(redis, hash.task_id);
     await withdrawReviewDoorbell(redis, hash.task_id, reviewEvents.get(hash.task_id) ?? '');
   }
+  return 'COMMITTED';
 }
 
 /**
@@ -3717,11 +5718,11 @@ export async function supersedeTask(
 ): Promise<ApiResponse<{ task_id: string; status: string; dependent_task_ids?: string[] }>> {
   const invalid = supersedeValidation(req);
   if (invalid) return { ok: false, data: null, error: invalid };
-  const lockToken = await acquirePmReviewLock(redis, taskId);
-  if (!lockToken) {
+  const decisionLock = await acquirePmReviewLock(redis, taskId);
+  if (!decisionLock) {
     return { ok: false, data: null, error: { code: 'TASK_SUPERSEDE_IN_PROGRESS', message: `任务 ${taskId} 正在执行另一条 PM 决策。` } };
   }
-  try {
+  return runWithPmDecisionLockCleanup(redis, taskId, decisionLock, async () => {
     const hash = await redis.hgetall(keys.hash.task(taskId));
     if (!hash.task_id) {
       return { ok: false, data: null, error: { code: 'TASK_NOT_FOUND', message: `任务不存在：${taskId}` } };
@@ -3765,11 +5766,19 @@ export async function supersedeTask(
         },
       };
     }
-    await applySupersedeBatch(redis, [hash], req);
+    const outcome = await applySupersedeBatch(redis, [hash], req, new Map([[taskId, decisionLock]]));
+    if (outcome !== 'COMMITTED') {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'TASK_SUPERSEDE_ROUND_CHANGED',
+          message: `任务 ${taskId} 的锁或交付轮次已变化；旧 supersede 未写入，请重新检查。`,
+        },
+      };
+    }
     return { ok: true, data: { task_id: taskId, status: 'superseded' } };
-  } finally {
-    await redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.pmReviewLock(taskId), lockToken);
-  }
+  });
 }
 
 function stableSupersedeToken(value: unknown): string {
@@ -3779,7 +5788,14 @@ function stableSupersedeToken(value: unknown): string {
 async function buildPlanSupersedePreview(
   redis: Redis,
   planId: string,
-): Promise<{ planExists: boolean; preview: PlanSupersedePreview; candidates: Record<string, string>[] }> {
+): Promise<{
+  planExists: boolean;
+  preview: PlanSupersedePreview;
+  candidates: Record<string, string>[];
+  previewGuards: Record<string, string>[];
+  planRevisionGuards: Array<[string, string]>;
+  planCount: number;
+}> {
   const plan = await redis.hgetall(keys.hash.plan(planId));
   const allTasks = await allTaskHashes(redis);
   const planTasks = allTasks
@@ -3823,7 +5839,7 @@ async function buildPlanSupersedePreview(
       done_at: task.done_at ?? '',
       pm_review_status: task.pm_review_status ?? '',
       resolution_status: task.resolution_status ?? '',
-      depends_on: (task.depends_on ?? '').split(',').filter(Boolean).sort(),
+      depends_on: task.depends_on ?? '',
       superseded_at: task.superseded_at ?? '',
       supersede_preview_token: task.supersede_preview_token ?? '',
       supersede_batch_size: task.supersede_batch_size ?? '',
@@ -3835,7 +5851,30 @@ async function buildPlanSupersedePreview(
     blockers,
     preview_token: stableSupersedeToken({ plan_id: planId, tasks: snapshotTasks, blockers }),
   };
-  return { planExists: Boolean(plan.plan_id), preview, candidates };
+  const previewGuardIds = new Set(snapshotTasks.map((task) => task.task_id));
+  const previewGuards = allTasks
+    .filter((task) => previewGuardIds.has(task.task_id))
+    .sort((left, right) => left.task_id.localeCompare(right.task_id));
+  const projectionPlanIds = (await redis.smembers(keys.planStatusProjection.planIds)).sort();
+  const planRevisionGuards = projectionPlanIds.map((projectionPlanId) => [
+    projectionPlanId,
+    '',
+  ] as [string, string]);
+  if (planRevisionGuards.length > 0) {
+    const revisions = await redis.hmget(
+      keys.planStatusProjection.revisionByPlan,
+      ...planRevisionGuards.map(([projectionPlanId]) => projectionPlanId),
+    );
+    planRevisionGuards.forEach((guard, index) => { guard[1] = revisions[index] ?? ''; });
+  }
+  return {
+    planExists: Boolean(plan.plan_id),
+    preview,
+    candidates,
+    previewGuards,
+    planRevisionGuards,
+    planCount: projectionPlanIds.length,
+  };
 }
 
 /** 只读预览：列出会退出的 task、所有阻塞项和绑定当前状态的 SHA-256 token。 */
@@ -3865,11 +5904,14 @@ export async function supersedePlan(
     return { ok: false, data: null, error: { code: 'PLAN_SUPERSEDE_PREVIEW_REQUIRED', message: '必须提供 preview 返回的 64 位 preview_token。' } };
   }
   const planLockToken = randomUUID();
-  const acquiredPlan = await redis.set(keys.string.planSupersedeLock(planId), planLockToken, 'PX', 30_000, 'NX');
+  const planLockKey = keys.string.planSupersedeLock(planId);
+  const acquiredPlan = await redis.set(planLockKey, planLockToken, 'PX', 30_000, 'NX');
   if (acquiredPlan !== 'OK') {
     return { ok: false, data: null, error: { code: 'PLAN_SUPERSEDE_IN_PROGRESS', message: `Plan ${planId} 正在执行另一条 supersede 决策。` } };
   }
-  const taskLocks: Array<{ taskId: string; token: string }> = [];
+  const planLease = startBackfillLockRenewal(redis, planLockKey, planLockToken, 30_000);
+  const taskLocks: Array<{ taskId: string; lock: PmDecisionLock }> = [];
+  let primaryFailure: unknown;
   try {
     const initial = await buildPlanSupersedePreview(redis, planId);
     if (!initial.planExists) {
@@ -3919,12 +5961,13 @@ export async function supersedePlan(
         },
       };
     }
-    for (const taskId of initial.preview.candidate_task_ids) {
-      const token = await acquirePmReviewLock(redis, taskId);
-      if (!token) {
+    // 所有 plan 都按 task_id 全序获取共享 PM 决策锁；并发批次不会形成 AB/BA 死锁。
+    for (const taskId of [...initial.preview.candidate_task_ids].sort()) {
+      const lock = await acquirePmReviewLock(redis, taskId);
+      if (!lock) {
         return { ok: false, data: null, error: { code: 'PLAN_SUPERSEDE_TASK_BUSY', message: `任务 ${taskId} 正在执行另一条 PM 决策。` } };
       }
-      taskLocks.push({ taskId, token });
+      taskLocks.push({ taskId, lock });
     }
     const current = await buildPlanSupersedePreview(redis, planId);
     if (current.preview.preview_token !== req.preview_token) {
@@ -3952,7 +5995,30 @@ export async function supersedePlan(
     if (current.candidates.length === 0) {
       return { ok: false, data: null, error: { code: 'PLAN_SUPERSEDE_EMPTY', message: `Plan ${planId} 没有 done + pending review 候选。` } };
     }
-    await applySupersedeBatch(redis, current.candidates, req, { planId, previewToken: req.preview_token });
+    const outcome = await applySupersedeBatch(
+      redis,
+      current.candidates,
+      req,
+      new Map(taskLocks.map(({ taskId, lock }) => [taskId, lock])),
+      {
+        planId,
+        previewToken: req.preview_token,
+        planLockToken,
+        previewGuards: current.previewGuards,
+        planRevisionGuards: current.planRevisionGuards,
+        planCount: current.planCount,
+      },
+    );
+    if (outcome !== 'COMMITTED') {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'PLAN_SUPERSEDE_PREVIEW_STALE',
+          message: 'Plan 锁、候选任务锁或交付轮次已变化；未应用任何修改，请重新 preview。',
+        },
+      };
+    }
     const plan = (await getPlan(redis, planId)).data as { status?: string } | null;
     return {
       ok: true,
@@ -3962,11 +6028,26 @@ export async function supersedePlan(
         status: plan?.status ?? 'cancelled',
       },
     };
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
   } finally {
-    for (const lock of taskLocks.reverse()) {
-      await redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.pmReviewLock(lock.taskId), lock.token);
+    const cleanupErrors = await cleanupPlanDecisionLocks(
+      redis,
+      planId,
+      planLockToken,
+      planLease,
+      taskLocks,
+    );
+    if (cleanupErrors.length > 0) {
+      const cleanupFailure = new AggregateError(
+        cleanupErrors,
+        `PM decision lock cleanup failed plan=${planId}`,
+      );
+      if (primaryFailure === undefined) throw cleanupFailure;
+      // finally 不能用 cleanup 错误覆盖原业务异常；记录附加故障，调用方仍收到原异常。
+      console.error(`[biao] ${cleanupFailure.message}`, cleanupFailure);
     }
-    await redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.planSupersedeLock(planId), planLockToken);
   }
 }
 
@@ -4018,6 +6099,54 @@ export async function taskReset(
   redis: Redis,
   taskId: string,
   req: { force?: boolean; reset_by?: string },
+): Promise<ApiResponse<{ task_id: string; from_status: string; to_status: string }>> {
+  const decisionLock = await acquirePmReviewLock(redis, taskId);
+  if (!decisionLock) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'TASK_DECISION_IN_PROGRESS', message: `任务 ${taskId} 正在执行另一条 PM 决策，请稍后重试。` },
+    };
+  }
+  return runWithPmDecisionLockCleanup(redis, taskId, decisionLock, async () => {
+    return await taskResetLocked(redis, taskId, req, decisionLock.token);
+  });
+}
+
+const COMMIT_TASK_RESET = `
+-- commit-task-reset-round-cas-v1
+local task_id = ARGV[1]
+local field_count = tonumber(ARGV[8]) or 0
+if redis.call('GET', KEYS[13]) ~= ARGV[9 + field_count * 2] then return {'LOCK_LOST'} end
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_NOT_FOUND'} end
+if (redis.call('HGET', KEYS[1], 'status') or '') ~= ARGV[2] or
+   (redis.call('HGET', KEYS[1], 'pm_review_status') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'resolution_status') or '') ~= ARGV[4] or
+   (redis.call('HGET', KEYS[1], 'done_at') or '') ~= ARGV[5] then
+  return {'ROUND_CHANGED'}
+end
+for index = 9, 8 + field_count * 2, 2 do
+  redis.call('HSET', KEYS[1], ARGV[index], ARGV[index + 1])
+end
+redis.call('ZREM', KEYS[2], task_id)
+redis.call('SREM', KEYS[3], task_id)
+redis.call('HDEL', KEYS[4], task_id)
+redis.call('DEL', KEYS[5])
+redis.call('ZREM', KEYS[6], task_id)
+redis.call('ZADD', KEYS[7], tonumber(ARGV[7]), task_id)
+redis.call('SADD', KEYS[8], ARGV[6])
+redis.call('SADD', KEYS[9], task_id)
+redis.call('HINCRBY', KEYS[10], ARGV[6], 1)
+redis.call('SADD', KEYS[11], ARGV[6])
+redis.call('ZREM', KEYS[12], task_id)
+return {'COMMITTED'}
+`;
+
+async function taskResetLocked(
+  redis: Redis,
+  taskId: string,
+  req: { force?: boolean; reset_by?: string },
+  lockToken: string,
 ): Promise<ApiResponse<{ task_id: string; from_status: string; to_status: string }>> {
   const hash = await redis.hgetall(keys.hash.task(taskId));
   if (!hash.task_id) {
@@ -4083,28 +6212,12 @@ export async function taskReset(
 
   const now = Date.now();
 
-  // 当前 review 轮次被 reset 后必须清空持续待办和门铃去重。下次重新 done 会产生
-  // 新 event_id，不能被上一轮已经 ack 的 event_id 静音。
-  await redis.zrem(keys.reviewRequested.pending, taskId);
-  await redis.srem(keys.reviewRequested.fired, taskId);
-  await redis.hdel(keys.reviewRequested.eventByTask, taskId);
-
-  // 1. 删除 lease
-  await redis.del(keys.string.lease(taskId));
-
-  // 2. 从当前状态 zset 移除
+  // 当前 review 轮次清理、lease/status 真相和 projection dirty 必须同一次提交。
+  // 任一后续 SQLite/ownership/event 步骤失败都不得让 summary 永久停在 reset 前。
   const fromZset = (keys.zset.status as Record<string, string>)[fromStatus];
-  if (fromZset) {
-    await redis.zrem(fromZset, taskId);
-  }
-
-  // 3. 添加到 pending zset
   const priority = Number(hash.priority ?? 5);
   const score = pendingScore(priority, now);
-  await redis.zadd(keys.zset.status.pending, score, taskId);
-
-  // 4. 更新 task hash + 审计字段
-  await redis.hset(keys.hash.task(taskId), {
+  const resetFields = {
     status: 'pending',
     claimed_by: '',
     claimed_at: '',
@@ -4117,9 +6230,12 @@ export async function taskReset(
     pm_reviewed_by: '',
     pm_reviewed_at: '',
     pm_review_comment: '',
+    pm_accept_effects_applied: '',
     pm_reject_reason: '',
     pm_fix_instructions: '',
     pm_rejection_resolution_mode: '',
+    pm_repair_ownership_required: '',
+    pm_repair_ownership_intent: '',
     failed_reason: '',
     resolution_status: '',
     resolution_action: '',
@@ -4138,7 +6254,45 @@ export async function taskReset(
     reset_at: String(now),
     reset_by: req.reset_by ?? 'pm',
     reset_from_status: fromStatus,
-  });
+  };
+  const resetFlatFields = Object.entries(resetFields).flatMap(([field, value]) => [field, String(value)]);
+  const resetOutcome = (await redis.eval(
+    COMMIT_TASK_RESET,
+    13,
+    keys.hash.task(taskId),
+    keys.reviewRequested.pending,
+    keys.reviewRequested.fired,
+    keys.reviewRequested.eventByTask,
+    keys.string.lease(taskId),
+    fromZset ?? keys.zset.status.pending,
+    keys.zset.status.pending,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(hash.plan_id),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    keys.string.pmReviewLock(taskId),
+    taskId,
+    fromStatus,
+    hash.pm_review_status ?? '',
+    hash.resolution_status ?? '',
+    hash.done_at ?? '',
+    hash.plan_id,
+    String(score),
+    String(resetFlatFields.length / 2),
+    ...resetFlatFields,
+    lockToken,
+  )) as string[];
+  if (String(resetOutcome?.[0] ?? '') !== 'COMMITTED') {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        code: 'TASK_RESET_ROUND_CHANGED',
+        message: `任务 ${taskId} 在 reset 提交前已进入新的状态或验收轮次，请重新读取后再操作。`,
+      },
+    };
+  }
   sqliteStore?.updateTaskFields(taskId, {
     status: 'pending',
     claimed_by: '',
@@ -4152,9 +6306,12 @@ export async function taskReset(
     pm_reviewed_by: '',
     pm_reviewed_at: '',
     pm_review_comment: '',
+    pm_accept_effects_applied: '',
     pm_reject_reason: '',
     pm_fix_instructions: '',
     pm_rejection_resolution_mode: '',
+    pm_repair_ownership_required: '',
+    pm_repair_ownership_intent: '',
     failure_reason: '',
     resolution_status: '',
     resolution_action: '',
@@ -4231,11 +6388,13 @@ export async function cancelTask(redis: Redis, taskId: string): Promise<ApiRespo
     };
   }
 
-  // 检查是否被其他 pending/running task 依赖
+  // 检查是否被其他 pending/running/blocked task 依赖。waiting_dependency 已经释放
+  // 旧 claim 但仍是活跃下游；漏掉它会允许取消前置并制造永久无法满足的 blocked。
   const pendingIds = await redis.zrange(keys.zset.status.pending, 0, -1);
   const runningIds = await redis.zrange(keys.zset.status.running, 0, -1);
+  const blockedIds = await redis.zrange(keys.zset.status.blocked, 0, -1);
   const dependents: string[] = [];
-  for (const otherId of [...pendingIds, ...runningIds]) {
+  for (const otherId of [...new Set([...pendingIds, ...runningIds, ...blockedIds])]) {
     if (otherId === taskId) continue;
     const depRaw = await redis.hget(keys.hash.task(otherId), 'depends_on');
     if (depRaw && depRaw.split(',').filter(Boolean).includes(taskId)) {
@@ -4253,11 +6412,22 @@ export async function cancelTask(redis: Redis, taskId: string): Promise<ApiRespo
     };
   }
 
-  // 执行撤销：移出 pending zset + 标记 cancelled（保留 hash 作审计）
+  // 执行撤销：status/zset 与 plan projection 同一 MULTI；后续 SQLite 或 repair
+  // 决策失败不会留下“已取消但 aggregate 仍是 active”的崩溃窗口。
   const cancelledAt = Date.now();
-  await redis.zrem(keys.zset.status.pending, taskId);
-  await redis.zadd(keys.zset.status.cancelled, cancelledAt, taskId);
-  await redis.hset(keys.hash.task(taskId), 'status', 'cancelled', 'cancelled_at', String(cancelledAt));
+  const cancelTx = redis.multi();
+  cancelTx.zrem(keys.zset.status.pending, taskId);
+  cancelTx.zadd(keys.zset.status.cancelled, cancelledAt, taskId);
+  cancelTx.hset(keys.hash.task(taskId), 'status', 'cancelled', 'cancelled_at', String(cancelledAt));
+  cancelTx.sadd(keys.planStatusProjection.planIds, hash.plan_id);
+  cancelTx.sadd(keys.planStatusProjection.taskIdsByPlan(hash.plan_id), taskId);
+  cancelTx.hincrby(keys.planStatusProjection.revisionByPlan, hash.plan_id, 1);
+  cancelTx.sadd(keys.planStatusProjection.dirtyPlans, hash.plan_id);
+  cancelTx.zrem(keys.intakeActionableFailed.pending, taskId);
+  const cancelOutcomes = await cancelTx.exec();
+  if (!cancelOutcomes || cancelOutcomes.some(([error]) => error)) {
+    throw new Error(`任务 ${taskId} 的 cancel 真相与 plan projection 未能原子提交`);
+  }
   // SQLite 双写：cancel 时 status → cancelled
   if (sqliteStore) {
     sqliteStore.updateTaskFields(taskId, { status: 'cancelled', cancelled_at: String(cancelledAt) });
@@ -4379,7 +6549,9 @@ function generateQuestionId(): string {
  * 幂等命中、ownership 释放、状态迁移和门铃写入收敛为一个 Redis 原子单元。
  *
  * KEYS: task, lease, open pointer, open-pointer metadata, new question, running zset,
- *       blocked zset, agent, events stream, file ownership hash, owner-by-agent set
+ *       blocked zset, agent, events stream, file ownership hash, owner-by-agent set,
+ *       plan registry, plan task registry, plan revision hash, dirty-plan set,
+ *       actionable-failed zset
  */
 const CREATE_QUESTION_CAS = `
 local task_id = ARGV[1]
@@ -4425,6 +6597,9 @@ end
 
 if redis.call('HGET', KEYS[1], 'task_id') == false then
   return {'TASK_NOT_FOUND'}
+end
+if (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id then
+  return {'PLAN_CHANGED'}
 end
 local task_status = redis.call('HGET', KEYS[1], 'status') or ''
 if task_status ~= 'running' then
@@ -4487,7 +6662,14 @@ redis.call('HSET', KEYS[1],
   'expire_at', '')
 redis.call('ZREM', KEYS[6], task_id)
 redis.call('ZADD', KEYS[7], tonumber(now), task_id)
-redis.call('HSET', KEYS[8], 'status', 'idle', 'current_task', '')
+if (redis.call('HGET', KEYS[8], 'current_task') or '') == task_id then
+  redis.call('HSET', KEYS[8], 'status', 'idle', 'current_task', '')
+end
+redis.call('SADD', KEYS[12], plan_id)
+redis.call('SADD', KEYS[13], task_id)
+redis.call('HINCRBY', KEYS[14], plan_id, 1)
+redis.call('SADD', KEYS[15], plan_id)
+redis.call('ZREM', KEYS[16], task_id)
 redis.call('XADD', KEYS[9], '*',
   'event_id', event_id,
   'type', 'question_asked',
@@ -4539,7 +6721,7 @@ export async function createQuestion(
   }
   const raw = (await redis.eval(
     CREATE_QUESTION_CAS,
-    11,
+    16,
     keys.hash.task(taskId),
     keys.string.lease(taskId),
     keys.question.openByTask(taskId),
@@ -4551,6 +6733,11 @@ export async function createQuestion(
     keys.stream.events,
     keys.hash.fileOwnership,
     keys.set.ownerByAgent(agentId),
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(planId),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
     taskId,
     agentId,
     req.claim_token,
@@ -4571,11 +6758,13 @@ export async function createQuestion(
     CLAIM_OWNER_MISMATCH: { code: 'CLAIM_OWNER_MISMATCH', message: '任务不属于当前 Worker' },
     LEASE_EXPIRED: { code: 'LEASE_EXPIRED', message: '租约已失效，无法提问（请重新 claim）' },
     CLAIM_TOKEN_INVALID: { code: 'CLAIM_TOKEN_INVALID', message: '仅原持有 Worker 可用原 claim_token 幂等重试' },
+    PLAN_CHANGED: { code: 'TASK_STATE_CONFLICT', message: '任务的 plan 绑定已变化，拒绝创建 Question' },
   };
   if (errors[outcome]) return { ok: false, data: null, error: errors[outcome] };
 
   // 首次创建与同 token 的幂等重放都从 Redis 最终态补偿 SQLite；重放绝不使用本次 body
   // 覆盖首个问题，但能修复“Redis 已提交、首次 SQLite 双写恰好失败”的短暂故障。
+  await persistTaskFromRedis(redis, taskId);
   await reconcileQuestionSqlite(redis, resolvedQuestionId, taskId);
 
   const question = await redis.hgetall(keys.hash.question(resolvedQuestionId));
@@ -4732,8 +6921,10 @@ async function reconcileQuestionSqlite(redis: Redis, questionId: string, fallbac
  * 状态，两个 Fastify 请求交错时会互相覆盖 watch 集。Lua 在 Redis 内一次执行完状态检查和所有写入，
  * 因而并发不同答案只能有一个胜出；相同答案则可靠地幂等重放。
  *
- * KEYS: question hash, task hash, open-question pointer, open-pointer metadata, blocked zset, pending zset, task stream, event stream
- * ARGV: question id, consumer, answer, timestamp, default PM consumer
+ * KEYS: question hash, task hash, open-question pointer, open-pointer metadata, blocked zset,
+ * pending zset, task stream, event stream, plan registry, plan task registry,
+ * plan revision hash, dirty-plan set, actionable-failed zset
+ * ARGV: question id, consumer, answer, timestamp, default PM consumer, expected plan id
  */
 const ANSWER_QUESTION_CAS = `
 local question_id = ARGV[1]
@@ -4741,6 +6932,7 @@ local consumer = ARGV[2]
 local answer = ARGV[3]
 local now = ARGV[4]
 local default_consumer = ARGV[5]
+local expected_plan_id = ARGV[6]
 
 if redis.call('HGET', KEYS[1], 'question_id') == false then
   return {'QUESTION_NOT_FOUND'}
@@ -4781,6 +6973,9 @@ if task_status ~= 'blocked' or (redis.call('HGET', KEYS[2], 'blocked_question_id
   return {'TASK_STATE_CONFLICT', task_id, task_status}
 end
 
+local plan_id = redis.call('HGET', KEYS[1], 'plan_id') or redis.call('HGET', KEYS[2], 'plan_id') or ''
+if plan_id ~= expected_plan_id then return {'PLAN_CHANGED', task_id} end
+
 redis.call('HSET', KEYS[1], 'status', 'answered', 'answered_at', now, 'answered_by', consumer, 'answer', answer)
 if redis.call('GET', KEYS[3]) == question_id then
   redis.call('DEL', KEYS[3])
@@ -4789,7 +6984,6 @@ end
 
 local priority = tonumber(redis.call('HGET', KEYS[2], 'priority') or '5')
 local score = priority * 10000000000000 - tonumber(now)
-local plan_id = redis.call('HGET', KEYS[1], 'plan_id') or redis.call('HGET', KEYS[2], 'plan_id') or ''
 redis.call('HSET', KEYS[2],
   'status', 'pending',
   'block_reason', '',
@@ -4803,6 +6997,11 @@ redis.call('HSET', KEYS[2],
   'last_question_answer', answer)
 redis.call('ZREM', KEYS[5], task_id)
 redis.call('ZADD', KEYS[6], score, task_id)
+redis.call('SADD', KEYS[9], plan_id)
+redis.call('SADD', KEYS[10], task_id)
+redis.call('HINCRBY', KEYS[11], plan_id, 1)
+redis.call('SADD', KEYS[12], plan_id)
+redis.call('ZREM', KEYS[13], task_id)
 redis.call('XADD', KEYS[7], '*', 'task_id', task_id, 'priority', tostring(priority))
 redis.call('XADD', KEYS[8], '*',
   'event_id', now .. '_question_answered_' .. question_id,
@@ -4849,7 +7048,7 @@ export async function answerQuestion(
   }
   const raw = (await redis.eval(
     ANSWER_QUESTION_CAS,
-    8,
+    13,
     keys.hash.question(questionId),
     keys.hash.task(boundTaskId),
     keys.question.openByTask(boundTaskId),
@@ -4858,11 +7057,17 @@ export async function answerQuestion(
     keys.zset.status.pending,
     keys.stream.tasks,
     keys.stream.events,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(questionBefore.plan_id ?? ''),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
     questionId,
     consumer,
     answer,
     String(now),
     DEFAULT_PM_CONSUMER,
+    questionBefore.plan_id ?? '',
   )) as string[];
   const [outcome, taskId = ''] = raw.map(String);
 
@@ -4873,12 +7078,14 @@ export async function answerQuestion(
     ANSWER_CONFLICT: { code: 'ANSWER_CONFLICT', message: '该 Question 已被回答，冲突回答被拒绝' },
     TASK_NOT_FOUND: { code: 'TASK_NOT_FOUND', message: `任务不存在：${taskId}` },
     TASK_STATE_CONFLICT: { code: 'TASK_STATE_CONFLICT', message: '任务已不处于该 Question 对应的 blocked 状态，拒绝覆盖其后续状态' },
+    PLAN_CHANGED: { code: 'TASK_STATE_CONFLICT', message: 'Question 与任务的 plan 绑定已变化，拒绝恢复任务' },
   };
   if (errors[outcome]) return { ok: false, data: null, error: errors[outcome] };
 
   // Lua 已写 Redis。包括 IDEMPOTENT 在内都重放 SQLite 副本：首次 Redis 成功但 SQLite 暂时失败时，
   // 同答案重试可补齐持久化；冲突回答在 Lua 层被拒，绝不会覆盖已存答案。
   if (outcome === 'ANSWERED' || outcome === 'TERMINAL_ANSWERED' || outcome === 'IDEMPOTENT') {
+    await persistTaskFromRedis(redis, taskId);
     await reconcileQuestionSqlite(redis, questionId, taskId);
   }
 
@@ -4914,8 +7121,11 @@ local reason = ARGV[4]
 local question_id = ARGV[5]
 local now = ARGV[6]
 local condition_clear = ARGV[7] == '1'
+local expected_plan_id = ARGV[8]
 
 if redis.call('HGET', KEYS[1], 'task_id') == false then return {'TASK_NOT_FOUND'} end
+local plan_id = redis.call('HGET', KEYS[1], 'plan_id') or ''
+if plan_id ~= expected_plan_id then return {'TASK_NOT_FOUND'} end
 if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'running' then
   return {'TASK_NOT_RUNNING', redis.call('HGET', KEYS[1], 'status') or ''}
 end
@@ -4960,7 +7170,14 @@ if condition_clear then
   redis.call('ZREM', KEYS[4], task_id)
   redis.call('ZADD', KEYS[9], score, task_id)
   redis.call('XADD', KEYS[10], '*', 'task_id', task_id, 'priority', tostring(priority))
-  redis.call('HSET', KEYS[5], 'status', 'idle', 'current_task', '')
+  if (redis.call('HGET', KEYS[5], 'current_task') or '') == task_id then
+    redis.call('HSET', KEYS[5], 'status', 'idle', 'current_task', '')
+  end
+  redis.call('SADD', KEYS[11], plan_id)
+  redis.call('SADD', KEYS[12], task_id)
+  redis.call('HINCRBY', KEYS[13], plan_id, 1)
+  redis.call('SADD', KEYS[14], plan_id)
+  redis.call('ZREM', KEYS[15], task_id)
   redis.call('XADD', KEYS[6], '*',
     'event_id', now .. '_' .. event_type .. '_' .. task_id,
     'type', event_type,
@@ -4982,7 +7199,14 @@ redis.call('HSET', KEYS[1],
   'expire_at', '')
 redis.call('ZREM', KEYS[3], task_id)
 redis.call('ZADD', KEYS[4], tonumber(now), task_id)
-redis.call('HSET', KEYS[5], 'status', 'idle', 'current_task', '')
+if (redis.call('HGET', KEYS[5], 'current_task') or '') == task_id then
+  redis.call('HSET', KEYS[5], 'status', 'idle', 'current_task', '')
+end
+redis.call('SADD', KEYS[11], plan_id)
+redis.call('SADD', KEYS[12], task_id)
+redis.call('HINCRBY', KEYS[13], plan_id, 1)
+redis.call('SADD', KEYS[14], plan_id)
+redis.call('ZREM', KEYS[15], task_id)
 redis.call('XADD', KEYS[6], '*',
   'event_id', now .. '_task_blocked_' .. task_id,
   'type', 'task_blocked',
@@ -5060,7 +7284,7 @@ async function blockTaskWithEligibilityCheck(
         const tx = isolated.multi();
         tx.eval(
           TASK_BLOCK_CAS,
-          10,
+          15,
           taskKey,
           keys.string.lease(taskId),
           keys.zset.status.running,
@@ -5071,6 +7295,11 @@ async function blockTaskWithEligibilityCheck(
           keys.set.ownerByAgent(agentId),
           keys.zset.status.pending,
           keys.stream.tasks,
+          keys.planStatusProjection.planIds,
+          keys.planStatusProjection.taskIdsByPlan(current.plan_id ?? ''),
+          keys.planStatusProjection.revisionByPlan,
+          keys.planStatusProjection.dirtyPlans,
+          keys.intakeActionableFailed.pending,
           taskId,
           agentId,
           req.claim_token,
@@ -5078,6 +7307,7 @@ async function blockTaskWithEligibilityCheck(
           req.question_id ?? '',
           String(now),
           conditionClear ? '1' : '0',
+          current.plan_id ?? '',
         );
         const committed = await tx.exec();
         if (committed === null) continue;
@@ -5206,6 +7436,11 @@ async function requeueBlockedEligible(
         });
         tx.zrem(keys.zset.status.blocked, taskId);
         tx.zadd(keys.zset.status.pending, pendingScore(priority, now), taskId);
+        tx.sadd(keys.planStatusProjection.planIds, current.plan_id ?? '');
+        tx.sadd(keys.planStatusProjection.taskIdsByPlan(current.plan_id ?? ''), taskId);
+        tx.hincrby(keys.planStatusProjection.revisionByPlan, current.plan_id ?? '', 1);
+        tx.sadd(keys.planStatusProjection.dirtyPlans, current.plan_id ?? '');
+        tx.zrem(keys.intakeActionableFailed.pending, taskId);
         tx.xadd(keys.stream.tasks, '*', 'task_id', taskId, 'priority', String(priority));
         // worker 门铃只提供重新领取所需的定位信息；实际任务内容仍由 /claim 读取。
         tx.xadd(
@@ -5295,7 +7530,11 @@ async function reconcileBlockedWaiters(redis: Redis): Promise<RuntimeReconciliat
  * repair resolution 才会放开普通下游；这样普通代码不会绕过 PM 验收，而验收任务也
  * 不会反向卡住自身。
  */
-async function wakeDependents(redis: Redis, completedTaskId: string, opts: { allowAcceptance?: boolean } = {}): Promise<void> {
+async function wakeDependents(
+  redis: Redis,
+  completedTaskId: string,
+  opts: { allowAcceptance?: boolean } = {},
+): Promise<string[]> {
   const pendingIds = await redis.zrange(keys.zset.status.pending, 0, -1);
   for (const pendingId of pendingIds) {
     const pendingHash = await redis.hgetall(keys.hash.task(pendingId));
@@ -5331,7 +7570,7 @@ async function wakeDependents(redis: Redis, completedTaskId: string, opts: { all
       }
     }
   }
-  await requeueDependencyWaiters(redis, completedTaskId);
+  return requeueDependencyWaiters(redis, completedTaskId);
 }
 
 export async function taskBlock(
@@ -5428,6 +7667,11 @@ export async function taskResume(
   });
   tx.zrem(keys.zset.status.blocked, taskId);
   tx.zadd(keys.zset.status.pending, pendingScore(priority, now), taskId);
+  tx.sadd(keys.planStatusProjection.planIds, hash.plan_id ?? '');
+  tx.sadd(keys.planStatusProjection.taskIdsByPlan(hash.plan_id ?? ''), taskId);
+  tx.hincrby(keys.planStatusProjection.revisionByPlan, hash.plan_id ?? '', 1);
+  tx.sadd(keys.planStatusProjection.dirtyPlans, hash.plan_id ?? '');
+  tx.zrem(keys.intakeActionableFailed.pending, taskId);
   tx.xadd(keys.stream.tasks, '*', 'task_id', taskId, 'priority', String(priority));
   tx.xadd(
     keys.stream.events,
@@ -5445,8 +7689,11 @@ export async function taskResume(
     'timestamp',
     String(now),
   );
-  await tx.exec();
-
+  const resumeOutcomes = await tx.exec();
+  if (!resumeOutcomes || resumeOutcomes.some(([error]) => error)) {
+    await redis.del(keys.planStatusProjection.ready).catch(() => undefined);
+    throw new Error(`任务 ${taskId} 的 resume 状态提交失败`);
+  }
   // SQLite 双写
   if (sqliteStore) {
     sqliteStore.updateTaskFields(taskId, {
@@ -5568,6 +7815,8 @@ export async function getReviewInfo(
       resolution_attempts: Number(hash.resolution_attempts ?? 0),
       resolution_decision_reason: hash.resolution_decision_reason ?? '',
       repair_ownership_extension: parseRepairOwnershipAudit(hash.repair_ownership_extension),
+      pm_repair_ownership_required: hash.pm_repair_ownership_required === 'true',
+      pm_repair_ownership_intent: parseRepairOwnershipAudit(hash.pm_repair_ownership_intent),
       result_md: resultMd,
       result_json: resultJson,
       changed_files: (resultJson.changed_files as string[]) ?? [],
@@ -5597,25 +7846,187 @@ type PmReviewResponse = ApiResponse<{
 }>;
 
 const RELEASE_PM_REVIEW_LOCK = `
+-- release-pm-review-lock-v1
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
 `;
 
+interface PmDecisionLock {
+  token: string;
+  lease: BackfillLockLease;
+}
+
+/**
+ * PM review 的最终提交边界。外层短锁负责正常请求串行；这里仍按 done_at + status +
+ * review/resolution 快照做 CAS，防锁过期、管理员修复或其它非锁写路径让旧验收跨轮次落盘。
+ */
+const COMMIT_PM_REVIEW_AUDIT = `
+-- commit-pm-review-round-cas-v1
+local task_id = ARGV[1]
+local plan_id = ARGV[2]
+local field_count = tonumber(ARGV[7]) or 0
+if redis.call('GET', KEYS[9]) ~= ARGV[8 + field_count * 2] then return {'LOCK_LOST'} end
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_NOT_FOUND'} end
+if (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= 'done' or
+   (redis.call('HGET', KEYS[1], 'done_at') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'pm_review_status') or '') ~= ARGV[4] or
+   (redis.call('HGET', KEYS[1], 'resolution_status') or '') ~= ARGV[5] then
+  return {'ROUND_CHANGED'}
+end
+for index = 8, 7 + field_count * 2, 2 do
+  redis.call('HSET', KEYS[1], ARGV[index], ARGV[index + 1])
+end
+redis.call('ZREM', KEYS[2], task_id)
+redis.call('ZADD', KEYS[3], tonumber(ARGV[6]), task_id)
+redis.call('SADD', KEYS[4], plan_id)
+redis.call('SADD', KEYS[5], task_id)
+redis.call('HINCRBY', KEYS[6], plan_id, 1)
+redis.call('SADD', KEYS[7], plan_id)
+redis.call('ZREM', KEYS[8], task_id)
+return {'COMMITTED'}
+`;
+
+async function commitPmReviewAudit(
+  redis: Redis,
+  taskId: string,
+  snapshot: Record<string, string>,
+  now: number,
+  fields: Record<string, string>,
+  lockToken: string,
+): Promise<boolean> {
+  const flatFields = Object.entries(fields).flat();
+  const result = (await redis.eval(
+    COMMIT_PM_REVIEW_AUDIT,
+    9,
+    keys.hash.task(taskId),
+    keys.reviewRequested.pending,
+    keys.runtimeReconcile.pending,
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(snapshot.plan_id ?? ''),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    keys.string.pmReviewLock(taskId),
+    taskId,
+    snapshot.plan_id ?? '',
+    snapshot.done_at ?? '',
+    snapshot.pm_review_status ?? '',
+    snapshot.resolution_status ?? '',
+    String(now),
+    String(flatFields.length / 2),
+    ...flatFields,
+    lockToken,
+  )) as string[];
+  return String(result?.[0] ?? '') === 'COMMITTED';
+}
+
 /**
  * PM review 会同时写不可变审计、resolution、事件与依赖唤醒，必须按 task 串行。
  * 短锁只覆盖这段临界区；后到的网络重试等首个请求结束后重新读取真相，从而得到
  * 幂等回放或明确冲突，而不是双写 reviewer/reason/event。
  */
-async function acquirePmReviewLock(redis: Redis, taskId: string): Promise<string | null> {
+async function acquirePmReviewLock(redis: Redis, taskId: string): Promise<PmDecisionLock | null> {
   const token = randomUUID();
+  const testTtl = process.env.NODE_ENV === 'test'
+    ? Number(process.env.BIAO_TEST_PM_DECISION_LOCK_TTL_MS ?? '')
+    : Number.NaN;
+  const ttlMs = Number.isFinite(testTtl) && testTtl >= 30 ? testTtl : 30_000;
   for (let attempt = 0; attempt < 100; attempt++) {
-    const acquired = await redis.set(keys.string.pmReviewLock(taskId), token, 'PX', 30_000, 'NX');
-    if (acquired === 'OK') return token;
+    const lockKey = keys.string.pmReviewLock(taskId);
+    const acquired = await redis.set(lockKey, token, 'PX', ttlMs, 'NX');
+    if (acquired === 'OK') {
+      return { token, lease: startBackfillLockRenewal(redis, lockKey, token, ttlMs) };
+    }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
   }
   return null;
+}
+
+async function cleanupPmReviewLock(
+  redis: Redis,
+  taskId: string,
+  lock: PmDecisionLock,
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  const stopped = await Promise.allSettled([lock.lease.stop()]);
+  if (stopped[0].status === 'rejected') errors.push(stopped[0].reason);
+  const released = await Promise.allSettled([
+    redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.pmReviewLock(taskId), lock.token),
+  ]);
+  if (released[0].status === 'rejected') errors.push(released[0].reason);
+  return errors;
+}
+
+/**
+ * 单任务 PM 决策与 plan 批量决策使用相同的 cleanup 规则：
+ * - cleanup 永远尝试停止续租并释放 owner token；
+ * - 原业务异常或结构化错误返回优先，cleanup 只能作为附加故障记录；
+ * - 业务成功却未能完成 cleanup 时必须显式失败，不能谎报一次干净提交。
+ */
+async function runWithPmDecisionLockCleanup<T extends { ok: boolean }>(
+  redis: Redis,
+  taskId: string,
+  lock: PmDecisionLock,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let result: T | undefined;
+  let primaryFailure: unknown;
+  try {
+    result = await operation();
+    return result;
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    const cleanupErrors = await cleanupPmReviewLock(redis, taskId, lock);
+    if (cleanupErrors.length > 0) {
+      const cleanupFailure = new AggregateError(
+        cleanupErrors,
+        `PM decision lock cleanup failed task=${taskId}`,
+      );
+      if (primaryFailure === undefined && result?.ok === true) throw cleanupFailure;
+      console.error(`[biao] ${cleanupFailure.message}`, cleanupFailure);
+    }
+  }
+}
+
+async function cleanupPlanDecisionLocks(
+  redis: Redis,
+  planId: string,
+  planLockToken: string,
+  planLease: BackfillLockLease,
+  taskLocks: Array<{ taskId: string; lock: PmDecisionLock }>,
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  const taskStops = await Promise.allSettled(taskLocks.map(({ lock }) => lock.lease.stop()));
+  for (const stopped of taskStops) if (stopped.status === 'rejected') errors.push(stopped.reason);
+
+  // 即使某个 task renewal stop 失败，Plan renewal 也必须单独停止，不能因顺序 await
+  // 提前退出而留下一个会无限续期的 owner token。
+  const planStop = await Promise.allSettled([planLease.stop()]);
+  if (planStop[0].status === 'rejected') errors.push(planStop[0].reason);
+
+  // 所有 timer 已先停止后，再并发执行 owner-token release。任一 EVAL 失败不得阻断
+  // 其它 task 或 plan 的释放；失败锁至多等待既有 TTL，自此不会再被后台续上。
+  const releases = await Promise.allSettled([
+    ...taskLocks.map(({ taskId, lock }) => redis.eval(
+      RELEASE_PM_REVIEW_LOCK,
+      1,
+      keys.string.pmReviewLock(taskId),
+      lock.token,
+    )),
+    redis.eval(
+      RELEASE_PM_REVIEW_LOCK,
+      1,
+      keys.string.planSupersedeLock(planId),
+      planLockToken,
+    ),
+  ]);
+  for (const released of releases) if (released.status === 'rejected') errors.push(released.reason);
+  return errors;
 }
 
 export interface ResolutionDecisionRequest {
@@ -5635,6 +8046,377 @@ export interface ResolutionDecisionData {
   max_retries: number;
   available_actions: ResolutionDecisionAction[];
   created_task_ids?: string[];
+}
+
+const COMMIT_RESOLUTION_CANCEL = `
+-- commit-resolution-cancel-round-fenced-v1
+local task_id = ARGV[1]
+local plan_id = ARGV[2]
+if redis.call('GET', KEYS[7]) ~= ARGV[10] then return {'LOCK_LOST'} end
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id or
+   (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'resolution_status') or '') ~= 'needs_pm_decision' or
+   (redis.call('HGET', KEYS[1], 'resolution_generation') or '') ~= ARGV[5] or
+   (redis.call('HGET', KEYS[1], 'repair_root_task_id') or '') ~= ARGV[6] or
+   (redis.call('HGET', KEYS[1], 'resolution_decision_reason') or '') ~= ARGV[7] then
+  return {'ROUND_CHANGED'}
+end
+redis.call('HSET', KEYS[1],
+  'resolution_status', 'cancelled',
+  'resolution_action', 'cancel',
+  'resolution_decision_reason', 'cancelled:' .. ARGV[8],
+  'resolution_decided_by', ARGV[9],
+  'resolution_decided_at', ARGV[11])
+redis.call('SADD', KEYS[2], plan_id)
+redis.call('SADD', KEYS[3], task_id)
+redis.call('HINCRBY', KEYS[4], plan_id, 1)
+redis.call('SADD', KEYS[5], plan_id)
+redis.call('ZREM', KEYS[6], task_id)
+redis.call('XADD', KEYS[8], '*',
+  'event_id', ARGV[11] .. '_resolution_cancel_' .. task_id,
+  'type', 'resolution_decided',
+  'task_id', task_id,
+  'plan_id', plan_id,
+  'project_path', ARGV[12],
+  'consumer', 'worker',
+  'resolution_action', 'cancel',
+  'decided_by', ARGV[9],
+  'timestamp', ARGV[11])
+return {'COMMITTED'}
+`;
+
+const BEGIN_RESOLUTION_CONTINUE = `
+-- begin-resolution-continue-round-fenced-v1
+if redis.call('GET', KEYS[7]) ~= ARGV[8] then return {'LOCK_LOST'} end
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= ARGV[1] or
+   (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= ARGV[2] or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'resolution_status') or '') ~= 'needs_pm_decision' or
+   (redis.call('HGET', KEYS[1], 'resolution_generation') or '') ~= ARGV[5] or
+   (redis.call('HGET', KEYS[1], 'repair_root_task_id') or '') ~= ARGV[6] or
+   (redis.call('HGET', KEYS[1], 'resolution_decision_reason') or '') ~= ARGV[7] then
+  return {'ROUND_CHANGED'}
+end
+-- 先把 needs_pm_decision 原子占位为 repairing。即使 owner 随后因长暂停丢失 TTL，
+-- 后来的 cancel/continue 也不能再从旧 decision round 起步；reconcile 可按 repair 指针恢复。
+redis.call('HSET', KEYS[1],
+  'resolution_status', 'repairing',
+  'resolution_action', 'continue',
+  'resolution_continue_owner', ARGV[8],
+  'resolution_continue_snapshot_generation', ARGV[5],
+  'resolution_continue_snapshot_repair_root', ARGV[6],
+  'resolution_continue_snapshot_reason', ARGV[7],
+  'resolution_continue_snapshot_task_ids', ARGV[11],
+  'resolution_continue_snapshot_attempts', ARGV[12],
+  'resolution_decided_by', ARGV[9],
+  'resolution_decided_at', ARGV[10])
+redis.call('SADD', KEYS[2], ARGV[2])
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('HINCRBY', KEYS[4], ARGV[2], 1)
+redis.call('SADD', KEYS[5], ARGV[2])
+redis.call('ZREM', KEYS[6], ARGV[1])
+redis.call('ZADD', KEYS[8], tonumber(ARGV[10]), ARGV[1])
+return {'RESERVED'}
+`;
+
+const COMMIT_RESOLUTION_CONTINUE_AUDIT = `
+-- commit-resolution-continue-round-fenced-v1
+local task_id = ARGV[1]
+local plan_id = ARGV[2]
+if redis.call('GET', KEYS[2]) ~= ARGV[9] then return {'LOCK_LOST'} end
+local current_generation = tonumber(redis.call('HGET', KEYS[1], 'resolution_generation') or '0')
+local current_attempts = tonumber(redis.call('HGET', KEYS[1], 'resolution_attempts') or '0')
+local current_resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id or
+   (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id or
+   (redis.call('HGET', KEYS[1], 'status') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'repair_root_task_id') or '') ~= ARGV[6] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_owner') or '') ~= ARGV[9] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_generation') or '') ~= ARGV[5] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_repair_root') or '') ~= ARGV[6] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_reason') or '') ~= ARGV[7] or
+   (current_resolution ~= 'repairing' and current_resolution ~= 'required') or
+   (redis.call('HGET', KEYS[1], 'resolution_decision_reason') or '') ~= '' or
+   (current_generation <= (tonumber(ARGV[5]) or 0) and current_attempts <= (tonumber(ARGV[8]) or 0)) or
+   (redis.call('HGET', KEYS[1], 'resolution_task_id') or '') == '' then
+  return {'ROUND_CHANGED'}
+end
+redis.call('HSET', KEYS[1],
+  'resolution_decided_by', ARGV[10],
+  'resolution_decided_at', ARGV[11],
+  'resolution_decision_generation', ARGV[5])
+redis.call('XADD', KEYS[3], '*',
+  'event_id', ARGV[11] .. '_resolution_continue_' .. task_id,
+  'type', 'resolution_decided',
+  'task_id', task_id,
+  'plan_id', plan_id,
+  'project_path', ARGV[12],
+  'consumer', 'worker',
+  'resolution_action', 'continue',
+  'decided_by', ARGV[10],
+  'created_tasks', ARGV[13],
+  'timestamp', ARGV[11])
+redis.call('HDEL', KEYS[1],
+  'resolution_continue_owner',
+  'resolution_continue_snapshot_generation',
+  'resolution_continue_snapshot_repair_root',
+  'resolution_continue_snapshot_reason',
+  'resolution_continue_snapshot_task_ids',
+  'resolution_continue_snapshot_attempts')
+return {'COMMITTED'}
+`;
+
+const COMMIT_RECOVERED_RESOLUTION_CONTINUE_AUDIT = `
+-- commit-recovered-resolution-continue-audit-v1
+local owner = redis.call('HGET', KEYS[1], 'resolution_continue_owner') or ''
+if owner == '' then return {'ALREADY_COMMITTED'} end
+if owner ~= ARGV[6] or
+   (redis.call('HGET', KEYS[1], 'task_id') or '') ~= ARGV[1] or
+   (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= ARGV[2] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_generation') or '') ~= ARGV[3] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_repair_root') or '') ~= ARGV[4] or
+   (redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_reason') or '') ~= ARGV[5] then
+  return {'ROUND_CHANGED'}
+end
+local current_generation = tonumber(redis.call('HGET', KEYS[1], 'resolution_generation') or '0')
+local current_attempts = tonumber(redis.call('HGET', KEYS[1], 'resolution_attempts') or '0')
+local snapshot_attempts = tonumber(redis.call('HGET', KEYS[1], 'resolution_continue_snapshot_attempts') or '0')
+local current_resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+if (current_resolution ~= 'repairing' and current_resolution ~= 'required') or
+   (redis.call('HGET', KEYS[1], 'resolution_decision_reason') or '') ~= '' or
+   (current_generation <= (tonumber(ARGV[3]) or 0) and current_attempts <= snapshot_attempts) or
+   (redis.call('HGET', KEYS[1], 'resolution_task_id') or '') == '' then
+  return {'NOT_READY'}
+end
+redis.call('XADD', KEYS[2], '*',
+  'event_id', ARGV[8] .. '_resolution_continue_' .. ARGV[1],
+  'type', 'resolution_decided',
+  'task_id', ARGV[1],
+  'plan_id', ARGV[2],
+  'project_path', ARGV[9],
+  'consumer', 'worker',
+  'resolution_action', 'continue',
+  'decided_by', ARGV[7],
+  'created_tasks', ARGV[10],
+  'timestamp', ARGV[8])
+redis.call('HSET', KEYS[1],
+  'resolution_decided_by', ARGV[7],
+  'resolution_decided_at', ARGV[8],
+  'resolution_decision_generation', ARGV[3])
+redis.call('HDEL', KEYS[1],
+  'resolution_continue_owner',
+  'resolution_continue_snapshot_generation',
+  'resolution_continue_snapshot_repair_root',
+  'resolution_continue_snapshot_reason',
+  'resolution_continue_snapshot_task_ids',
+  'resolution_continue_snapshot_attempts')
+redis.call('ZREM', KEYS[3], ARGV[1])
+return {'COMMITTED'}
+`;
+
+const ROLLBACK_INTERRUPTED_RESOLUTION_CONTINUE = `
+-- rollback-interrupted-resolution-continue-v1
+if (redis.call('HGET', KEYS[1], 'resolution_continue_owner') or '') ~= ARGV[2] then
+  return {'ROUND_CHANGED'}
+end
+local resolution = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+if resolution == 'repairing' then
+  if (redis.call('HGET', KEYS[1], 'resolution_generation') or '') ~= ARGV[4] or
+     (redis.call('HGET', KEYS[1], 'resolution_task_ids') or '') ~= ARGV[5] or
+     (redis.call('HGET', KEYS[1], 'resolution_attempts') or '') ~= ARGV[6] then
+    return {'NOT_READY'}
+  end
+  redis.call('HSET', KEYS[1],
+    'resolution_status', 'needs_pm_decision',
+    'resolution_action', 'inspect',
+    'resolution_decision_reason', ARGV[7])
+elseif resolution ~= 'needs_pm_decision' then
+  return {'NOT_READY'}
+end
+redis.call('HDEL', KEYS[1],
+  'resolution_continue_owner',
+  'resolution_continue_snapshot_generation',
+  'resolution_continue_snapshot_repair_root',
+  'resolution_continue_snapshot_reason',
+  'resolution_continue_snapshot_task_ids',
+  'resolution_continue_snapshot_attempts')
+redis.call('ZADD', KEYS[2], tonumber(ARGV[3]), ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
+return {'ROLLED_BACK'}
+`;
+
+function resolutionRoundArgs(root: Record<string, string>): string[] {
+  return [
+    root.task_id,
+    root.plan_id ?? '',
+    root.status ?? '',
+    root.resolution_status ?? '',
+    root.resolution_generation ?? '',
+    root.repair_root_task_id ?? '',
+    root.resolution_decision_reason ?? '',
+  ];
+}
+
+async function beginResolutionContinue(
+  redis: Redis,
+  root: Record<string, string>,
+  lockToken: string,
+  decidedBy: string,
+  decidedAt: number,
+): Promise<boolean> {
+  const result = (await redis.eval(
+    BEGIN_RESOLUTION_CONTINUE,
+    8,
+    keys.hash.task(root.task_id),
+    keys.planStatusProjection.planIds,
+    keys.planStatusProjection.taskIdsByPlan(root.plan_id ?? ''),
+    keys.planStatusProjection.revisionByPlan,
+    keys.planStatusProjection.dirtyPlans,
+    keys.intakeActionableFailed.pending,
+    keys.string.pmReviewLock(root.task_id),
+    keys.runtimeReconcile.pending,
+    ...resolutionRoundArgs(root),
+    lockToken,
+    decidedBy,
+    String(decidedAt),
+    root.resolution_task_ids ?? '',
+    root.resolution_attempts ?? '',
+  )) as string[];
+  return String(result?.[0] ?? '') === 'RESERVED';
+}
+
+type ResolutionContinueWork =
+  | { ok: true; createdTaskIds: string[] }
+  | { ok: false; message: string };
+
+/** 创建显式 continue 放行的下一代；确定性 task id 使 API 与 reconcile 可安全重放。 */
+async function performResolutionContinueWork(
+  redis: Redis,
+  root: Record<string, string>,
+  decidedBy: string,
+): Promise<ResolutionContinueWork> {
+  const reason = root.resolution_continue_snapshot_reason || root.resolution_decision_reason || '';
+  const createdTaskIds: string[] = [];
+  if (root.type === 'acceptance' && reason.startsWith('reverify_retry_limit_reached')) {
+    const result = await ensureAcceptanceReverifyTask(
+      redis,
+      root.task_id,
+      `pm-continue:${decidedBy}`,
+      { allowRetryLimitOverride: true },
+    );
+    if (!result.taskId) return { ok: false, message: '未能为验收根创建新的 reverify generation。' };
+    createdTaskIds.push(result.taskId);
+    return { ok: true, createdTaskIds };
+  }
+
+  if (root.type === 'acceptance') {
+    const repairTaskIds: string[] = [];
+    for (const sourceTaskId of acceptanceSourceIds(root)) {
+      const result = await ensureRepairTask(redis, sourceTaskId, {
+        source: 'acceptance_failed',
+        reason: `PM ${decidedBy} 显式 continue，额外放行一代来源修复。`,
+        decisionRootTaskId: root.task_id,
+        allowRetryLimitOverride: true,
+      });
+      if (result.repairTaskId) {
+        repairTaskIds.push(result.repairTaskId);
+        if (result.created) createdTaskIds.push(result.repairTaskId);
+      }
+    }
+    if (repairTaskIds.length === 0) {
+      return { ok: false, message: '未能为验收根创建新的来源 repair。' };
+    }
+    await markAcceptanceFailureResolution(redis, root.task_id, repairTaskIds, false);
+    return { ok: true, createdTaskIds };
+  }
+
+  const latest = root.resolution_task_id
+    ? await redis.hgetall(keys.hash.task(root.resolution_task_id))
+    : {};
+  const sourceTaskId = latest.fix_for || root.task_id;
+  const result = await ensureRepairTask(redis, sourceTaskId, {
+    source: 'worker_failed',
+    reason: `PM ${decidedBy} 显式 continue，额外放行一代修复。`,
+    allowRetryLimitOverride: true,
+  });
+  if (!result.repairTaskId) {
+    return { ok: false, message: '未能创建新的 repair generation。' };
+  }
+  if (result.created) createdTaskIds.push(result.repairTaskId);
+  return { ok: true, createdTaskIds };
+}
+
+function continuationCreatedTaskIds(root: Record<string, string>): string[] {
+  const before = new Set((root.resolution_continue_snapshot_task_ids ?? '').split(',').filter(Boolean));
+  return (root.resolution_task_ids ?? '').split(',').filter((taskId) => taskId && !before.has(taskId));
+}
+
+async function rollbackInterruptedResolutionContinue(
+  redis: Redis,
+  root: Record<string, string>,
+): Promise<void> {
+  await redis.eval(
+    ROLLBACK_INTERRUPTED_RESOLUTION_CONTINUE,
+    3,
+    keys.hash.task(root.task_id),
+    keys.intakeActionableFailed.pending,
+    keys.runtimeReconcile.pending,
+    root.task_id,
+    root.resolution_continue_owner ?? '',
+    String(Date.now()),
+    root.resolution_continue_snapshot_generation ?? '',
+    root.resolution_continue_snapshot_task_ids ?? '',
+    root.resolution_continue_snapshot_attempts ?? '',
+    root.resolution_continue_snapshot_reason ?? 'repair_retry_limit_reached',
+  );
+}
+
+/**
+ * BEGIN 后进程中断或 owner 失锁时，低频 reconcile 重放确定性 child，
+ * 再以 continuation owner 为幂等键补齐一次审计。活锁存在时不与原请求竞争。
+ */
+async function recoverInterruptedResolutionContinues(
+  redis: Redis,
+  candidateIds: Iterable<string>,
+): Promise<void> {
+  for (const taskId of new Set(candidateIds)) {
+    let root = await redis.hgetall(keys.hash.task(taskId));
+    if (!root.task_id || !root.resolution_continue_owner) continue;
+    if (await redis.get(keys.string.pmReviewLock(root.task_id))) continue;
+
+    const work = await performResolutionContinueWork(
+      redis,
+      root,
+      root.resolution_decided_by || 'pm-reconcile',
+    );
+    root = await redis.hgetall(keys.hash.task(taskId));
+    if (!work.ok) {
+      await rollbackInterruptedResolutionContinue(redis, root);
+      continue;
+    }
+
+    const createdTaskIds = continuationCreatedTaskIds(root);
+    const outcome = (await redis.eval(
+      COMMIT_RECOVERED_RESOLUTION_CONTINUE_AUDIT,
+      3,
+      keys.hash.task(root.task_id),
+      keys.stream.events,
+      keys.runtimeReconcile.pending,
+      root.task_id,
+      root.plan_id ?? '',
+      root.resolution_continue_snapshot_generation ?? '',
+      root.resolution_continue_snapshot_repair_root ?? '',
+      root.resolution_continue_snapshot_reason ?? '',
+      root.resolution_continue_owner ?? '',
+      root.resolution_decided_by || 'pm-reconcile',
+      root.resolution_decided_at || String(Date.now()),
+      root.project_path ?? '',
+      createdTaskIds.join(','),
+    )) as string[];
+    const state = String(outcome?.[0] ?? '');
+    if (state === 'NOT_READY') await rollbackInterruptedResolutionContinue(redis, root);
+  }
 }
 
 function resolutionDecisionData(
@@ -5715,8 +8497,8 @@ export async function resolutionDecision(
     return { ok: false, data: null, error: { code: 'TASK_NOT_FOUND', message: `任务不存在：${taskId}` } };
   }
   const rootTaskId = initial.root.task_id;
-  const lockToken = await acquirePmReviewLock(redis, rootTaskId);
-  if (!lockToken) {
+  const decisionLock = await acquirePmReviewLock(redis, rootTaskId);
+  if (!decisionLock) {
     return {
       ok: false,
       data: null,
@@ -5724,7 +8506,7 @@ export async function resolutionDecision(
     };
   }
 
-  try {
+  return runWithPmDecisionLockCleanup(redis, rootTaskId, decisionLock, async () => {
     const resolved = await resolveDecisionRoot(redis, rootTaskId);
     if (!resolved) {
       return { ok: false, data: null, error: { code: 'TASK_NOT_FOUND', message: `任务不存在：${rootTaskId}` } };
@@ -5748,25 +8530,41 @@ export async function resolutionDecision(
     const now = Date.now();
     if (req.action === 'cancel') {
       const originalReason = root.resolution_decision_reason || 'operator_cancelled';
-      await redis.hset(keys.hash.task(rootTaskId), {
-        resolution_status: 'cancelled',
-        resolution_action: 'cancel',
-        resolution_decision_reason: `cancelled:${originalReason}`,
-      });
-      await persistTaskFromRedis(redis, rootTaskId);
-      await redis.xadd(
+      const outcome = (await redis.eval(
+        COMMIT_RESOLUTION_CANCEL,
+        8,
+        keys.hash.task(rootTaskId),
+        keys.planStatusProjection.planIds,
+        keys.planStatusProjection.taskIdsByPlan(root.plan_id ?? ''),
+        keys.planStatusProjection.revisionByPlan,
+        keys.planStatusProjection.dirtyPlans,
+        keys.intakeActionableFailed.pending,
+        keys.string.pmReviewLock(rootTaskId),
         keys.stream.events,
-        '*',
-        'event_id', `${now}_resolution_cancel_${rootTaskId}`,
-        'type', 'resolution_decided',
-        'task_id', rootTaskId,
-        'plan_id', root.plan_id ?? '',
-        'project_path', root.project_path ?? '',
-        'consumer', 'worker',
-        'resolution_action', 'cancel',
-        'decided_by', req.decided_by.trim(),
-        'timestamp', String(now),
-      );
+        rootTaskId,
+        root.plan_id ?? '',
+        root.status ?? '',
+        root.resolution_status ?? '',
+        root.resolution_generation ?? '',
+        root.repair_root_task_id ?? '',
+        root.resolution_decision_reason ?? '',
+        originalReason,
+        req.decided_by.trim(),
+        decisionLock.token,
+        String(now),
+        root.project_path ?? '',
+      )) as string[];
+      if (String(outcome?.[0] ?? '') !== 'COMMITTED') {
+        return {
+          ok: false,
+          data: null,
+          error: {
+            code: 'RESOLUTION_DECISION_ROUND_CHANGED',
+            message: `根任务 ${rootTaskId} 的决策锁或 resolution 轮次已变化；旧 cancel 未写入。`,
+          },
+        };
+      }
+      await persistTaskFromRedis(redis, rootTaskId);
       const cancelled = await redis.hgetall(keys.hash.task(rootTaskId));
       return { ok: true, data: resolutionDecisionData(taskId, cancelled) };
     }
@@ -5785,76 +8583,57 @@ export async function resolutionDecision(
       };
     }
 
-    const createdTaskIds: string[] = [];
-    if (root.type === 'acceptance' && reason.startsWith('reverify_retry_limit_reached')) {
-      const result = await ensureAcceptanceReverifyTask(
-        redis,
-        rootTaskId,
-        `pm-continue:${req.decided_by.trim()}`,
-        { allowRetryLimitOverride: true },
-      );
-      if (result.taskId) createdTaskIds.push(result.taskId);
-    } else if (root.type === 'acceptance') {
-      const repairTaskIds: string[] = [];
-      for (const sourceTaskId of acceptanceSourceIds(root)) {
-        const result = await ensureRepairTask(redis, sourceTaskId, {
-          source: 'acceptance_failed',
-          reason: `PM ${req.decided_by.trim()} 显式 continue，额外放行一代来源修复。`,
-          decisionRootTaskId: rootTaskId,
-          allowRetryLimitOverride: true,
-        });
-        if (result.repairTaskId) {
-          repairTaskIds.push(result.repairTaskId);
-          if (result.created) createdTaskIds.push(result.repairTaskId);
-        }
-      }
-      if (repairTaskIds.length === 0) {
-        return {
-          ok: false,
-          data: null,
-          error: { code: 'RESOLUTION_CONTINUE_FAILED', message: '未能为验收根创建新的来源 repair。' },
-        };
-      }
-      await markAcceptanceFailureResolution(redis, rootTaskId, repairTaskIds, false);
-    } else {
-      const latest = root.resolution_task_id
-        ? await redis.hgetall(keys.hash.task(root.resolution_task_id))
-        : {};
-      const sourceTaskId = latest.fix_for || rootTaskId;
-      const result = await ensureRepairTask(redis, sourceTaskId, {
-        source: 'worker_failed',
-        reason: `PM ${req.decided_by.trim()} 显式 continue，额外放行一代修复。`,
-        allowRetryLimitOverride: true,
-      });
-      if (!result.repairTaskId) {
-        return {
-          ok: false,
-          data: null,
-          error: { code: 'RESOLUTION_CONTINUE_FAILED', message: '未能创建新的 repair generation。' },
-        };
-      }
-      if (result.created) createdTaskIds.push(result.repairTaskId);
+    // continue 的第一条有副作用写入前必须重新验证 owner token 与完整决策轮次。
+    // 正常长操作由低频续租维持；即使 TTL 被人为缩短或进程停顿导致失锁，旧请求也
+    // 会在创建新 generation 前 fail closed，而不是跨过后来 PM 的 cancel/reset。
+    if (!(await beginResolutionContinue(redis, root, decisionLock.token, req.decided_by.trim(), now))) {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'RESOLUTION_DECISION_ROUND_CHANGED',
+          message: `根任务 ${rootTaskId} 的决策锁或 resolution 轮次已变化；旧 continue 未执行。`,
+        },
+      };
     }
 
+    const work = await performResolutionContinueWork(redis, root, req.decided_by.trim());
+    if (!work.ok) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'RESOLUTION_CONTINUE_FAILED', message: work.message },
+      };
+    }
+    const createdTaskIds = work.createdTaskIds;
+
     const continued = await redis.hgetall(keys.hash.task(rootTaskId));
-    await redis.xadd(
+    const continueAudit = (await redis.eval(
+      COMMIT_RESOLUTION_CONTINUE_AUDIT,
+      3,
+      keys.hash.task(rootTaskId),
+      keys.string.pmReviewLock(rootTaskId),
       keys.stream.events,
-      '*',
-      'event_id', `${now}_resolution_continue_${rootTaskId}`,
-      'type', 'resolution_decided',
-      'task_id', rootTaskId,
-      'plan_id', root.plan_id ?? '',
-      'project_path', root.project_path ?? '',
-      'consumer', 'worker',
-      'resolution_action', 'continue',
-      'decided_by', req.decided_by.trim(),
-      'created_tasks', createdTaskIds.join(','),
-      'timestamp', String(now),
-    );
+      ...resolutionRoundArgs(root),
+      root.resolution_attempts ?? '',
+      decisionLock.token,
+      req.decided_by.trim(),
+      String(now),
+      root.project_path ?? '',
+      createdTaskIds.join(','),
+    )) as string[];
+    if (String(continueAudit?.[0] ?? '') !== 'COMMITTED') {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'RESOLUTION_DECISION_ROUND_CHANGED',
+          message: `根任务 ${rootTaskId} 的决策锁或 resolution generation 已变化；旧 continue 审计未提交。`,
+        },
+      };
+    }
     return { ok: true, data: resolutionDecisionData(taskId, continued, createdTaskIds) };
-  } finally {
-    await redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.pmReviewLock(rootTaskId), lockToken);
-  }
+  });
 }
 
 /** PM 验收（POST /task/:id/review）—— accept 记录通过 / reject 生成修复 task（软门，不改 done） */
@@ -5863,8 +8642,8 @@ export async function pmReview(
   taskId: string,
   req: PmReviewRequest,
 ): Promise<PmReviewResponse> {
-  const lockToken = await acquirePmReviewLock(redis, taskId);
-  if (!lockToken) {
+  const decisionLock = await acquirePmReviewLock(redis, taskId);
+  if (!decisionLock) {
     return {
       ok: false,
       data: null,
@@ -5874,17 +8653,16 @@ export async function pmReview(
       },
     };
   }
-  try {
-    return await pmReviewLocked(redis, taskId, req);
-  } finally {
-    await redis.eval(RELEASE_PM_REVIEW_LOCK, 1, keys.string.pmReviewLock(taskId), lockToken);
-  }
+  return runWithPmDecisionLockCleanup(redis, taskId, decisionLock, async () => {
+    return await pmReviewLocked(redis, taskId, req, decisionLock.token);
+  });
 }
 
 async function pmReviewLocked(
   redis: Redis,
   taskId: string,
   req: PmReviewRequest,
+  lockToken: string,
 ): Promise<PmReviewResponse> {
   const hash = await redis.hgetall(keys.hash.task(taskId));
   if (!hash.task_id) {
@@ -5938,6 +8716,7 @@ async function pmReviewLocked(
   // 都必须通过新的任务/复验表达，不能回写已生效的验收结论。
   if (hash.pm_review_status === 'accepted') {
     if (req.verdict === 'accept') {
+      await replayAcceptedRepairSideEffects(redis, taskId);
       return { ok: true, data: { task_id: taskId, review_status: 'accepted' } };
     }
     return {
@@ -6046,41 +8825,67 @@ async function pmReviewLocked(
     const storedResolutionMode: 'repair' | 'reverify' = hash.pm_rejection_resolution_mode === 'reverify'
       ? 'reverify'
       : 'repair';
-    const fixTaskIds = historicalTasks
+    let fixTaskIds = historicalTasks
       .filter((task) => task.task_id && (storedResolutionMode === 'reverify' ? task.type === 'acceptance' : task.type !== 'acceptance'))
       .map((task) => task.task_id);
     const sameText = req.reviewed_by === (hash.pm_reviewed_by ?? '') &&
       (req.comment ?? '') === (hash.pm_review_comment ?? '') &&
       (req.reject_reason ?? '') === (hash.pm_reject_reason ?? '') &&
       (req.fix_instructions ?? '') === (hash.pm_fix_instructions ?? '');
-    let sameOwnership = req.repair_ownership === undefined &&
-      historicalTasks.every((task) => task.type === 'acceptance' || !task.repair_ownership_extension);
-
-    if (req.repair_ownership !== undefined && acceptanceFor.length === 1) {
-      const normalized = normalizeRepairOwnership(req.repair_ownership);
-      const source = await redis.hgetall(keys.hash.task(acceptanceFor[0]));
-      const rootId = source.repair_root_task_id || source.task_id;
-      const root = rootId === source.task_id ? source : await redis.hgetall(keys.hash.task(rootId));
-      const delta: { value?: NormalizedRepairOwnership; error?: string } = normalized.value && source.task_id
-        ? repairOwnershipDelta(source, root, normalized.value)
-        : {};
-      if (!normalized.value || !delta.value) {
+    let storedOwnership: NormalizedRepairOwnership | undefined;
+    let requestedOwnership: NormalizedRepairOwnership | undefined;
+    if (storedResolutionMode === 'reverify') {
+      if (hash.pm_repair_ownership_required || hash.pm_repair_ownership_intent) {
+        const reason = `repair_ownership_intent_forbidden:${taskId}`;
+        await markResolutionNeedsPmDecision(redis, hash.repair_root_task_id || taskId, reason);
+        await markAcceptanceFailureResolution(redis, taskId, [], true);
         return {
           ok: false,
           data: null,
-          error: {
-            code: 'INVALID_REPAIR_OWNERSHIP',
-            message: normalized.error ?? delta.error ?? 'repair_ownership 无效。',
-          },
+          error: { code: 'REPAIR_OWNERSHIP_INTENT_INVALID', message: `验收拒绝扩权审计不一致：${reason}` },
         };
       }
-      sameOwnership = historicalTasks
-        .filter((task) => task.task_id && task.type !== 'acceptance')
-        .some((task) => {
-          const audit = parseRepairOwnershipAudit(task.repair_ownership_extension);
-          return JSON.stringify(audit ?? { files: [], modules: [] }) === JSON.stringify(delta.value);
-        });
+    } else if (acceptanceFor.length !== 1 && (hash.pm_repair_ownership_required || hash.pm_repair_ownership_intent)) {
+      const reason = `repair_ownership_intent_source_ambiguous:${taskId}`;
+      await markResolutionNeedsPmDecision(redis, hash.repair_root_task_id || taskId, reason);
+      await markAcceptanceFailureResolution(redis, taskId, [], true);
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'REPAIR_OWNERSHIP_INTENT_INVALID', message: `显式 repair ownership 审计无法安全重放：${reason}` },
+      };
+    } else if (acceptanceFor.length === 1) {
+      const source = await redis.hgetall(keys.hash.task(acceptanceFor[0]));
+      const rootId = source.repair_root_task_id || source.task_id;
+      const root = rootId === source.task_id ? source : await redis.hgetall(keys.hash.task(rootId));
+      const stored = persistedRepairOwnershipIntent(hash, source, root);
+      if (stored.error) {
+        await markResolutionNeedsPmDecision(redis, hash.repair_root_task_id || taskId, stored.error);
+        await markAcceptanceFailureResolution(redis, taskId, [], true);
+        return {
+          ok: false,
+          data: null,
+          error: { code: 'REPAIR_OWNERSHIP_INTENT_INVALID', message: `显式 repair ownership 审计无法安全重放：${stored.error}` },
+        };
+      }
+      storedOwnership = stored.value;
+      if (req.repair_ownership !== undefined) {
+        const normalized = normalizeRepairOwnership(req.repair_ownership);
+        const delta = normalized.value ? repairOwnershipDelta(source, root, normalized.value) : {};
+        if (!normalized.value || !delta.value) {
+          return {
+            ok: false,
+            data: null,
+            error: {
+              code: 'INVALID_REPAIR_OWNERSHIP',
+              message: normalized.error ?? delta.error ?? 'repair_ownership 无效。',
+            },
+          };
+        }
+        requestedOwnership = delta.value;
+      }
     }
+    const sameOwnership = sameRepairOwnership(storedOwnership, requestedOwnership);
 
     const sameResolutionMode = requestedResolutionMode === storedResolutionMode;
     if (!sameText || !sameOwnership || !sameResolutionMode) {
@@ -6092,6 +8897,35 @@ async function pmReviewLocked(
           message: `验收任务 ${taskId} 已有不可变的拒绝审计；请处理当前来源 repair/reverify，不可用重复 review 改写原因或 ownership。`,
         },
       };
+    }
+    if (fixTaskIds.length === 0) {
+      if (storedResolutionMode === 'reverify') {
+        const reverify = await ensureAcceptanceReverifyTask(
+          redis,
+          hash.repair_root_task_id || taskId,
+          `pm-reject-replay:${req.reviewed_by}`,
+          { trigger: 'pm_reverify_only' },
+        );
+        fixTaskIds = reverify.taskId ? [reverify.taskId] : [];
+      } else {
+        const resolutions: ResolutionResult[] = [];
+        for (const sourceTaskId of acceptanceFor) {
+          resolutions.push(await ensureRepairTask(redis, sourceTaskId, {
+            source: 'acceptance_failed',
+            reason: `独立验收任务 ${taskId} 被 PM 拒绝。${hash.pm_reject_reason ? ` 原因：${hash.pm_reject_reason}` : ''}`,
+            instructions: hash.pm_fix_instructions,
+            repairOwnership: storedOwnership,
+            decisionRootTaskId: hash.repair_root_task_id || hash.task_id,
+          }));
+        }
+        fixTaskIds = resolutions.flatMap((resolution) => resolution.repairTaskId ? [resolution.repairTaskId] : []);
+        await markAcceptanceFailureResolution(
+          redis,
+          taskId,
+          fixTaskIds,
+          resolutions.some((resolution) => resolution.state === 'needs_pm_decision'),
+        );
+      }
     }
     return {
       ok: true,
@@ -6110,17 +8944,25 @@ async function pmReviewLocked(
       .split(',')
       .filter(Boolean);
     const historicalTasks = await Promise.all(historicalIds.map((id) => redis.hgetall(keys.hash.task(id))));
-    const fixTaskIds = historicalTasks.filter((task) => task.task_id).map((task) => task.task_id);
+    let fixTaskIds = historicalTasks.filter((task) => task.task_id).map((task) => task.task_id);
     const sameText = req.reviewed_by === (hash.pm_reviewed_by ?? '') &&
       (req.comment ?? '') === (hash.pm_review_comment ?? '') &&
       (req.reject_reason ?? '') === (hash.pm_reject_reason ?? '') &&
       (req.fix_instructions ?? '') === (hash.pm_fix_instructions ?? '');
-    let sameOwnership = req.repair_ownership === undefined &&
-      historicalTasks.every((task) => !task.repair_ownership_extension);
+    const rootId = hash.repair_root_task_id || hash.task_id;
+    const root = rootId === hash.task_id ? hash : await redis.hgetall(keys.hash.task(rootId));
+    const stored = persistedRepairOwnershipIntent(hash, hash, root);
+    if (stored.error) {
+      await markResolutionNeedsPmDecision(redis, rootId, stored.error);
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'REPAIR_OWNERSHIP_INTENT_INVALID', message: `显式 repair ownership 审计无法安全重放：${stored.error}` },
+      };
+    }
+    let requestedOwnership: NormalizedRepairOwnership | undefined;
     if (req.repair_ownership !== undefined) {
       const normalized = normalizeRepairOwnership(req.repair_ownership);
-      const rootId = hash.repair_root_task_id || hash.task_id;
-      const root = rootId === hash.task_id ? hash : await redis.hgetall(keys.hash.task(rootId));
       const delta = normalized.value ? repairOwnershipDelta(hash, root, normalized.value) : {};
       if (!normalized.value || !delta.value) {
         return {
@@ -6132,11 +8974,9 @@ async function pmReviewLocked(
           },
         };
       }
-      sameOwnership = historicalTasks.some((task) => {
-        const audit = parseRepairOwnershipAudit(task.repair_ownership_extension);
-        return JSON.stringify(audit ?? { files: [], modules: [] }) === JSON.stringify(delta.value);
-      });
+      requestedOwnership = delta.value;
     }
+    const sameOwnership = sameRepairOwnership(stored.value, requestedOwnership);
     if (!sameText || !sameOwnership) {
       return {
         ok: false,
@@ -6146,6 +8986,17 @@ async function pmReviewLocked(
           message: `任务 ${taskId} 已有不可变的拒绝审计；不可并发或重复改写 reviewer、原因、指令或 ownership。`,
         },
       };
+    }
+    // 进程可能在“写入不可变 reject 审计”与“创建 repair”之间退出。精确重复
+    // reject 不能把空 repair 列表当作成功闭环；在同一 PM review 锁内幂等补建。
+    if (fixTaskIds.length === 0) {
+      const resolution = await ensureRepairTask(redis, taskId, {
+        source: 'pm_rejected',
+        reason: hash.pm_reject_reason,
+        instructions: hash.pm_fix_instructions,
+        repairOwnership: stored.value,
+      });
+      fixTaskIds = resolution.repairTaskId ? [resolution.repairTaskId] : [];
     }
     return {
       ok: true,
@@ -6227,26 +9078,31 @@ async function pmReviewLocked(
   const now = Date.now();
 
   if (req.verdict === 'accept') {
-    await redis.hset(keys.hash.task(taskId), {
+    const accepted = await commitPmReviewAudit(redis, taskId, hash, now, {
       pm_review_status: 'accepted',
       pm_reviewed_by: req.reviewed_by,
       pm_reviewed_at: String(now),
       pm_review_comment: req.comment ?? '',
-    });
-    await redis.zrem(keys.reviewRequested.pending, taskId);
+    }, lockToken);
+    if (!accepted) {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'TASK_REVIEW_ROUND_CHANGED',
+          message: `任务 ${taskId} 在验收提交前已进入新的状态或交付轮次，请重新读取后再验收。`,
+        },
+      };
+    }
     sqliteStore?.updateTaskFields(taskId, {
       pm_review_status: 'accepted',
       pm_reviewed_by: req.reviewed_by,
       pm_reviewed_at: String(now),
       pm_review_comment: req.comment ?? '',
     });
-    // PM accept 是普通下游真正的 dependency-ready 边界。若当前 task 是 repair，
-    // 同时把它的 fix 链逐层标为 resolved（不改写原 rejected/failed 审计）。
-    await wakeDependents(redis, taskId, { allowAcceptance: true });
-    const resolvedTaskIds = await resolveRepairLineage(redis, taskId);
-    for (const resolvedTaskId of resolvedTaskIds) {
-      await wakeDependents(redis, resolvedTaskId, { allowAcceptance: true });
-    }
+    // PM accept 是普通下游真正的 dependency-ready 边界。副作用通过同一个幂等
+    // replay 入口提交，使网络重试和低频 reconcile 都能补偿 accepted 写入后的崩溃。
+    await replayAcceptedRepairSideEffects(redis, taskId);
     const acceptedHash = await redis.hgetall(keys.hash.task(taskId));
     await redis.xadd(
       keys.stream.events,
@@ -6264,7 +9120,8 @@ async function pmReviewLocked(
   }
 
   // reject：记录拒绝并进入统一 repair resolution（不改原 task 的 done 状态）。
-  await redis.hset(keys.hash.task(taskId), {
+  const repairOwnershipIntent = repairOwnership ? serializedRepairOwnership(repairOwnership) : '';
+  const rejected = await commitPmReviewAudit(redis, taskId, hash, now, {
     pm_review_status: 'rejected',
     pm_reviewed_by: req.reviewed_by,
     pm_reviewed_at: String(now),
@@ -6272,6 +9129,8 @@ async function pmReviewLocked(
     pm_reject_reason: req.reject_reason ?? '',
     pm_fix_instructions: req.fix_instructions ?? '',
     pm_rejection_resolution_mode: hash.type === 'acceptance' ? requestedResolutionMode : '',
+    pm_repair_ownership_required: repairOwnership ? 'true' : '',
+    pm_repair_ownership_intent: repairOwnershipIntent,
     ...(hash.type === 'acceptance' && requestedResolutionMode === 'reverify'
       ? {
           resolution_status: 'required',
@@ -6281,8 +9140,17 @@ async function pmReviewLocked(
           resolution_decision_reason: '',
         }
       : {}),
-  });
-  await redis.zrem(keys.reviewRequested.pending, taskId);
+  }, lockToken);
+  if (!rejected) {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        code: 'TASK_REVIEW_ROUND_CHANGED',
+        message: `任务 ${taskId} 在验收提交前已进入新的状态或交付轮次，请重新读取后再验收。`,
+      },
+    };
+  }
   sqliteStore?.updateTaskFields(taskId, {
     pm_review_status: 'rejected',
     pm_reviewed_by: req.reviewed_by,
@@ -6291,6 +9159,8 @@ async function pmReviewLocked(
     pm_reject_reason: req.reject_reason ?? '',
     pm_fix_instructions: req.fix_instructions ?? '',
     pm_rejection_resolution_mode: hash.type === 'acceptance' ? requestedResolutionMode : '',
+    pm_repair_ownership_required: repairOwnership ? 'true' : '',
+    pm_repair_ownership_intent: repairOwnershipIntent,
     ...(hash.type === 'acceptance' && requestedResolutionMode === 'reverify'
       ? {
           resolution_status: 'required',
@@ -6430,6 +9300,496 @@ function derivePlanStatus(tasks: PlanTaskState[]): 'submitted' | 'active' | 'fai
   return 'active';
 }
 
+type PlanTaskCounters = {
+  pending: number;
+  running: number;
+  blocked: number;
+  done: number;
+  failed: number;
+  cancelled: number;
+  superseded: number;
+};
+
+interface PlanStatusProjection {
+  status: 'submitted' | 'active' | 'failed' | 'completed' | 'cancelled';
+  tasks: PlanTaskCounters;
+  reviews: { pending: number; accepted: number; rejected: number };
+  attention: { failed: number; rejected: number; needs_pm_decision: number };
+  history: { resolved_failed: number; resolved_rejected: number };
+  runtimeTaskCount: number;
+}
+
+const PLAN_STATUS_PROJECTION_VERSION = '1';
+const PLAN_STATUS_VALUES = new Set(['submitted', 'active', 'failed', 'completed', 'cancelled']);
+const PLAN_TASK_STATUS_VALUES = ['pending', 'running', 'blocked', 'done', 'failed', 'cancelled', 'superseded'] as const;
+
+function emptyPlanTaskCounters(): PlanTaskCounters {
+  return { pending: 0, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0, superseded: 0 };
+}
+
+function planTaskStateFromHash(task: Record<string, string>): PlanTaskState {
+  return {
+    task_id: task.task_id,
+    status: task.status,
+    review_status: task.pm_review_status || undefined,
+    resolution_status: task.resolution_status || undefined,
+    repair_root_task_id: task.repair_root_task_id || undefined,
+    resolution_task_ids: task.resolution_task_ids ? task.resolution_task_ids.split(',').filter(Boolean) : undefined,
+    supersede_batch_size: task.supersede_batch_size ? Number(task.supersede_batch_size) : undefined,
+  };
+}
+
+function planTaskStateFromRow(task: TaskRow): PlanTaskState {
+  return {
+    task_id: task.task_id,
+    status: task.status,
+    review_status: task.pm_review_status || undefined,
+    resolution_status: task.resolution_status || undefined,
+    repair_root_task_id: task.repair_root_task_id || undefined,
+    resolution_task_ids: task.resolution_task_ids ? task.resolution_task_ids.split(',').filter(Boolean) : undefined,
+    supersede_batch_size: task.supersede_batch_size || undefined,
+  };
+}
+
+/** 单个 plan 的完整统计真相；只在 backfill、状态转换或当前 plan 轮询时重建。 */
+function buildPlanStatusProjection(tasks: PlanTaskState[]): PlanStatusProjection {
+  const counters = emptyPlanTaskCounters();
+  const reviews = { pending: 0, accepted: 0, rejected: 0 };
+  const attention = { failed: 0, rejected: 0, needs_pm_decision: 0 };
+  const history = { resolved_failed: 0, resolved_rejected: 0 };
+  const isClosedResolution = (status: string | undefined) => status === 'resolved' || status === 'cancelled';
+  const isActiveResolution = (status: string | undefined) => status === 'required' || status === 'repairing';
+
+  for (const task of tasks) {
+    if (PLAN_TASK_STATUS_VALUES.includes(task.status as typeof PLAN_TASK_STATUS_VALUES[number])) {
+      counters[task.status as keyof PlanTaskCounters]++;
+    }
+    if (task.status === 'done') {
+      if (task.review_status === 'accepted') reviews.accepted++;
+      else if (task.review_status === 'rejected') {
+        reviews.rejected++;
+        if (task.resolution_status === 'resolved') history.resolved_rejected++;
+        else if (!isClosedResolution(task.resolution_status) && !isActiveResolution(task.resolution_status)) {
+          attention.rejected++;
+        }
+        if (task.resolution_status === 'needs_pm_decision') attention.needs_pm_decision++;
+      } else {
+        reviews.pending++;
+      }
+    }
+    if (task.status === 'failed') {
+      if (task.resolution_status === 'resolved') history.resolved_failed++;
+      else if (!isClosedResolution(task.resolution_status) && !isActiveResolution(task.resolution_status)) {
+        attention.failed++;
+      }
+      if (task.resolution_status === 'needs_pm_decision') attention.needs_pm_decision++;
+    }
+  }
+
+  return {
+    status: derivePlanStatus(tasks),
+    tasks: counters,
+    reviews,
+    attention,
+    history,
+    runtimeTaskCount: tasks.length,
+  };
+}
+
+function planStatusProjectionHash(projection: PlanStatusProjection): Record<string, string> {
+  return {
+    version: PLAN_STATUS_PROJECTION_VERSION,
+    status: projection.status,
+    runtime_task_count: String(projection.runtimeTaskCount),
+    task_pending: String(projection.tasks.pending),
+    task_running: String(projection.tasks.running),
+    task_blocked: String(projection.tasks.blocked),
+    task_done: String(projection.tasks.done),
+    task_failed: String(projection.tasks.failed),
+    task_cancelled: String(projection.tasks.cancelled),
+    task_superseded: String(projection.tasks.superseded),
+    review_pending: String(projection.reviews.pending),
+    review_accepted: String(projection.reviews.accepted),
+    review_rejected: String(projection.reviews.rejected),
+    attention_failed: String(projection.attention.failed),
+    attention_rejected: String(projection.attention.rejected),
+    attention_needs_pm_decision: String(projection.attention.needs_pm_decision),
+    history_resolved_failed: String(projection.history.resolved_failed),
+    history_resolved_rejected: String(projection.history.resolved_rejected),
+  };
+}
+
+function parseProjectionInteger(hash: Record<string, string>, field: string): number | undefined {
+  const value = Number(hash[field]);
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function planStatusProjectionFromHash(hash: Record<string, string>): PlanStatusProjection | undefined {
+  if (hash.version !== PLAN_STATUS_PROJECTION_VERSION || !PLAN_STATUS_VALUES.has(hash.status)) return undefined;
+  const fields = [
+    'runtime_task_count',
+    ...PLAN_TASK_STATUS_VALUES.map((status) => `task_${status}`),
+    'review_pending', 'review_accepted', 'review_rejected',
+    'attention_failed', 'attention_rejected', 'attention_needs_pm_decision',
+    'history_resolved_failed', 'history_resolved_rejected',
+  ];
+  const values = new Map(fields.map((field) => [field, parseProjectionInteger(hash, field)]));
+  if ([...values.values()].some((value) => value === undefined)) return undefined;
+  const read = (field: string) => values.get(field)!;
+  return {
+    status: hash.status as PlanStatusProjection['status'],
+    runtimeTaskCount: read('runtime_task_count'),
+    tasks: {
+      pending: read('task_pending'), running: read('task_running'), blocked: read('task_blocked'),
+      done: read('task_done'), failed: read('task_failed'), cancelled: read('task_cancelled'),
+      superseded: read('task_superseded'),
+    },
+    reviews: {
+      pending: read('review_pending'), accepted: read('review_accepted'), rejected: read('review_rejected'),
+    },
+    attention: {
+      failed: read('attention_failed'), rejected: read('attention_rejected'),
+      needs_pm_decision: read('attention_needs_pm_decision'),
+    },
+    history: {
+      resolved_failed: read('history_resolved_failed'),
+      resolved_rejected: read('history_resolved_rejected'),
+    },
+  };
+}
+
+const COMMIT_PLAN_STATUS_PROJECTION = `
+local current = redis.call('HGET', KEYS[1], ARGV[1]) or '0'
+if current ~= ARGV[2] then return 0 end
+local field_count = tonumber(ARGV[3]) or 0
+local fields_end = 3 + field_count * 2
+for index = 4, fields_end, 2 do
+  redis.call('HSET', KEYS[2], ARGV[index], ARGV[index + 1])
+end
+-- stale membership is derived from the exact same revision snapshot. It must not be
+-- deleted before the CAS: a concurrent task create/reindex may have made it valid again.
+for index = fields_end + 1, #ARGV do
+  redis.call('SREM', KEYS[4], ARGV[index])
+end
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
+`;
+
+/**
+ * 重建单个 plan。revision CAS 避免“读取 task 后、写 aggregate 前”发生的新转换被
+ * SREM 吞掉；冲突时 dirty 会保留，下一轮（或本轮重试）继续处理。
+ */
+async function refreshPlanStatusProjection(redis: Redis, planId: string): Promise<PlanStatusProjection> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const revision = await redis.hget(keys.planStatusProjection.revisionByPlan, planId) ?? '0';
+    const taskIds = await redis.smembers(keys.planStatusProjection.taskIdsByPlan(planId));
+    const hashes = await readTaskHashesInChunks(redis, taskIds);
+    const valid = hashes.filter((task) => task.task_id && task.plan_id === planId);
+    const validTaskIds = new Set(valid.map((task) => task.task_id));
+    const staleIds = taskIds.filter((taskId) => !validTaskIds.has(taskId));
+    const projection = buildPlanStatusProjection(valid.map(planTaskStateFromHash));
+    const fields = Object.entries(planStatusProjectionHash(projection)).flat();
+    const committed = Number(await redis.eval(
+      COMMIT_PLAN_STATUS_PROJECTION,
+      4,
+      keys.planStatusProjection.revisionByPlan,
+      keys.planStatusProjection.aggregateByPlan(planId),
+      keys.planStatusProjection.dirtyPlans,
+      keys.planStatusProjection.taskIdsByPlan(planId),
+      planId,
+      revision,
+      String(fields.length / 2),
+      ...fields,
+      ...staleIds,
+    ));
+    if (committed === 1) return projection;
+  }
+  // 高频转换下宁可保留 dirty 并返回最后一次当前快照，也不能误清标志。
+  const taskIds = await redis.smembers(keys.planStatusProjection.taskIdsByPlan(planId));
+  const hashes = await readTaskHashesInChunks(redis, taskIds);
+  return buildPlanStatusProjection(
+    hashes.filter((task) => task.task_id && task.plan_id === planId).map(planTaskStateFromHash),
+  );
+}
+
+async function refreshDirtyPlanStatusProjections(redis: Redis): Promise<void> {
+  const dirtyPlans = await redis.smembers(keys.planStatusProjection.dirtyPlans);
+  for (let offset = 0; offset < dirtyPlans.length; offset += 20) {
+    await Promise.all(dirtyPlans.slice(offset, offset + 20).map((planId) => refreshPlanStatusProjection(redis, planId)));
+  }
+}
+
+async function readHashesByKeysInChunks(
+  redis: Redis,
+  hashKeys: Iterable<string>,
+): Promise<Array<Record<string, string>>> {
+  const allKeys = [...hashKeys];
+  const hashes: Array<Record<string, string>> = [];
+  for (let offset = 0; offset < allKeys.length; offset += 500) {
+    hashes.push(...await Promise.all(allKeys.slice(offset, offset + 500).map((key) => redis.hgetall(key))));
+  }
+  return hashes;
+}
+
+const RELEASE_PLAN_STATUS_BACKFILL_LOCK = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+/**
+ * Backfill 的唯一发布点。扫描可以超过 lock TTL；只有发布瞬间仍持有 owner token 的
+ * 调用者能触碰 live aggregate/registries/ready。旧 owner 晚到时返回 0，不会覆盖新
+ * owner 的 snapshot，也不会清掉新 owner 留下的 dirty。
+ *
+ * KEYS: lock, ready, plan registry, agent registry, agent-ready,
+ *       then [task-registry, aggregate] for every encoded plan.
+ * ARGV: owner, version, agent-count, agents..., plan-count,
+ *       then per plan: plan-id, task-count, task ids..., field-count, field/value...
+ */
+const PUBLISH_PLAN_STATUS_BACKFILL_FENCED = `
+-- plan-status-projection-fenced-backfill-v1
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local cursor = 3
+local agent_count = tonumber(ARGV[cursor]) or 0
+cursor = cursor + 1
+for index = 1, agent_count do
+  redis.call('SADD', KEYS[4], ARGV[cursor])
+  cursor = cursor + 1
+end
+redis.call('SET', KEYS[5], ARGV[2])
+
+local plan_count = tonumber(ARGV[cursor]) or 0
+cursor = cursor + 1
+for plan_index = 1, plan_count do
+  local plan_id = ARGV[cursor]
+  cursor = cursor + 1
+  local task_count = tonumber(ARGV[cursor]) or 0
+  cursor = cursor + 1
+  local task_key = KEYS[4 + plan_index * 2]
+  local aggregate_key = KEYS[5 + plan_index * 2]
+  redis.call('SADD', KEYS[3], plan_id)
+  for task_index = 1, task_count do
+    redis.call('SADD', task_key, ARGV[cursor])
+    cursor = cursor + 1
+  end
+  local field_count = tonumber(ARGV[cursor]) or 0
+  cursor = cursor + 1
+  for field_index = 1, field_count do
+    redis.call('HSET', aggregate_key, ARGV[cursor], ARGV[cursor + 1])
+    cursor = cursor + 2
+  end
+end
+
+-- ready 必须是最后一个写入；任何 WRONGTYPE/脚本错误都不能发布半投影。
+redis.call('SET', KEYS[2], ARGV[2])
+return 1
+`;
+
+const DELETE_PLAN_STATUS_READY_IF_OWNER = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[2])
+`;
+
+async function waitForPlanStatusBackfill(redis: Redis): Promise<void> {
+  // 正常万级升级只需数百毫秒。并发首读等待同一份 durable marker，不各自重扫历史；
+  // owner 崩溃时锁会自动过期，随后当前请求接管重建。
+  for (let attempt = 0; attempt < 600; attempt++) {
+    if (await redis.get(keys.planStatusProjection.ready)) return;
+    if (!(await redis.exists(keys.planStatusProjection.backfillLock))) return ensurePlanStatusProjection(redis);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error('plan status projection backfill timed out');
+}
+
+/** 首次升级一次性回建；ready 发布后，稳态永远不再扫描历史 task keys。 */
+async function ensurePlanStatusProjection(redis: Redis): Promise<void> {
+  if (await redis.get(keys.planStatusProjection.ready)) {
+    await refreshDirtyPlanStatusProjections(redis);
+    return;
+  }
+
+  const backfillOwner = randomUUID();
+  const backfillTtlMs = 30_000;
+  const acquired = await redis.set(
+    keys.planStatusProjection.backfillLock,
+    backfillOwner,
+    'PX',
+    backfillTtlMs,
+    'NX',
+  );
+  if (acquired !== 'OK') {
+    await waitForPlanStatusBackfill(redis);
+    await refreshDirtyPlanStatusProjections(redis);
+    return;
+  }
+  const renewal = startBackfillLockRenewal(
+    redis,
+    keys.planStatusProjection.backfillLock,
+    backfillOwner,
+    backfillTtlMs,
+  );
+
+  try {
+    // ready 可能在 SET NX 前由上一位 owner 发布；持锁后二次检查避免无意义重扫。
+    if (await redis.get(keys.planStatusProjection.ready)) {
+      await refreshDirtyPlanStatusProjections(redis);
+      return;
+    }
+
+    const includeLegacyAgents = !(await redis.get(keys.planStatusProjection.agentIdsReady));
+    const [taskKeys, planKeys, agentKeys] = await Promise.all([
+      scanKeys(redis, `${PREFIX}:hash:task:*`),
+      scanKeys(redis, `${PREFIX}:hash:plan:*`),
+      includeLegacyAgents ? scanKeys(redis, `${PREFIX}:hash:agent:*`) : Promise.resolve([]),
+    ]);
+    const [taskHashes, planHashes, agentHashes] = await Promise.all([
+      readHashesByKeysInChunks(redis, taskKeys),
+      readHashesByKeysInChunks(redis, planKeys),
+      readHashesByKeysInChunks(redis, agentKeys),
+    ]);
+    const statesByPlan = new Map<string, PlanTaskState[]>();
+    const idsByPlan = new Map<string, string[]>();
+    for (const task of taskHashes) {
+      if (!task.task_id || !task.plan_id) continue;
+      const states = statesByPlan.get(task.plan_id) ?? [];
+      states.push(planTaskStateFromHash(task));
+      statesByPlan.set(task.plan_id, states);
+      const ids = idsByPlan.get(task.plan_id) ?? [];
+      ids.push(task.task_id);
+      idsByPlan.set(task.plan_id, ids);
+    }
+    const planIds = new Set([
+      ...planHashes.map((plan) => plan.plan_id).filter(Boolean),
+      ...statesByPlan.keys(),
+    ]);
+
+    const agentIds = agentHashes.map((agent) => agent.agent_id).filter(Boolean);
+    const orderedPlanIds = [...planIds].sort();
+    const publishKeys = [
+      keys.planStatusProjection.backfillLock,
+      keys.planStatusProjection.ready,
+      keys.planStatusProjection.planIds,
+      keys.planStatusProjection.agentIds,
+      keys.planStatusProjection.agentIdsReady,
+      ...orderedPlanIds.flatMap((planId) => [
+        keys.planStatusProjection.taskIdsByPlan(planId),
+        keys.planStatusProjection.aggregateByPlan(planId),
+      ]),
+    ];
+    const publishArgs: string[] = [
+      backfillOwner,
+      PLAN_STATUS_PROJECTION_VERSION,
+      String(agentIds.length),
+      ...agentIds,
+      String(orderedPlanIds.length),
+    ];
+    for (const planId of orderedPlanIds) {
+      const ids = idsByPlan.get(planId) ?? [];
+      const aggregate = Object.entries(
+        planStatusProjectionHash(buildPlanStatusProjection(statesByPlan.get(planId) ?? [])),
+      );
+      publishArgs.push(
+        planId,
+        String(ids.length),
+        ...ids,
+        String(aggregate.length),
+        ...aggregate.flat(),
+      );
+    }
+    if (renewal.state.lost) {
+      throw renewal.state.error ?? new Error('plan status projection backfill lease lost');
+    }
+    const published = Number(await redis.eval(
+      PUBLISH_PLAN_STATUS_BACKFILL_FENCED,
+      publishKeys.length,
+      ...publishKeys,
+      ...publishArgs,
+    ));
+    if (published !== 1) {
+      // lock 过期后另一 owner 可接管；旧 owner 只等待/复用其结果，绝不能发布旧快照。
+      await waitForPlanStatusBackfill(redis);
+      await refreshDirtyPlanStatusProjections(redis);
+      return;
+    }
+    // backfill 期间发生的转换会留下 dirty+revision；marker 发布后马上收敛，且绝不
+    // 清空 dirty set，避免吞掉并发状态转换。
+    await refreshDirtyPlanStatusProjections(redis);
+  } catch (error) {
+    // 只能让仍持锁的失败 owner 撤销自己的 ready。过期旧 owner 不得删除后来 owner
+    // 已发布的 marker，这是固定 TTL 锁真正需要的 fencing 边界。
+    await redis.eval(
+      DELETE_PLAN_STATUS_READY_IF_OWNER,
+      2,
+      keys.planStatusProjection.backfillLock,
+      keys.planStatusProjection.ready,
+      backfillOwner,
+    ).catch(() => undefined);
+    throw new Error(`plan status projection backfill failed: ${(error as Error).message}`, { cause: error });
+  } finally {
+    await renewal.stop();
+    await redis.eval(
+      RELEASE_PLAN_STATUS_BACKFILL_LOCK,
+      1,
+      keys.planStatusProjection.backfillLock,
+      backfillOwner,
+    ).catch(() => undefined);
+  }
+}
+
+interface LoadedPlanStatusSummary {
+  summary: BiaoPlanSummary;
+  projection: PlanStatusProjection;
+}
+
+async function loadPlanStatusSummaries(redis: Redis): Promise<LoadedPlanStatusSummary[]> {
+  await ensurePlanStatusProjection(redis);
+  const planIds = await redis.smembers(keys.planStatusProjection.planIds);
+  const planHashes = (await readHashesByKeysInChunks(
+    redis,
+    planIds.map((planId) => keys.hash.plan(planId)),
+  )).filter((plan) => Boolean(plan.plan_id));
+  let aggregateHashes = await readHashesByKeysInChunks(
+    redis,
+    planHashes.map((plan) => keys.planStatusProjection.aggregateByPlan(plan.plan_id)),
+  );
+
+  // 正常状态转换会 durable 标记 dirty；只有投影缺失/损坏才按 plan 自愈。即使一个
+  // active plan 内已有万级 accepted 历史，稳态轮询也不能重复读取那些 task hash。
+  const refreshIds = planHashes.flatMap((plan, index) => {
+    const projection = planStatusProjectionFromHash(aggregateHashes[index] ?? {});
+    return !projection ? [plan.plan_id] : [];
+  });
+  for (let offset = 0; offset < refreshIds.length; offset += 20) {
+    await Promise.all(refreshIds.slice(offset, offset + 20).map((planId) => refreshPlanStatusProjection(redis, planId)));
+  }
+  if (refreshIds.length > 0) {
+    const refreshed = new Map((await readHashesByKeysInChunks(
+      redis,
+      refreshIds.map((planId) => keys.planStatusProjection.aggregateByPlan(planId)),
+    )).map((hash, index) => [refreshIds[index], hash]));
+    aggregateHashes = aggregateHashes.map((hash, index) => refreshed.get(planHashes[index].plan_id) ?? hash);
+  }
+
+  return planHashes.map((plan, index) => {
+    const projection = planStatusProjectionFromHash(aggregateHashes[index] ?? {}) ?? buildPlanStatusProjection([]);
+    return {
+      projection,
+      summary: {
+        plan_id: plan.plan_id,
+        title: plan.title,
+        status: projection.status,
+        created_at: Number(plan.created_at ?? 0),
+        project_path: plan.project_path,
+        task_count: Number(plan.task_count ?? 0),
+        tasks: projection.tasks,
+        reviews: projection.reviews,
+      },
+    };
+  });
+}
+
 /** get plan（对应 05 号 md 接口 10：GET /plan/{plan_id}）
  *  返回任务详情数组（title/type/assignee/ownership 等），供前端看板展示
  */
@@ -6463,6 +9823,8 @@ export async function getPlan(redis: Redis, planId: string): Promise<ApiResponse
     pm_fix_instructions?: string;
     pm_rejection_resolution_mode?: string;
     repair_ownership_extension?: RepairOwnershipExtension;
+    pm_repair_ownership_required?: boolean;
+    pm_repair_ownership_intent?: RepairOwnershipExtension;
     failure_reason?: string;
     blocked_reason?: string;
     blocked_at?: number;
@@ -6522,6 +9884,8 @@ export async function getPlan(redis: Redis, planId: string): Promise<ApiResponse
         pm_fix_instructions: h.pm_fix_instructions || undefined,
         pm_rejection_resolution_mode: h.pm_rejection_resolution_mode || undefined,
         repair_ownership_extension: parseRepairOwnershipAudit(h.repair_ownership_extension),
+        pm_repair_ownership_required: h.pm_repair_ownership_required === 'true' || undefined,
+        pm_repair_ownership_intent: parseRepairOwnershipAudit(h.pm_repair_ownership_intent),
         failure_reason: h.failed_reason || undefined,
         blocked_reason: h.block_reason || undefined,
         blocked_at: h.blocked_at ? Number(h.blocked_at) : undefined,
@@ -6594,8 +9958,8 @@ export async function getStatus(redis: Redis): Promise<ApiResponse<unknown>> {
   const conflictCount = await redis.llen(keys.list.ownershipConflicts);
 
   // 复用 plan 列表投影，确保全局摘要与 GET /plans 使用同一派生状态口径。
-  const planList = await getPlans(redis);
-  const plans = (planList.data?.plans ?? []).map((plan) => ({
+  const loadedPlans = await loadPlanStatusSummaries(redis);
+  const plans = loadedPlans.map(({ summary: plan }) => ({
     plan_id: plan.plan_id,
     title: plan.title,
     status: plan.status,
@@ -6603,46 +9967,112 @@ export async function getStatus(redis: Redis): Promise<ApiResponse<unknown>> {
     task_count: plan.task_count,
   }));
 
-  // agents 列表（扫描 hash:agent:*）
+  // agents 列表使用注册索引；Redis SCAN 即使带 MATCH 仍会走过万级 task keyspace。
   const now = Date.now();
-  const agentKeys = await scanKeys(redis, `${PREFIX}:hash:agent:*`);
-  const agents: Array<{ agent_id: string; agent_type: string; status: string; current_task: string; last_heartbeat: number }> = [];
+  const agentIds = await redis.smembers(keys.planStatusProjection.agentIds);
+  const agentKeys = agentIds.map((agentId) => keys.hash.agent(agentId));
+  interface StatusAgent {
+    agent_id: string;
+    agent_type: string;
+    status: string;
+    current_task: string;
+    current_task_status?: string;
+    last_heartbeat: number;
+  }
+  const agents: StatusAgent[] = [];
+  const currentAgents: StatusAgent[] = [];
+  const historicalAgents: StatusAgent[] = [];
   let onlineAgents = 0;
+  let staleRunningAgents = 0;
   for (const ak of agentKeys) {
     const h = await redis.hgetall(ak);
     if (h.agent_id) {
       const lastHb = Number(h.last_heartbeat ?? 0);
       // 在线语义按心跳租约派生：超阈值的 agent 不再显示 idle/online，避免 PM 误判有执行者在线。
       const derived = deriveAgentStatus(h.status, lastHb, now);
-      if (derived === 'idle' || derived === 'busy') onlineAgents++;
-      agents.push({
+      const currentTask = h.current_task ?? '';
+      const currentTaskStatus = currentTask
+        ? await redis.hget(keys.hash.task(currentTask), 'status') ?? undefined
+        : undefined;
+      const agent: StatusAgent = {
         agent_id: h.agent_id,
-        agent_type: h.agent_type,
+        agent_type: h.agent_type ?? '',
         status: derived,
-        current_task: h.current_task,
+        current_task: currentTask,
+        ...(currentTaskStatus ? { current_task_status: currentTaskStatus } : {}),
         last_heartbeat: lastHb,
-      });
+      };
+      agents.push(agent);
+
+      if (['idle', 'busy', 'online'].includes(derived)) {
+        onlineAgents++;
+        currentAgents.push(agent);
+      } else if (currentTaskStatus === 'running') {
+        // 心跳失联但 Redis 仍显示 running 时不能静默丢进历史，交给 PM 关注回收。
+        staleRunningAgents++;
+        currentAgents.push(agent);
+      } else {
+        // stale idle、已结束 current_task 等都只是注册审计，不占据首页当前资源列表。
+        historicalAgents.push(agent);
+      }
     }
   }
 
   // 在线计数与 hint 不得因历史注册记录误判：只有真正在线（心跳新鲜）的 agent 才算。
 
-  // reviews 计数：统计 done 任务的验收状态（pending=未验收 / accepted / rejected）
-  const doneIds = await redis.zrange(keys.zset.status.done, 0, -1);
+  // reviews/attention/history 直接汇总 plan 物化投影。终态历史 hash 只在首次升级时
+  // backfill，稳态轮询不能再 ZRANGE done/failed 后逐条 HGETALL。
   let reviewPending = 0;
   let reviewAccepted = 0;
   let reviewRejected = 0;
-  for (const did of doneIds) {
-    const rs = await redis.hget(keys.hash.task(did), 'pm_review_status');
-    if (rs === 'accepted') reviewAccepted++;
-    else if (rs === 'rejected') reviewRejected++;
-    else reviewPending++;
+  let currentFailed = 0;
+  let currentRejected = 0;
+  let resolvedFailed = 0;
+  let resolvedRejected = 0;
+  let needsPmDecision = 0;
+  for (const { projection } of loadedPlans) {
+    reviewPending += projection.reviews.pending;
+    reviewAccepted += projection.reviews.accepted;
+    reviewRejected += projection.reviews.rejected;
+    currentFailed += projection.attention.failed;
+    currentRejected += projection.attention.rejected;
+    needsPmDecision += projection.attention.needs_pm_decision;
+    resolvedFailed += projection.history.resolved_failed;
+    resolvedRejected += projection.history.resolved_rejected;
   }
 
-  // 无在线 agent 时返回 worker 接入引导 hint（新 PM 体验：避免看到全是 stale 的看板卡住）。
-  // 关键：以真实在线计数判断，历史注册但已失联的 agent 不算"有执行者在"。
+  // hint 只看活跃计划中真实可领取的 pending task，不能被孤立 ZSET 索引、已关闭计划、
+  // 未满足依赖或残留 lease 唤醒 Worker。任务原始 pending 计数仍保留给旧客户端审计。
+  const activePlanIds = new Set(
+    plans.filter((plan) => plan.status === 'submitted' || plan.status === 'active').map((plan) => plan.plan_id),
+  );
+  let hasClaimablePending = false;
+  if (onlineAgents === 0 && pending > 0 && activePlanIds.size > 0) {
+    const pendingIds = await redis.zrange(keys.zset.status.pending, 0, -1);
+    for (const taskId of pendingIds) {
+      const task = await redis.hgetall(keys.hash.task(taskId));
+      if (task.task_id !== taskId || task.status !== 'pending' || !activePlanIds.has(task.plan_id)) continue;
+      if (await redis.exists(keys.string.lease(taskId))) continue;
+
+      const dependencyIds = (task.depends_on ?? '').split(',').map((dep) => dep.trim()).filter(Boolean);
+      let dependenciesSatisfied = true;
+      for (const dependencyId of dependencyIds) {
+        const dependency = await redis.hgetall(keys.hash.task(dependencyId));
+        if (!isDependencySatisfied(dependency, task.type === 'acceptance')) {
+          dependenciesSatisfied = false;
+          break;
+        }
+      }
+      if (dependenciesSatisfied) {
+        hasClaimablePending = true;
+        break;
+      }
+    }
+  }
+
+  // 在线语义仍按真实心跳判断，历史注册但已失联的 Agent 不算"有执行者在"。
   const hint =
-    onlineAgents === 0
+    hasClaimablePending
       ? {
           // 前端按稳定语义码本地化展示，message 保留给旧客户端与 CLI 兼容。
           code: 'NO_ONLINE_WORKERS',
@@ -6659,8 +10089,20 @@ export async function getStatus(redis: Redis): Promise<ApiResponse<unknown>> {
       tasks: { pending, running, blocked, done, failed, cancelled, superseded },
       ownership_conflicts: conflictCount,
       reviews: { pending: reviewPending, accepted: reviewAccepted, rejected: reviewRejected },
+      attention: {
+        failed: currentFailed,
+        rejected: currentRejected,
+        needs_pm_decision: needsPmDecision,
+        stale_running_agents: staleRunningAgents,
+      },
+      history: {
+        resolved_failed: resolvedFailed,
+        resolved_rejected: resolvedRejected,
+        stale_agents: historicalAgents.length,
+      },
       plans,
       agents,
+      agent_groups: { current: currentAgents, history: historicalAgents },
       hint,
     },
   };
@@ -6903,6 +10345,37 @@ function isUnreviewedDoneTask(hash: Record<string, string>): boolean {
     !(hash.resolution_status ?? '').trim();
 }
 
+const REMOVE_STALE_PENDING_REVIEW = `
+local status = redis.call('HGET', KEYS[2], 'status') or ''
+local review = redis.call('HGET', KEYS[2], 'pm_review_status') or ''
+local resolution = redis.call('HGET', KEYS[2], 'resolution_status') or ''
+local function blank(value) return string.match(value, '^%s*$') ~= nil end
+if status == 'done' and blank(review) and blank(resolution) then return 0 end
+return redis.call('ZREM', KEYS[1], ARGV[1])
+`;
+
+/**
+ * 只在提交边界复核 task 仍不是“当前 done 未验收”时清理索引。普通 MULTI ZREM
+ * 会在 reset → fresh done 并发中误删新一代 member，造成 PM 永久漏单。
+ */
+async function removeStalePendingReviews(redis: Redis, taskIds: string[]): Promise<void> {
+  if (taskIds.length === 0) return;
+  const cleanup = redis.multi();
+  for (const taskId of taskIds) {
+    cleanup.eval(
+      REMOVE_STALE_PENDING_REVIEW,
+      2,
+      keys.reviewRequested.pending,
+      keys.hash.task(taskId),
+      taskId,
+    );
+  }
+  const outcomes = await cleanup.exec();
+  if (!outcomes || outcomes.some(([error]) => error)) {
+    throw new Error('failed to clean stale PM review entries');
+  }
+}
+
 /**
  * 历史 review_requested 事件必须对应当前这一次 done，才可写入任务→event 映射。
  * report() 在同一个 now 写 done_at 与事件 timestamp；给 Redis stream 时钟留少量误差，
@@ -7045,6 +10518,8 @@ if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_
 if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'done' then return {'TASK_NOT_DONE', ''} end
 local review_status = redis.call('HGET', KEYS[1], 'pm_review_status') or ''
 if string.match(review_status, '%S') then return {'TASK_REVIEWED', ''} end
+local resolution_status = redis.call('HGET', KEYS[1], 'resolution_status') or ''
+if string.match(resolution_status, '%S') then return {'TASK_IN_RESOLUTION', ''} end
 if not redis.call('ZSCORE', KEYS[2], task_id) then return {'NOT_INDEXED', ''} end
 
 local plan_consumer = redis.call('HGET', KEYS[6], 'pm_consumer') or ''
@@ -7082,14 +10557,12 @@ return {'CREATED', event_id}
 async function emitPendingReviewDoorbells(redis: Redis, consumer: string): Promise<void> {
   const pendingIds = await redis.zrange(keys.reviewRequested.pending, 0, -1);
   const planConsumers = new Map<string, string>();
-  const stale = redis.multi();
-  let hasStale = false;
+  const staleIds: string[] = [];
 
   for (const taskId of pendingIds) {
     const task = await redis.hgetall(keys.hash.task(taskId));
     if (!isUnreviewedDoneTask(task)) {
-      stale.zrem(keys.reviewRequested.pending, taskId);
-      hasStale = true;
+      staleIds.push(taskId);
       continue;
     }
     const planId = task.plan_id ?? '';
@@ -7119,12 +10592,7 @@ async function emitPendingReviewDoorbells(redis: Redis, consumer: string): Promi
     );
   }
 
-  if (hasStale) {
-    const outcomes = await stale.exec();
-    if (!outcomes || outcomes.some(([error]) => error)) {
-      throw new Error('failed to clean stale pending review index entries');
-    }
-  }
+  await removeStalePendingReviews(redis, staleIds);
 }
 
 /** 从 durable pending 索引按 stream 精确顺序取回仍未 ack 的事件。 */
@@ -7445,6 +10913,35 @@ export interface TaskListItem {
   superseded_reason?: string;
 }
 
+function taskListItemFromHash(h: Record<string, string>, status = h.status ?? ''): TaskListItem {
+  return {
+    task_id: h.task_id,
+    title: h.title ?? '',
+    type: h.type ?? '',
+    phase: h.phase ?? '',
+    status,
+    assignee: h.assignee ?? 'auto',
+    priority: Number(h.priority ?? 0),
+    plan_id: h.plan_id ?? '',
+    project_path: h.project_path ?? '',
+    pm_review_status: h.pm_review_status?.trim() || undefined,
+    failure_reason: h.failed_reason || undefined,
+    block_reason: h.block_reason || undefined,
+    fix_for: h.fix_for || undefined,
+    repair_root_task_id: h.repair_root_task_id || undefined,
+    resolution_status: h.resolution_status || undefined,
+    resolution_action: h.resolution_action || undefined,
+    resolution_task_id: h.resolution_task_id || undefined,
+    resolution_task_ids: h.resolution_task_ids ? h.resolution_task_ids.split(',').filter(Boolean) : undefined,
+    resolved_by_task: h.resolved_by_task || undefined,
+    resolution_generation: h.resolution_generation ? Number(h.resolution_generation) : undefined,
+    resolution_attempts: h.resolution_attempts ? Number(h.resolution_attempts) : undefined,
+    superseded_at: h.superseded_at ? Number(h.superseded_at) : undefined,
+    superseded_by: h.superseded_by || undefined,
+    superseded_reason: h.superseded_reason || undefined,
+  };
+}
+
 export async function getTasks(
   redis: Redis,
   opts: { plan_id?: string; status?: string; limit?: number } = {},
@@ -7463,35 +10960,42 @@ export async function getTasks(
       if (!h.task_id) continue;
       // plan_id 过滤
       if (opts.plan_id && h.plan_id !== opts.plan_id) continue;
-      items.push({
-        task_id: h.task_id,
-        title: h.title ?? '',
-        type: h.type ?? '',
-        phase: h.phase ?? '',
-        status: st,
-        assignee: h.assignee ?? 'auto',
-        priority: Number(h.priority ?? 0),
-        plan_id: h.plan_id ?? '',
-        project_path: h.project_path ?? '',
-        pm_review_status: h.pm_review_status || undefined,
-        failure_reason: h.failed_reason || undefined,
-        block_reason: h.block_reason || undefined,
-        fix_for: h.fix_for || undefined,
-        repair_root_task_id: h.repair_root_task_id || undefined,
-        resolution_status: h.resolution_status || undefined,
-        resolution_action: h.resolution_action || undefined,
-        resolution_task_id: h.resolution_task_id || undefined,
-        resolution_task_ids: h.resolution_task_ids ? h.resolution_task_ids.split(',').filter(Boolean) : undefined,
-        resolved_by_task: h.resolved_by_task || undefined,
-        resolution_generation: h.resolution_generation ? Number(h.resolution_generation) : undefined,
-        resolution_attempts: h.resolution_attempts ? Number(h.resolution_attempts) : undefined,
-        superseded_at: h.superseded_at ? Number(h.superseded_at) : undefined,
-        superseded_by: h.superseded_by || undefined,
-        superseded_reason: h.superseded_reason || undefined,
-      });
+      items.push(taskListItemFromHash(h, st));
       if (items.length >= limit) break;
     }
     if (items.length >= limit) break;
+  }
+
+  return { ok: true, data: { tasks: items, total: items.length } };
+}
+
+/**
+ * PM 待验收专用查询。只遍历当前 pending-review zset，不经过 done 历史窗口，
+ * 因而不会在长期运行累计大量 accepted/rejected 记录后静默漏单。
+ */
+export async function getPendingReviewTasks(
+  redis: Redis,
+  opts: { plan_id?: string } = {},
+): Promise<ApiResponse<{ tasks: TaskListItem[]; total: number }>> {
+  // 该接口必须可独立作为 PM 首入口。升级后即使尚未运行 pm-start/intake，
+  // 也要先一次性从旧 done/event 事实补建 pending-review 索引，不能静默报空。
+  await ensureLegacyReviewIndexes(redis);
+  const ids = await redis.zrange(keys.reviewRequested.pending, 0, -1);
+  const items: TaskListItem[] = [];
+  const staleIds: string[] = [];
+
+  for (const taskId of ids) {
+    const h = await redis.hgetall(keys.hash.task(taskId));
+    if (!h.task_id || !isUnreviewedDoneTask(h)) {
+      staleIds.push(taskId);
+      continue;
+    }
+    if (opts.plan_id && h.plan_id !== opts.plan_id) continue;
+    items.push(taskListItemFromHash(h, 'done'));
+  }
+
+  if (staleIds.length > 0) {
+    await removeStalePendingReviews(redis, staleIds);
   }
 
   return { ok: true, data: { tasks: items, total: items.length } };
@@ -7514,58 +11018,7 @@ export interface BiaoPlanSummary {
 export async function getPlans(
   redis: Redis,
 ): Promise<ApiResponse<{ plans: BiaoPlanSummary[]; total: number }>> {
-  const planKeys = await scanKeys(redis, `${PREFIX}:hash:plan:*`);
-  const plans: BiaoPlanSummary[] = [];
-  for (const pk of planKeys) {
-    const h = await redis.hgetall(pk);
-    if (h.plan_id) {
-      plans.push({
-        plan_id: h.plan_id,
-        title: h.title,
-        status: h.status,
-        created_at: Number(h.created_at ?? 0),
-        project_path: h.project_path,
-        task_count: Number(h.task_count ?? 0),
-        tasks: { pending: 0, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0, superseded: 0 },
-        reviews: { pending: 0, accepted: 0, rejected: 0 },
-      });
-    }
-  }
-
-  // 按 plan_id 分组统计任务状态
-  const byPlan = new Map(plans.map((p) => [p.plan_id, p.tasks]));
-  const reviewsByPlan = new Map(plans.map((p) => [p.plan_id, p.reviews]));
-  const taskStatesByPlan = new Map<string, PlanTaskState[]>();
-  const taskKeys = await scanKeys(redis, `${PREFIX}:hash:task:*`);
-  for (const tk of taskKeys) {
-    const t = await redis.hgetall(tk);
-    const counter = t.plan_id ? byPlan.get(t.plan_id) : undefined;
-    if (counter && ['pending', 'running', 'blocked', 'done', 'failed', 'cancelled', 'superseded'].includes(t.status)) {
-      (counter as Record<string, number>)[t.status] += 1;
-      const states = taskStatesByPlan.get(t.plan_id) ?? [];
-      states.push({
-        task_id: t.task_id,
-        status: t.status,
-        review_status: t.pm_review_status || undefined,
-        resolution_status: t.resolution_status || undefined,
-        repair_root_task_id: t.repair_root_task_id || undefined,
-        resolution_task_ids: t.resolution_task_ids ? t.resolution_task_ids.split(',').filter(Boolean) : undefined,
-        supersede_batch_size: t.supersede_batch_size ? Number(t.supersede_batch_size) : undefined,
-      });
-      taskStatesByPlan.set(t.plan_id, states);
-      if (t.status === 'done') {
-        const reviews = reviewsByPlan.get(t.plan_id)!;
-        if (t.pm_review_status === 'accepted') reviews.accepted++;
-        else if (t.pm_review_status === 'rejected') reviews.rejected++;
-        else reviews.pending++;
-      }
-    }
-  }
-
-  for (const plan of plans) {
-    plan.status = derivePlanStatus(taskStatesByPlan.get(plan.plan_id) ?? []);
-  }
-
+  const plans = (await loadPlanStatusSummaries(redis)).map(({ summary }) => summary);
   return { ok: true, data: { plans, total: plans.length } };
 }
 
@@ -7708,13 +11161,11 @@ export async function pmIntake(
   // 2. done 未验收的持续事实。门铃已 ack 后它仍必须留在统一 intake；复用原 event_id
   // 让已运行的 Supervisor 继续按同一键静音，而不是把同一个 task 当成新提醒重复响铃。
   const pendingReviewIds = await redis.zrange(keys.reviewRequested.pending, 0, -1);
-  const staleReview = redis.multi();
-  let hasStaleReview = false;
+  const staleReviewIds: string[] = [];
   for (const taskId of pendingReviewIds) {
     const h = await redis.hgetall(keys.hash.task(taskId));
     if (!isUnreviewedDoneTask(h)) {
-      staleReview.zrem(keys.reviewRequested.pending, taskId);
-      hasStaleReview = true;
+      staleReviewIds.push(taskId);
       continue;
     }
     const taskConsumer = await resolvePmConsumer(redis, h.plan_id ?? '');
@@ -7737,20 +11188,21 @@ export async function pmIntake(
     });
     counts.review_requested = (counts.review_requested ?? 0) + 1;
   }
-  if (hasStaleReview) {
-    const outcomes = await staleReview.exec();
-    if (!outcomes || outcomes.some(([error]) => error)) {
-      throw new Error('failed to clean stale PM review intake entries');
-    }
-  }
+  await removeStalePendingReviews(redis, staleReviewIds);
 
-  // 3. 当前状态兜底。已在 repair 流中的 failed 不需要 PM 介入；只有重试耗尽才
-  // 产生 resolution_required。文件/依赖等待由共享 Supervisor/Worker 自行恢复。
+  // 3. 当前状态兜底。failed 只读当前 actionable 索引；resolved/repairing 历史只在
+  // standalone 首次升级 backfill 一次。blocked 仍是非终态当前集合，可直接读 zset。
+  await ensureIntakeActionableFailedIndex(redis);
+  const staleFailedCandidates: string[] = [];
+  const failedRootsToSync = new Set<string>();
   const collectStatusTasks = async (statusKey: string, kind: IntakeItem['kind']) => {
     const ids = await redis.zrange(statusKey, 0, -1);
     for (const tid of ids) {
       let h = await redis.hgetall(keys.hash.task(tid));
-      if (!h.task_id) continue;
+      if (!h.task_id) {
+        if (kind === 'failed') staleFailedCandidates.push(tid);
+        continue;
+      }
       let effectiveTaskId = tid;
       let observedAt = Number(h.blocked_at ?? h.done_at ?? 0) || undefined;
       // 终态 repair/reverify child 只是根任务的失败证据，不是第二个
@@ -7758,8 +11210,16 @@ export async function pmIntake(
       // 折叠为唯一的根任务 resolution_required。
       if (kind === 'failed' && h.repair_root_task_id && h.repair_root_task_id !== h.task_id) {
         const root = await redis.hgetall(keys.hash.task(h.repair_root_task_id));
-        if (root.task_id && ['repairing', 'required', 'resolved', 'cancelled'].includes(root.resolution_status ?? '')) continue;
+        if (root.task_id && ['repairing', 'required', 'resolved', 'cancelled'].includes(root.resolution_status ?? '')) {
+          staleFailedCandidates.push(tid);
+          continue;
+        }
         if (root.task_id && root.resolution_status === 'needs_pm_decision') {
+          // 当前索引以“可行动根”为稳态单位。历史 child 只在本轮折叠展示，随后
+          // 用原子 actionability Lua 把根补入并删除 child，避免 N 个失败 attempt
+          // 让每轮 intake 重新读取 N 个 hash。
+          staleFailedCandidates.push(tid);
+          failedRootsToSync.add(root.task_id);
           effectiveTaskId = root.task_id;
           h = root;
         }
@@ -7770,7 +11230,10 @@ export async function pmIntake(
       if (taskConsumer !== consumer) continue;
       if (opts.plan_id && h.plan_id !== opts.plan_id) continue;
       if (opts.project_path && h.project_path !== opts.project_path) continue;
-      if (kind === 'failed' && ['repairing', 'required', 'resolved', 'cancelled'].includes(h.resolution_status ?? '')) continue;
+      if (kind === 'failed' && ['repairing', 'required', 'resolved', 'cancelled'].includes(h.resolution_status ?? '')) {
+        staleFailedCandidates.push(tid);
+        continue;
+      }
       if (kind === 'blocked' && ['waiting_file_release', 'waiting_dependency'].includes(h.block_reason ?? '')) continue;
       // waiting_pm_reply 由 Question 的持久事件/列表处理；若旧数据没有 Question 指针，
       // 才把它作为最小 blocked 门铃保留给 PM，避免无声丢失。
@@ -7793,12 +11256,39 @@ export async function pmIntake(
       counts[effectiveKind] = (counts[effectiveKind] ?? 0) + 1;
     }
   };
-  await collectStatusTasks(keys.zset.status.failed, 'failed');
+  await collectStatusTasks(keys.intakeActionableFailed.pending, 'failed');
   await collectStatusTasks(keys.zset.status.blocked, 'blocked');
+  for (const rootTaskId of failedRootsToSync) {
+    await syncIntakeActionableFailed(redis, rootTaskId);
+  }
+  const uniqueStaleFailedCandidates = [...new Set(staleFailedCandidates)];
+  for (let offset = 0; offset < uniqueStaleFailedCandidates.length; offset += 100) {
+    // 读到 stale 后 task 可能并发进入 needs_pm_decision。不能用旧快照直接 ZREM；
+    // 每项都在 Lua 提交点重读当前 status/resolution，必要时反而补回候选。
+    await Promise.all(
+      uniqueStaleFailedCandidates
+        .slice(offset, offset + 100)
+        .map((taskId) => syncIntakeActionableFailed(redis, taskId)),
+    );
+  }
 
   // 4. stale agent 只有仍持有 running task 时才进入 PM intake。纯 idle/stale
   // 注册是可自行恢复的历史噪声，/status 已能展示，不该每轮催 PM 清理。
-  const agentKeys = await scanKeys(redis, `${PREFIX}:hash:agent:*`);
+  if (!(await redis.get(keys.planStatusProjection.agentIdsReady))) {
+    const legacyAgentKeys = await scanKeys(redis, `${PREFIX}:hash:agent:*`);
+    const legacyAgents = await readHashesByKeysInChunks(redis, legacyAgentKeys);
+    const legacyIds = legacyAgents.map((agent) => agent.agent_id).filter(Boolean);
+    const transaction = redis.multi();
+    if (legacyIds.length > 0) transaction.sadd(keys.planStatusProjection.agentIds, ...legacyIds);
+    transaction.set(keys.planStatusProjection.agentIdsReady, PLAN_STATUS_PROJECTION_VERSION);
+    const outcomes = await transaction.exec();
+    if (!outcomes || outcomes.some(([error]) => error)) {
+      await redis.del(keys.planStatusProjection.agentIdsReady).catch(() => undefined);
+      throw new Error('legacy agent index backfill failed');
+    }
+  }
+  const agentIds = await redis.smembers(keys.planStatusProjection.agentIds);
+  const agentKeys = agentIds.map((agentId) => keys.hash.agent(agentId));
   for (const ak of agentKeys) {
     const h = await redis.hgetall(ak);
     if (!h.agent_id) continue;
@@ -7823,7 +11313,8 @@ export async function pmIntake(
 
 /**
  *  发现需要人工动作的 failed / stale_running / stale_agent / blocked_long / done_unreviewed。
- *  autoFix=true 时只处理安全项：stale_running → reset 回 pending、stale_agent → 标记 offline。
+ *  autoFix=true 时只处理安全项：stale running/agent 回收，以及为无 resolution
+ *  的 legacy failed 补建不可变 repair 闭环。
  *  正在自动 repair/reverify 的失败以及文件/依赖等待不制造 PM 噪声；只有 retry 耗尽、
  *  Question 或未知阻塞才出现在 PM 的 watchdog 结果中。
  */
@@ -7862,9 +11353,53 @@ async function runWatchdogUnlocked(
   const problems: WatchdogProblem[] = [];
   const now = Date.now();
 
-  // 正常新任务会在 report/review 时即时进入 repair。这里仅补偿升级前或异常写入
-  // 遗留的终态；显式 --auto-fix 才会产生状态写入，普通巡检保持只读、低成本。
-  if (opts.autoFix) await reconcileResolutionBacklogUnlocked(redis);
+  // 显式 --auto-fix 复用 Supervisor 的 CAS 运行态补偿：stale lease 的 retries 与
+  // max_retries 必须使用同一口径，不能由通用 taskReset 无限放回 pending。
+  // 普通巡检仍保持只读、低成本。
+  if (opts.autoFix) {
+    const staleSnapshots = new Map<string, Record<string, string>>();
+    for (const taskId of await redis.zrange(keys.zset.status.running, 0, -1)) {
+      if (await redis.get(keys.string.lease(taskId)) !== null) continue;
+      const task = await redis.hgetall(keys.hash.task(taskId));
+      if (task.status !== 'running') continue;
+      // watchdog 以“lease 已不存在”为 stale 真相；running zset 的名义 expire score
+      // 可能仍在未来。这里只原子把它暴露给统一 lazyReclaim CAS，绝不自行迁移状态。
+      const exposed = Number(await redis.eval(
+        `if redis.call('GET', KEYS[1]) == false and
+            (redis.call('HGET', KEYS[2], 'status') or '') == 'running' then
+           redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+           return 1
+         end
+         return 0`,
+        3,
+        keys.string.lease(taskId),
+        keys.hash.task(taskId),
+        keys.zset.status.running,
+        taskId,
+        String(now),
+      ));
+      if (exposed === 1) staleSnapshots.set(taskId, task);
+    }
+    const reconciled = await reconcileRuntimeStateUnlocked(redis);
+    const reclaimed = reconciled.data?.reclaimed ?? [];
+    const failed = new Set(reconciled.data?.failed ?? []);
+    for (const taskId of reclaimed) {
+      const snapshot = staleSnapshots.get(taskId);
+      const retryExhausted = failed.has(taskId);
+      problems.push({
+        type: 'stale_running',
+        task_id: taskId,
+        detail: retryExhausted
+          ? `running lease 已失效；自动回收后超过 max_retries，任务已进入 failed→repair 闭环`
+          : `running lease 已失效；已自动回收并返回 pending（原 worker ${snapshot?.claimed_by || '?'}）`,
+        suggestion: retryExhausted
+          ? `biao task get ${taskId}（查看自动生成的 repair 与失败审计）`
+          : `等待 Worker fresh claim ${taskId}`,
+        auto_fixable: true,
+        fixed: true,
+      });
+    }
+  }
 
   // 1. failed tasks（含被 report partial 的——partial 走 failed 分支落库）。
   // repair/reverify 已有明确 Worker 闭环，watchdog 不重复要求 PM reset；retry 耗尽
@@ -7897,8 +11432,8 @@ async function runWatchdogUnlocked(
         : `遗留 failed task（${h.failed_reason || `retries=${h.retries ?? 0}，last by ${h.claimed_by || '?'}` }）`,
       suggestion: needsDecision
         ? `biao task get ${effectiveTaskId}（检查 lineage 后选择 continue 或 cancel）`
-        : `biao task get ${effectiveTaskId}（核对失败证据后 reset 或 cancel；新失败会自动生成 repair）`,
-      auto_fixable: false,
+        : 'biao watchdog --auto-fix',
+      auto_fixable: !needsDecision,
     });
   }
 
@@ -7912,24 +11447,27 @@ async function runWatchdogUnlocked(
       type: 'stale_running',
       task_id: tid,
       detail: `running 但 lease 已失效，worker ${h.claimed_by || '?'} 可能已退出`,
-      suggestion: `biao task reset ${tid}（重置回 pending）`,
+      suggestion: 'biao watchdog --auto-fix',
       auto_fixable: true,
     };
-    if (opts.autoFix) {
-      const r = await taskReset(redis, tid, { reset_by: 'watchdog' });
-      p.fixed = r.ok;
-    }
+    // autoFix 已在本轮开头统一经过 lazyReclaim CAS。若 lease 恰好在该 CAS 之后
+    // 才过期，此处只报告当前事实，留给下一低频轮次回收，避免维护第二套迁移语义。
     problems.push(p);
   }
 
   // 3. stale agents（last_heartbeat 超过 5 分钟）
+  // 纯 idle 或 current_task 已终结的失联注册只是历史审计，不是当前
+  // 故障。只有仍指向真实 running task 时才提醒/自动离线，与
+  // /status 及 PM intake 的 current-attention 口径保持一致。
   const agentKeys = await scanKeys(redis, `${PREFIX}:hash:agent:*`);
   for (const ak of agentKeys) {
     const h = await redis.hgetall(ak);
     if (!h.agent_id) continue;
     if (h.status === 'offline') continue;
     const lastHb = Number(h.last_heartbeat ?? 0);
-    if (now - lastHb > 5 * 60_000) {
+    if (now - lastHb > STALE_AGENT_THRESHOLD_MS && h.current_task) {
+      const currentTaskStatus = await redis.hget(keys.hash.task(h.current_task), 'status');
+      if (currentTaskStatus !== 'running') continue;
       const p: WatchdogProblem = {
         type: 'stale_agent',
         agent_id: h.agent_id,

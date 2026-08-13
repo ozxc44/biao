@@ -4,6 +4,7 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AUTO_YES=0
+CHECK_ONLY=0
 REDIS_URL=${BIAO_REDIS_URL:-redis://127.0.0.1:6379}
 PREVIOUS_ARG=
 BOOTSTRAP_TOKEN_PRESENT=0
@@ -14,6 +15,53 @@ if [ "${BIAO_BOOTSTRAP_TOKEN+x}" = x ]; then
 fi
 # 系统检测、包管理器、Redis 与 npm 子进程都不应继承控制面凭据。
 unset BIAO_BOOTSTRAP_TOKEN BIAO_API_TOKEN
+
+show_help() {
+  cat <<'EOF'
+Biao 开箱配置
+
+用法：
+  ./bootstrap.sh --yes --workspace <允许根目录> [--project <默认项目>]
+
+选项：
+  --workspace <path>   Biao 允许访问的工作区；默认当前 Biao 仓库
+  --project <path>     Worker 默认领取的项目；默认等于 workspace
+  --runtime-dir <path> 可变配置与数据目录；安装包默认当前目录/.biao
+  --redis-url <url>    默认 redis://127.0.0.1:6379
+  --host <host>        默认 127.0.0.1
+  --port <port>        默认 7331
+  --token-file <path>  从权限为 owner-only（例如 600）的文件读取已有 Token
+  --pm-agent-command <command>
+                       PM 待办出现时由共享 Supervisor 按需启动的本机 Agent 命令
+  --pm-agent codex     使用仓库内置 Codex PM 适配器；不能与 --pm-agent-command 同用
+  --yes, -y            允许 shell 入口安装缺失系统依赖并启动本机 Redis
+  --check              仅检查 Node、npm、Redis 工具与连通性；绝不安装、构建或写配置
+  --no-install         跳过 npm 依赖安装
+  --no-build           跳过 npm run build
+  --force              覆盖已有 .biao 配置
+  --upgrade            保留已有 config.env，只更新仓库生成的启动器与 PM 手册
+
+也可由秘密管理器注入 BIAO_BOOTSTRAP_TOKEN。不要把 Token 写进 argv 或 Shell 历史。
+EOF
+}
+
+# 帮助必须在任何系统依赖探测前可用；同时跳过已知 option 的参数值，避免把路径值误判为帮助。
+HELP_VALUE_PENDING=0
+for ARG in "$@"; do
+  if [ "$HELP_VALUE_PENDING" -eq 1 ]; then
+    HELP_VALUE_PENDING=0
+    continue
+  fi
+  case "$ARG" in
+    --workspace|--project|--runtime-dir|--redis-url|--host|--port|--token-file|--pm-agent-command|--pm-agent)
+      HELP_VALUE_PENDING=1
+      ;;
+    --help|-h)
+      show_help
+      exit 0
+      ;;
+  esac
+done
 
 exec_bootstrap_node() {
   if [ "$BOOTSTRAP_TOKEN_PRESENT" -eq 1 ]; then
@@ -30,10 +78,18 @@ for ARG in "$@"; do
   fi
   case "$ARG" in
     --yes|-y) AUTO_YES=1 ;;
+    --check) CHECK_ONLY=1 ;;
     --redis-url) PREVIOUS_ARG=--redis-url ;;
     --redis-url=*) REDIS_URL=${ARG#--redis-url=} ;;
   esac
 done
+
+case "$REDIS_URL" in
+  redis://127.0.0.1|redis://localhost|redis://127.0.0.1:*|redis://localhost:*|redis://127.0.0.1/*|redis://localhost/*)
+    REDIS_IS_LOCAL=1
+    ;;
+  *) REDIS_IS_LOCAL=0 ;;
+esac
 
 node_is_ready() {
   command -v node >/dev/null 2>&1 || return 1
@@ -51,7 +107,8 @@ node_is_ready() {
 }
 
 redis_tools_are_ready() {
-  command -v redis-cli >/dev/null 2>&1 && command -v redis-server >/dev/null 2>&1
+  command -v redis-cli >/dev/null 2>&1 || return 1
+  [ "$REDIS_IS_LOCAL" -eq 0 ] || command -v redis-server >/dev/null 2>&1
 }
 
 redis_is_reachable() {
@@ -73,7 +130,11 @@ else
 fi
 
 if redis_tools_are_ready; then
-  echo "[ok] Redis 命令行与服务端"
+  if [ "$REDIS_IS_LOCAL" -eq 1 ]; then
+    echo "[ok] Redis 命令行与服务端"
+  else
+    echo "[ok] Redis 客户端探测工具（远程地址无需本机服务端）"
+  fi
 else
   REDIS_WAS_MISSING=1
   echo "[missing] Redis"
@@ -87,10 +148,16 @@ else
 fi
 
 if [ "$NODE_WAS_MISSING" -eq 0 ] && [ "$REDIS_WAS_MISSING" -eq 0 ] && [ "$REDIS_WAS_DOWN" -eq 0 ]; then
-  if [ "${BIAO_BOOTSTRAP_SYSTEM_ONLY:-0}" = "1" ]; then
+  if [ "$CHECK_ONLY" -eq 1 ] || [ "${BIAO_BOOTSTRAP_SYSTEM_ONLY:-0}" = "1" ]; then
+    echo "[ok] 只读检查通过；未安装、构建或写入 .biao"
     exit 0
   fi
   exec_bootstrap_node "$@"
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  echo "只读检查未通过；未安装、启动服务、构建或写入 .biao。" >&2
+  exit 2
 fi
 
 if [ "$AUTO_YES" -ne 1 ]; then
@@ -170,6 +237,11 @@ if [ "$NODE_WAS_MISSING" -eq 1 ]; then
   echo "[installed] Node.js 20.19+ / 22.12+"
 fi
 
+if [ "$REDIS_WAS_MISSING" -eq 1 ] && [ "$REDIS_IS_LOCAL" -eq 0 ]; then
+  echo "远程 Redis 只需要 redis-cli 作为安全探测客户端；为避免安装不需要的本机 redis-server，请先单独安装 redis-cli 后重试。" >&2
+  exit 1
+fi
+
 if [ "$REDIS_WAS_MISSING" -eq 1 ]; then
   case "$OS_NAME" in
     Darwin) install_with_brew redis ;;
@@ -186,13 +258,6 @@ if [ "$REDIS_WAS_MISSING" -eq 1 ]; then
   fi
   echo "[installed] Redis"
 fi
-
-case "$REDIS_URL" in
-  redis://127.0.0.1:*|redis://localhost:*|redis://127.0.0.1/*|redis://localhost/*)
-    REDIS_IS_LOCAL=1
-    ;;
-  *) REDIS_IS_LOCAL=0 ;;
-esac
 
 if ! redis_is_reachable && [ "$REDIS_IS_LOCAL" -eq 1 ]; then
   echo "[start] 正在启动本机 Redis"

@@ -140,8 +140,9 @@ function TaskCard({
   onOpen: () => void;
 }) {
   const { t } = useI18n();
+  const resolution = getResolutionPresentation(task);
   return (
-    <article className="task-card">
+    <article className={`task-card ${resolution?.status === 'resolved' ? 'task-card-resolved' : ''}`.trim()}>
       <button
         type="button"
         className="task-card-open"
