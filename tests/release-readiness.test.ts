@@ -52,10 +52,11 @@ describe('release configuration', () => {
     expect(new Set(dedicatedUrls.map((url) => url.pathname)).size).toBe(dedicatedUrls.length);
   });
 
-  it('the repository test runner remains single-fork while Redis suites use FLUSHDB', () => {
+  it('the repository test runner remains single-threaded while Redis suites use FLUSHDB', () => {
     const config = readFileSync(join(root, 'vitest.config.ts'), 'utf8');
     expect(config).toMatch(/fileParallelism:\s*false/);
-    expect(config).toMatch(/singleFork:\s*true/);
+    expect(config).toMatch(/pool:\s*['"]threads['"]/);
+    expect(config).toMatch(/singleThread:\s*true/);
   });
 
   it('builds the server before tests that launch packaged CLI entrypoints', () => {

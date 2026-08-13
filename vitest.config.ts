@@ -8,9 +8,9 @@ export default defineConfig({
     hookTimeout: 10000,
     // 所有测试共享同一 Redis，必须串行（文件级 + 测试级）
     fileParallelism: false,
-    pool: 'forks',
+    pool: 'threads',
     poolOptions: {
-      forks: { singleFork: true },
+      threads: { singleThread: true },
     },
   },
 });
