@@ -502,7 +502,11 @@ async function invokeAgent(command, payload, timeoutMs) {
         ? `PM Agent 命令被信号 ${signal} 终止`
         : `PM Agent 命令退出码为 ${code ?? 'unknown'}`));
     });
-    child.stdin.once('error', (error) => settle(reject, error));
+    child.stdin.once('error', (error) => {
+      // 命令可以在读取 stdin 前正常退出（例如健康检查用 /usr/bin/true）。此时
+      // EPIPE 只是输入管道的竞态，最终成功与否应由 close 的退出码决定。
+      if (error?.code !== 'EPIPE') settle(reject, error);
+    });
     const timeout = setTimeout(() => {
       beginTermination(`PM Agent 命令超过 ${timeoutMs}ms 未退出`);
     }, timeoutMs);

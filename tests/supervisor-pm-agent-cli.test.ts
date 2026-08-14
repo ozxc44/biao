@@ -253,7 +253,7 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs = 1_000): Promise<boolean> {
+async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (processIsAlive(pid) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -315,7 +315,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       import { existsSync, readFileSync, writeFileSync } from 'node:fs';
       const [started, peerStarted, output] = process.argv.slice(2);
       writeFileSync(started, 'started', 'utf8');
-      const deadline = Date.now() + 1500;
+      const deadline = Date.now() + 5000;
       while (!existsSync(peerStarted) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }

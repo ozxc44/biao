@@ -302,6 +302,31 @@ function stopActivePmAgents(signal = 'SIGTERM') {
   for (const slotId of activePmAgents.keys()) stopActivePmAgent(slotId, signal);
 }
 
+async function stopAndDrainActivePmAgents() {
+  const waitForActivePmAgents = async (timeoutMs) => {
+    const children = [...activePmAgents.values()]
+      .filter((child) => child.exitCode === null && child.signalCode === null);
+    if (children.length === 0) return;
+    const waitForClose = (child) => new Promise((resolveClose) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolveClose();
+        return;
+      }
+      child.once('close', resolveClose);
+    });
+    await Promise.race([
+      Promise.all(children.map(waitForClose)),
+      new Promise((resolveTimeout) => setTimeout(resolveTimeout, timeoutMs)),
+    ]);
+  };
+
+  stopActivePmAgents('SIGTERM');
+  await waitForActivePmAgents(1_200);
+  if (activePmAgents.size === 0) return;
+  stopActivePmAgents('SIGKILL');
+  await waitForActivePmAgents(300);
+}
+
 function clearActivePmAgent(slotId, child) {
   if (activePmAgents.get(slotId) !== child) return;
   activePmAgents.delete(slotId);
@@ -615,7 +640,7 @@ try {
   console.error(`[supervisor] 启动/运行失败：${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = receivedSignal ? signalExitCode(receivedSignal) : 1;
 } finally {
-  stopActivePmAgents('SIGTERM');
+  await stopAndDrainActivePmAgents();
   process.off('SIGINT', onSigint);
   process.off('SIGTERM', onSigterm);
   releaseLocalLock(handle);
