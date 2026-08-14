@@ -20,6 +20,25 @@ import type { ClaimedTask, VerifyCommand } from '../src/types/index.js';
 
 let tmpDir: string;
 
+/**
+ * SIGKILL 已经让进程停止执行时，Linux 仍可能短暂保留一个等待 init 回收的
+ * zombie。它不能继续写入、持有 Worker slot 或运行 Agent，因此按终止处理。
+ */
+function isPidTerminated(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 1).trimStart().startsWith('Z');
+  } catch {
+    return true;
+  }
+}
+
 function transientFetchError(message = 'fetch failed'): TypeError {
   const error = new TypeError(message);
   Object.assign(error, { cause: { code: 'ECONNRESET' } });
@@ -962,7 +981,7 @@ describe('runAgentCli', () => {
     expect(r.exitCode).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(8_000);
     expect(Number.isSafeInteger(grandchildPid)).toBe(true);
-    expect(() => process.kill(grandchildPid, 0)).toThrow();
+    expect(isPidTerminated(grandchildPid)).toBe(true);
   }, 10_000);
 
   it.skipIf(process.platform === 'win32')('abort 先 SIGTERM 再强制回收 Agent 进程树，close 后不能 late-write', async () => {
@@ -1016,8 +1035,8 @@ describe('runAgentCli', () => {
     expect(existsSync(termPath)).toBe(true);
     expect(existsSync(latePath)).toBe(false);
     expect(existsSync(grandchildLatePath)).toBe(false);
-    expect(() => process.kill(pids.parent, 0)).toThrow();
-    expect(() => process.kill(pids.grandchild, 0)).toThrow();
+    expect(isPidTerminated(pids.parent)).toBe(true);
+    expect(isPidTerminated(pids.grandchild)).toBe(true);
   }, 8_000);
 
   it('不存在的命令', async () => {
