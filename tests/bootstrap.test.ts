@@ -311,6 +311,8 @@ describe('clone 后自举配置', () => {
     expect(guide).toContain('不自动 review、answer 或 ack');
     expect(guide).toContain('不自动安装 cron 或 launchd');
     expect(guide).toContain('done 不等于 accepted');
+    expect(guide).toContain('旧 attempt 的失败证据不能冒充当前交付结果');
+    expect(guide).toContain('`changed_files=[]` 不是自动拒绝条件');
     expect(guide).toContain('独立验收');
     expect(guide).toContain('.biao/pm plan create');
     expect(guide).toContain('--verify-cmd');

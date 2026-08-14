@@ -456,7 +456,7 @@ node bin/biao.js review my-feature-acceptance \
   --reverify-only
 ```
 
-平台保留原 reject 审计，直接创建 fresh `<acceptance>-reverify-N`；它分别原样继承原 acceptance 的 `depends_on` 与 `acceptance_for`（两者不能相互替代），并继承 ownership 和 Verify、排除原验收者，仍须新的 Worker report 和 PM accept 才闭环。所有原 `depends_on` 和 `acceptance_for` 来源均须已 accepted/resolved，否则 fail closed。重复相同请求只回放同一复验任务；之后改成默认 source repair 会被拒绝。`--reverify-only` 只能用于 acceptance reject，不能和 `--repair-ownership` 同时使用。单来源验收未显式指定时修复该来源；多来源验收不会默认 fan-out，必须选择独立复验或分别处理具体来源。
+平台保留原 reject 审计，直接创建 fresh `<acceptance>-reverify-N`；它分别原样继承原 acceptance 的 `depends_on` 与 `acceptance_for`（两者不能相互替代），并继承 ownership 和 Verify、排除原验收者，仍须新的 Worker report 和 PM accept 才闭环。所有原 `depends_on` 和 `acceptance_for` 来源均须已 accepted/resolved，否则 fail closed。重复相同请求只回放同一复验任务；之后改成默认 source repair 会被拒绝。`--reverify-only` 只能用于 acceptance reject，不能和 `--repair-ownership` 同时使用。单来源验收未显式指定时修复该来源；多来源验收的普通 reject 会先进入 `repair_sources_required`，由 PM 通过 `task resolution ... --action inspect` 和 `--action continue --repair-source-task <最小来源>` 显式选源，平台不会默认 fan-out。
 
 如果验收证据表明修复必须涉及原任务 ownership 之外、但相邻且可明确列举的文件或模块，PM 可以**只为新 repair**授予最小扩展范围。原任务的 ownership、结果和拒绝审计不会被改写；平台会把新增范围写入 repair 的审计与目标中。参数使用单个 JSON，便于脚本安全传递：
 

@@ -197,11 +197,17 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain("question list --consumer 'pm-a' --status open --plan 'plan-one'");
     expect(invoked.stdin).toContain("question get <question_id> --consumer 'pm-a' --plan 'plan-one'");
     expect(invoked.stdin).toContain("question answer <question_id> --consumer 'pm-a' --plan 'plan-one'");
+    expect(invoked.stdin).toContain('--approve-ownership');
+    expect(invoked.stdin).toContain('--reject-ownership');
+    expect(invoked.stdin).toContain('requested_ownership');
+    expect(invoked.stdin).toContain('不得在缺少所有权决定时反复调用 answer');
     expect(invoked.stdin).toContain("pm unacked --consumer 'pm-a' --plan 'plan-one' --type question_asked --json");
     expect(invoked.stdin).toContain("pm ack --consumer 'pm-a' --plan 'plan-one' --event-id <asked_event_id>");
     expect(invoked.stdin).toContain('question answer');
     expect(invoked.stdin).toContain('review');
     expect(invoked.stdin).toContain('`reverify-only` 只允许 type=acceptance');
+    expect(invoked.stdin).toContain('多来源 acceptance 若发现具体产品缺陷');
+    expect(invoked.stdin).toContain('正常 reject 会先冻结拒绝审计');
     expect(invoked.stdin).toContain('普通 code/docs/research 任务');
     expect(invoked.stdin).toContain(`${pmLauncher} task resolution <task_id>`);
     expect(invoked.stdin).toContain('task resolution 不接受 --plan');

@@ -379,6 +379,8 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
     expect(invoked.argv).toContain(realpathSync(workspace));
     expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm-start')));
     expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm')));
+    expect(invoked.stdin).toContain('旧 attempt 的失败字段绝不能冒充当前交付结果');
+    expect(invoked.stdin).toContain('`changed_files=[]` 也不是自动拒绝条件');
   });
 
   it('有事项却没有显式 command 时给出可辨识配置失败，不启动 child', async () => {

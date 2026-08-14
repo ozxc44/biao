@@ -463,6 +463,36 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(sampleTask().question_answer).toBeUndefined();
   });
 
+  it('acceptance_ready immediately wakes the shared Worker scheduler', async () => {
+    const { url } = await startBiaoLikeServer({
+      events: () => ({
+        events: [{
+          event_id: 'evt-acceptance-ready', type: 'acceptance_ready', task_id: 'fresh-reverify',
+          plan_id: 'open-a', consumer: 'pm-a', timestamp: 202,
+        }],
+        next_cursor: '202-0',
+      }),
+      intake: () => ({ consumer: 'pm-a', cursor: '202-0', counts: {}, items: [] }),
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      workers: [{
+        agentId: 'acceptance-a', agentType: 'test', preferredProject: '/tmp/a',
+        capabilities: ['acceptance'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+      pollIntervalMs: 1_000,
+    });
+
+    await runtime.runOnce();
+
+    expect(runtime.workerWakeCount()).toBe(1);
+  });
+
   it('two identity-scoped idle slots each claim once and emit one presence heartbeat per shared refresh', async () => {
     const { url, requests } = await startBiaoLikeServer();
     const execute = async () => ({
@@ -677,13 +707,9 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/heartbeat')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
-    const offline = requests.filter((request) => request.path === '/agent/offline');
-    expect(offline).toHaveLength(1);
-    expect(JSON.parse(offline[0].body)).toEqual({
-      agent_id: 'code-a',
-      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
-      reason: 'plans_terminal',
-    });
+    // 本轮从未注册过 slot，就不能拿随机的新 epoch 去 offline 服务端可能仍保留的
+    // 历史 epoch；否则每次空转巡检都会产生 AGENT_REGISTRATION_CHANGED 噪声。
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
   });
 
   it('plans_terminal 软停机后新活跃计划出现时，以全新 epoch 复活 slot 并继续领取（留守/重入）', async () => {
@@ -1247,11 +1273,13 @@ describe('SharedWorkerCoordinator shutdown serialization', () => {
       }],
     });
 
+    await coordinator.refreshIdlePresence();
     await Promise.all([
       coordinator.offlineAll('supervisor_signal'),
       coordinator.offlineAll('supervisor_exit'),
     ]);
 
+    expect(requests.filter((request) => request.path === '/register')).toHaveLength(1);
     const offline = requests.filter((request) => request.path === '/agent/offline');
     expect(offline).toHaveLength(1);
     expect(JSON.parse(offline[0].body)).toEqual({
@@ -1281,7 +1309,7 @@ describe('SharedWorkerCoordinator shutdown serialization', () => {
     await coordinator.scheduleIfRequested();
 
     expect(wakeSignals).toEqual([]);
-    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
   });

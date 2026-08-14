@@ -72,7 +72,7 @@ function fakeRedis(): Redis {
 }
 
 describe('HTTP bearer authentication', () => {
-  it.each(['/status', '/plans', '/questions?consumer=pm', '/ownership/active'])(
+  it.each(['/status', '/plans', '/questions?consumer=pm'])(
     'denies scoped Worker bearer access to control-plane read %s',
     async (url) => {
       const app = await createHttpServer(fakeRedis(), {
@@ -96,6 +96,25 @@ describe('HTTP bearer authentication', () => {
       }
     },
   );
+
+  it('allows scoped Workers to read the active ownership roster used for concurrent diff attribution', async () => {
+    const app = await createHttpServer(fakeRedis(), {
+      ...config(),
+      workerApiToken: 'worker-only-secret',
+    } as BiaoConfig & { workerApiToken: string });
+
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/ownership/active',
+        headers: { authorization: 'Bearer worker-only-secret' },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ ok: true, data: { ownership: [] } });
+    } finally {
+      await app.close();
+    }
+  });
 
   it.each([
     ['/task/example/review', { verdict: 'accept', reviewed_by: 'forged-pm' }],

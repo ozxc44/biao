@@ -247,6 +247,114 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     contender.disconnect();
   });
 
+  it('acceptance continue 持锁创建新 reverify 期间，后台 reconcile 不得把根改回 PM 决策', async () => {
+    const sourceId = 'continue-race-source';
+    const rootId = 'continue-race-acceptance';
+    const oldReverifyId = `${rootId}-reverify-2`;
+    const owner = 'continue-owner-token';
+    await seedTask(sourceId);
+    await redis.zrem(keys.zset.status.pending, sourceId);
+    await redis.zadd(keys.zset.status.done, 60_000, sourceId);
+    await redis.hset(keys.hash.task(sourceId), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      resolution_status: 'resolved',
+    });
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: [sourceId],
+      depends_on: [sourceId],
+      max_retries: 2,
+    });
+    await seedTask(oldReverifyId, {
+      type: 'acceptance',
+      acceptance_for: [sourceId],
+      depends_on: [sourceId],
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: 2,
+    });
+    await redis.zrem(keys.zset.status.pending, rootId, oldReverifyId);
+    await redis.zadd(keys.zset.status.failed, 60_001, rootId, 60_002, oldReverifyId);
+    await redis.hset(keys.hash.task(oldReverifyId), { status: 'failed' });
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'repairing',
+      resolution_action: 'continue',
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      resolution_task_id: oldReverifyId,
+      resolution_task_ids: oldReverifyId,
+      resolution_decision_reason: 'reverify_retry_limit_reached',
+      resolution_continue_owner: owner,
+      resolution_continue_snapshot_generation: '2',
+      resolution_continue_snapshot_reason: 'reverify_retry_limit_reached',
+    });
+    await redis.set(keys.string.pmReviewLock(rootId), owner, 'PX', 60_000);
+
+    expect(await reconcileResolutionBacklog(redis)).toMatchObject({
+      needs_pm_decision_task_ids: [],
+    });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_action: 'continue',
+      resolution_continue_owner: owner,
+      resolution_task_id: oldReverifyId,
+    });
+  });
+
+  it('旧 failed reverify 比根任务先被扫描时，不得撤销根当前的 pending reverify', async () => {
+    const sourceId = 'reverify-order-source';
+    const rootId = 'reverify-order-root';
+    const oldId = `${rootId}-reverify-1`;
+    const currentId = `${rootId}-reverify-2`;
+    await seedTask(sourceId);
+    await redis.zrem(keys.zset.status.pending, sourceId);
+    await redis.zadd(keys.zset.status.done, 70_000, sourceId);
+    await redis.hset(keys.hash.task(sourceId), { status: 'done', pm_review_status: 'accepted' });
+    await seedTask(rootId, {
+      type: 'acceptance', acceptance_for: [sourceId], depends_on: [sourceId], max_retries: 2,
+    });
+    for (const [id, generation] of [[oldId, 1], [currentId, 2]] as const) {
+      await seedTask(id, {
+        type: 'acceptance', acceptance_for: [sourceId], depends_on: [sourceId],
+        fix_for: rootId, repair_root_task_id: rootId, resolution_generation: generation,
+      });
+    }
+    await redis.zrem(keys.zset.status.pending, rootId, oldId);
+    await redis.zadd(keys.zset.status.failed, 1, oldId, 2, rootId);
+    await redis.hset(keys.hash.task(oldId), {
+      status: 'failed',
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: '1',
+    });
+    await redis.hset(keys.hash.task(currentId), {
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: '2',
+    });
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      resolution_task_id: currentId,
+      resolution_task_ids: `${oldId},${currentId}`,
+      resolution_decision_reason: '',
+    });
+
+    expect(await reconcileResolutionBacklog(redis)).toMatchObject({ needs_pm_decision_task_ids: [] });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+      resolution_task_id: currentId,
+    });
+    expect(await redis.hget(keys.hash.task(currentId), 'status')).toBe('pending');
+    expect(await redis.exists(keys.hash.task(`${sourceId}-repair-1`))).toBe(0);
+  });
+
   it('legacy 空 generation/attempts 的首次 continue 只创建一个 child 与一条审计', async () => {
     const taskId = 'legacy-empty-resolution-counters';
     await seedTask(taskId, { max_retries: 0 });

@@ -95,7 +95,9 @@ function workerRequestAllowed(method: string, pathname: string): boolean {
   if (method === 'GET' || method === 'HEAD') {
     // Read access is also fail-closed: a future PM endpoint must not become Worker-readable
     // merely because it was not added to a denylist. These are the only reads used by BiaoClient.
-    return path === '/ownership' || /^\/task\/[^/]+$/.test(path);
+    // Worker 需要当前 ownership roster 才能把共享工作树中的并发改动归给真正
+    // 持有者；该只读数据面不包含 PM token、结果正文或控制面能力。
+    return path === '/ownership' || path === '/ownership/active' || /^\/task\/[^/]+$/.test(path);
   }
   if (method !== 'POST') return false;
   return /^(?:\/register|\/heartbeat|\/agent\/offline|\/claim|\/report|\/question|\/lease\/renew|\/ownership\/(?:declare|release)|\/task\/[^/]+\/block)$/.test(path);

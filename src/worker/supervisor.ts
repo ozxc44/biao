@@ -648,6 +648,8 @@ export interface SupervisorWorkerSlot {
 
 interface ManagedWorkerSlot extends SupervisorWorkerSlot {
   client: BiaoClient;
+  /** 仅表示当前 Coordinator 生命周期已经成功注册过该 client epoch。 */
+  registered: boolean;
   running: boolean;
   settled?: Promise<void>;
 }
@@ -715,6 +717,7 @@ export class SharedWorkerCoordinator {
     this.slots = opts.slots.map((slot) => ({
       ...slot,
       client: new BiaoClient(opts.biaoUrl, slot.agentId, opts.apiToken),
+      registered: false,
       running: false,
       settled: undefined,
     }));
@@ -758,7 +761,7 @@ export class SharedWorkerCoordinator {
       await Promise.allSettled(pending);
     }
     if (this.offline) return;
-    await Promise.all(this.slots.map(async (slot) => {
+    await Promise.all(this.slots.filter((slot) => slot.registered).map(async (slot) => {
       try {
         const response = await slot.client.offline(reason);
         if (response?.ok === false) {
@@ -766,6 +769,8 @@ export class SharedWorkerCoordinator {
         }
       } catch (error) {
         this.onError?.(`共享 Worker 离线登记异常（${slot.agentId}）：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        slot.registered = false;
       }
     }));
     this.started = false;
@@ -789,6 +794,7 @@ export class SharedWorkerCoordinator {
     this.offline = false;
     for (const slot of this.slots) {
       slot.client = new BiaoClient(this.biaoUrl, slot.agentId, this.apiToken);
+      slot.registered = false;
     }
     // 软停机期间 wake() 被抑制，新工作的调度请求可能已丢失；复活即补发一次，
     // 让当轮 refreshIdlePresence/scheduleIfRequested 直接领取新任务。
@@ -915,6 +921,7 @@ export class SharedWorkerCoordinator {
       if (registered?.ok === false) {
         throw new Error(`共享 Worker 注册失败（${slot.agentId}）：${registered.error?.code ?? 'UNKNOWN'} ${registered.error?.message ?? ''}`.trim());
       }
+      slot.registered = true;
     }
     if (this.shutdownReason || this.offlining || this.offline) return;
     this.started = true;
@@ -1138,6 +1145,10 @@ export class BiaoSupervisorRuntime {
         // 唤醒共享 coordinator，不把 Question/任务正文交给 Worker slot。
         'task_resumed',
         'task_ready',
+        // fresh acceptance/reverify 已进入普通 pending/claim 队列；它是 Worker 门铃，
+        // 不能等下一次 plan 轮询才发现，否则 PM continue 后会出现最长一个监视频率
+        // 的空窗。
+        'acceptance_ready',
         'dependency_ready',
         'ownership_released',
       ].includes(event.type)) {

@@ -205,6 +205,10 @@ export class BiaoClient {
     return this.api(`/ownership?path=${encodeURIComponent(path)}&agent_id=${this.agentId}`);
   }
 
+  async listActiveOwnership(): Promise<any> {
+    return this.api('/ownership/active');
+  }
+
   async getTask(taskId: string): Promise<{ ok: boolean; data: { status?: string; claimed_by?: string } | null }> {
     return this.api(`/task/${taskId}`);
   }
@@ -1228,12 +1232,19 @@ async function excludeChangesOwnedByOtherWorkers(
   agentId: string,
   changes: ProjectFileChange[],
   agentReportedPaths: ReadonlySet<string>,
+  ownershipAtExecutionStart: readonly { path: string; agent_id: string }[] = [],
 ): Promise<ProjectFileChange[]> {
   const decisions = await Promise.all(changes.map(async (change) => {
     // Kimi/Codex 工具流已明确记录当前 Agent 触碰该文件时，不能再用
     // “当前由他人 ownership 覆盖”把它排除。这正是 checkout/restore 覆盖
     // 他人未提交变更的高风险场景，必须 fail closed。
     if (agentReportedPaths.has(change.path)) return true;
+    // 另一 Worker 可能先完成并释放 ownership，导致结束时查询看不到它；执行起点的
+    // ownership 快照仍能证明该路径属于并发 lane。只对 Agent 未自报的路径生效，
+    // 因此 checkout/restore 覆盖他人文件仍会按上面的 fail-closed 规则处理。
+    if (ownershipAtExecutionStart.some((owner) =>
+      owner.agent_id !== agentId && globPatternMatchesPath(owner.path, change.path),
+    )) return false;
     try {
       const ownership = await client.checkOwnership(change.path);
       const ownerId = ownership?.data?.owner?.agent_id;
@@ -1505,6 +1516,11 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       // Worker 执行窗口的真实文件基线。它在 claim/ownership/lease 都确认后、Agent
       // 启动前建立，因此领取前已有的 dirty diff 不会自动算给当前 Worker。
       const projectFilesBefore = snapshotProjectFiles(projectPath);
+      const ownershipAtExecutionStart = typeof client.listActiveOwnership === 'function'
+        ? await client.listActiveOwnership()
+          .then((response) => Array.isArray(response?.data?.ownership) ? response.data.ownership : [])
+          .catch(() => [])
+        : [];
 
       // lease 续租：execute 前启动定时器，每 timeout/3 秒续一次，避免长任务 lease 过期被回收
       const leaseTimeout = task.timeout_seconds ?? 1800;
@@ -1567,6 +1583,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           cfg.agentId,
           projectFileChanges,
           normalizedReportedPaths,
+          ownershipAtExecutionStart,
         );
       }
       const actualChangedFiles = projectFileChanges

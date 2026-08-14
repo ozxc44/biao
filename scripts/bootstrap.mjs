@@ -937,6 +937,8 @@ BIAO_QUESTION: {"body":"需要 PM 决定的问题","checkpoint":"已完成内容
 - Worker 心跳、退出码、产出文件和测试数量不能单独代替验收。
 - acceptance 必须由没有执行被验收任务的独立 Agent 完成。
 - Verify 失败不得接受；拒绝时写清原因和可执行修复指令。
+- Review 必须先读取“当前 task”的 \`result_path\`、\`result_json_path\` 及其明确引用的 evidence，再把触发它的旧 reject/evidence 作为缺陷来源对照。旧 attempt 的失败证据不能冒充当前交付结果；若当前新鲜证据已经推翻旧结论，评语必须引用当前证据的实际字段。
+- \`changed_files=[]\` 不是自动拒绝条件。在共享工作树的连续 repair 中，前代未提交实现可能仍真实存在；当前 task 若通过新鲜、可复跑的真实流程证据证明该实现已满足要求，PM 应核对当前 diff、ownership 与证据后按事实验收，不得要求无意义地重复触碰代码。只有 result 自称有改动却漏报、越权改动、或当前证据仍不能证明目标时才因此拒绝。
 - 重置任务后旧结果和旧验收失效，必须重新执行和验收。
 - 不直接修改 Worker 正在持有 ownership 的文件。
 - 不替 Worker 向人类追问：Worker 的阻塞决策必须经平台 Question；PM 读取并回答后，Worker 用新 claim 继续。

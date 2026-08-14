@@ -192,6 +192,55 @@ describe('Worker Git ownership boundary', () => {
     );
   });
 
+  it('另一 Worker 在本任务结束前已释放 ownership 时，仍按执行起点快照排除其并发变更', async () => {
+    const claimedTask = task(['src/owned/**']);
+    const report = vi.fn(async () => ({ ok: true, data: {} }));
+    const client = clientFor(claimedTask, report);
+    (client as any).listActiveOwnership = vi.fn(async () => ({
+      ok: true,
+      data: {
+        ownership: [{
+          path: 'src/foreign/**',
+          agent_id: 'other-worker',
+          task_id: 'other-task',
+          priority: 5,
+          declared_at: Date.now() - 1_000,
+          expires_at: Date.now() + 60_000,
+          base_commit_sha: 'fixture',
+        }],
+        total: 1,
+      },
+    }));
+    // 模拟另一 Worker 已先完成并释放 ownership：结束时点查询已看不到 owner。
+    vi.mocked(client.checkOwnership).mockResolvedValue({
+      ok: true,
+      data: { occupied: false, action: 'proceed' },
+    });
+
+    await runWorkerLoop({
+      agentId: 'boundary-worker',
+      agentType: 'test',
+      maxTasks: 1,
+      client,
+      execute: async () => {
+        writeFileSync(join(projectPath, 'src', 'owned', 'created.ts'), 'mine\n');
+        writeFileSync(join(projectPath, 'src', 'foreign', 'concurrent.ts'), 'other worker\n');
+        return {
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false },
+          changedFiles: ['src/owned/created.ts'], backend: 'test', model: 'test',
+        };
+      },
+    });
+
+    const result = JSON.parse(readFileSync(join(projectPath, 'work', claimedTask.task_id, 'result.json'), 'utf8'));
+    expect(result.changed_files).toEqual(['src/owned/created.ts']);
+    expect(result.ownership_violations).toBeUndefined();
+    expect(result.status).toBe('success');
+    expect(report).toHaveBeenCalledWith(
+      claimedTask.task_id, claimedTask.claim_token, 'done', expect.any(String), expect.any(String), [],
+    );
+  });
+
   it('Agent 自报触碰了他人 ownership 文件时仍 fail closed，不得把 checkout 回滚伪装成并发改动', async () => {
     const claimedTask = task(['src/owned/**']);
     const report = vi.fn(async () => ({ ok: true, data: {} }));

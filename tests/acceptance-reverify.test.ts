@@ -19,6 +19,7 @@ import {
   pmReview,
   reconcileResolutionBacklog,
   report,
+  resolutionDecision,
   runWatchdog,
   setSqliteStore,
 } from '../src/server/service.js';
@@ -390,12 +391,11 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
       resolution_mode: 'reverify',
     })).data?.fix_task_id).toBe('repeat-acceptance-reverify-3');
 
-    // 独立性必须排除来源实现者、原验收者和最近一次复验者，但不能永久耗尽
-    // 所有历史复验者；更早的独立验收者可以轮换回来继续 fresh reverify。
+    // 独立性必须排除来源实现者和最近一次复验者，但不能永久耗尽所有历史
+    // 验收者；已有一轮独立复验后，原验收者也可以轮换回来。
     expect((await claimAs('repeat-implementer', ['acceptance'])).data).toBeNull();
-    expect((await claimAs('repeat-reviewer-1', ['acceptance'])).data).toBeNull();
     expect((await claimAs('repeat-reviewer-3', ['acceptance'])).data).toBeNull();
-    expect((await claimAs('repeat-reviewer-2', ['acceptance'])).data?.task_id)
+    expect((await claimAs('repeat-reviewer-1', ['acceptance'])).data?.task_id)
       .toBe('repeat-acceptance-reverify-3');
   });
 
@@ -866,7 +866,7 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     expect(await redis.exists(keys.hash.task('source-b-repair-1'))).toBe(0);
   });
 
-  it('多来源验收不得默认 fan-out repair，必须改为独立复验或分别处理来源', async () => {
+  it('多来源验收的普通 reject 先冻结审计并进入选源决策，不默认 fan-out repair', async () => {
     for (const sourceId of ['no-fanout-source-a', 'no-fanout-source-b']) {
       await completeCode(sourceId, `worker-${sourceId}`);
       expect((await pmReview(redis, sourceId, {
@@ -887,12 +887,90 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     });
 
     expect(rejected).toMatchObject({
-      ok: false,
-      error: { code: 'MULTI_SOURCE_REPAIR_TARGET_REQUIRED' },
+      ok: true,
+      data: { review_status: 'rejected', fix_task_ids: [] },
     });
-    expect(await redis.hget(keys.hash.task(acceptanceId), 'pm_review_status')).toBe('');
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      pm_review_status: 'rejected',
+      resolution_status: 'needs_pm_decision',
+    });
     expect(await redis.exists(keys.hash.task('no-fanout-source-a-repair-1'))).toBe(0);
     expect(await redis.exists(keys.hash.task('no-fanout-source-b-repair-1'))).toBe(0);
+
+    const selected = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-no-fanout',
+      repair_source_task_id: 'no-fanout-source-a',
+    });
+    expect(selected).toMatchObject({
+      ok: true,
+      data: { state: 'repairing', created_task_ids: ['no-fanout-source-a-repair-1'] },
+    });
+    expect(await redis.exists(keys.hash.task('no-fanout-source-a-repair-1'))).toBe(1);
+    expect(await redis.exists(keys.hash.task('no-fanout-source-b-repair-1'))).toBe(0);
+  });
+
+  it('多来源 fresh reverify 发现产品缺陷时回到验收根选源，不再误生下一代 reverify', async () => {
+    for (const sourceId of ['reverify-product-source-a', 'reverify-product-source-b']) {
+      await completeCode(sourceId, `worker-${sourceId}`);
+      expect((await pmReview(redis, sourceId, {
+        verdict: 'accept', reviewed_by: `pm-${sourceId}`,
+      })).ok).toBe(true);
+    }
+    const rootId = 'reverify-product-acceptance';
+    await completeAcceptance(
+      rootId,
+      ['reverify-product-source-a', 'reverify-product-source-b'],
+      'acceptance-worker-1',
+    );
+    expect((await pmReview(redis, rootId, {
+      verdict: 'reject',
+      reviewed_by: 'pm-root',
+      reject_reason: '只缺复验证据',
+      resolution_mode: 'reverify',
+    })).ok).toBe(true);
+
+    const reverifyId = `${rootId}-reverify-1`;
+    const claimed = await claimAs('acceptance-worker-2', ['acceptance']);
+    expect(claimed.data?.task_id).toBe(reverifyId);
+    const delivered = await report(redis, {
+      task_id: reverifyId,
+      agent_id: 'acceptance-worker-2',
+      claim_token: claimed.data!.claim_token,
+      status: 'done',
+      result_path: writeResult(reverifyId, '# fresh reverify\n\n- 结论：✅ PASS\n'),
+      verify_results: [{ cmd: VERIFY[0].cmd, exit_code: 0, passed: true }],
+    });
+    expect(delivered).toMatchObject({ ok: true });
+
+    const rejected = await pmReview(redis, reverifyId, {
+      verdict: 'reject',
+      reviewed_by: 'pm-reverify',
+      reject_reason: '真实产品缺陷位于 source-b',
+      fix_instructions: '修复 source-b 后重新验收',
+    });
+    expect(rejected).toMatchObject({
+      ok: true,
+      data: { review_status: 'rejected', resolution_mode: 'repair', fix_task_ids: [] },
+    });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_decision_reason: `repair_sources_required:${reverifyId}`,
+      resolution_task_id: reverifyId,
+    });
+    expect(await redis.exists(keys.hash.task(`${rootId}-reverify-2`))).toBe(0);
+
+    const selected = await resolutionDecision(redis, rootId, {
+      action: 'continue',
+      decided_by: 'pm-reverify',
+      repair_source_task_id: 'reverify-product-source-b',
+    });
+    expect(selected).toMatchObject({
+      ok: true,
+      data: { state: 'repairing', created_task_ids: ['reverify-product-source-b-repair-1'] },
+    });
+    expect(await redis.exists(keys.hash.task('reverify-product-source-a-repair-1'))).toBe(0);
+    expect(await redis.exists(keys.hash.task('reverify-product-source-b-repair-1'))).toBe(1);
   });
 
   it('单来源验收的显式扩权相对来源 ownership 校验，并只写入来源 repair', async () => {

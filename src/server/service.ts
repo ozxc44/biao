@@ -3826,6 +3826,18 @@ async function reconcileResolutionBacklogUnlocked(
       handledRoots.add(rootTaskId);
       continue;
     }
+    // PM 的显式 continue 已先用持久 owner 把根任务占位为 repairing，再创建下一代
+    // child。这个很短的窗口里 pointer 仍可能指向旧失败 attempt；后台 reconcile
+    // 若按旧 pointer 收敛，会清空新 pointer、重新触发 retry-limit，并撤销刚创建的
+    // pending child。只要同一 PM 锁仍有效，就让原事务完成；失锁后由
+    // recoverInterruptedResolutionContinues 按持久 intent 接管。
+    if (
+      resolutionOwner.resolution_continue_owner &&
+      await redis.get(keys.string.pmReviewLock(resolutionOwner.task_id)) === resolutionOwner.resolution_continue_owner
+    ) {
+      handledRoots.add(rootTaskId);
+      continue;
+    }
     // PM 已为多来源验收显式选源且对应 repair 正在执行时，该选择就是当前
     // resolution。reconcile 只能恢复发布/投影，不能再次改回 needs_pm_decision；
     // 否则 Supervisor 会重复唤醒 PM，并可能重复创建来源修复。
@@ -3972,33 +3984,37 @@ async function reconcileResolutionBacklogUnlocked(
       needsPmDecisionTaskIds.push(rootTaskId);
       continue;
     }
-    const activeRootReverify = source.type === 'acceptance' &&
-      source.resolution_action === 'reverify' &&
-      currentRepair.task_id === source.resolution_task_id &&
+    // candidate 可能是同一根下较早的 failed/rejected reverify。是否已有当前活跃
+    // 复验必须以 resolutionOwner（验收根）的最新指针判断，不能读取这个历史 child
+    // 自己为空的 resolution_action；否则历史 child 先被扫描时会绕过这里，把刚由
+    // PM continue 创建的 pending reverify 再次取消。
+    const activeRootReverify = resolutionOwner.type === 'acceptance' &&
+      resolutionOwner.resolution_action === 'reverify' &&
+      currentRepair.task_id === resolutionOwner.resolution_task_id &&
       currentRepair.type === 'acceptance' &&
-      currentRepair.fix_for === source.task_id &&
+      currentRepair.fix_for === resolutionOwner.task_id &&
       currentRepair.repair_root_task_id === rootTaskId &&
       (
         ['pending', 'running', 'blocked'].includes(currentRepair.status) ||
         (currentRepair.status === 'done' && !currentRepair.pm_review_status)
       );
     if (activeRootReverify) {
-      const gate = await acceptanceReverifyRepairGate(redis, source);
+      const gate = await acceptanceReverifyRepairGate(redis, resolutionOwner);
       if (!gate.allowed) {
         if (currentRepair.status === 'pending') {
           await terminalizePendingResolutionChildren(
             redis,
-            source,
+            resolutionOwner,
             [currentRepair.task_id],
             'acceptance_repair_required',
             `最新验收决定 ${gate.reviewTaskId} 要求修复，未有后续 accepted repair，已阻止无修复复验`,
           );
         }
-        await markAcceptanceFailureResolution(redis, source.task_id, [], true);
+        await markAcceptanceFailureResolution(redis, resolutionOwner.task_id, [], true);
         await markResolutionNeedsPmDecision(
           redis,
           rootTaskId,
-          acceptanceSourceIds(source).length > 1
+          acceptanceSourceIds(resolutionOwner).length > 1
             ? `repair_sources_required:${gate.reviewTaskId}`
             : `acceptance_repair_required:${gate.reviewTaskId}`,
         );
@@ -4007,9 +4023,9 @@ async function reconcileResolutionBacklogUnlocked(
         continue;
       }
       await ensurePendingTaskPublished(redis, currentRepair);
-      await ensureAcceptanceReadyEvent(redis, source, currentRepair);
+      await ensureAcceptanceReadyEvent(redis, resolutionOwner, currentRepair);
       await persistTaskFromRedis(redis, currentRepair.task_id);
-      await persistTaskFromRedis(redis, source.task_id);
+      await persistTaskFromRedis(redis, resolutionOwner.task_id);
       handledRoots.add(rootTaskId);
       continue;
     }
@@ -4812,7 +4828,6 @@ async function acceptanceReviewerConflictTask(
 
   const independentFrom = new Set(task.acceptance_for ?? []);
   if (task.repair_root_task_id) {
-    independentFrom.add(task.repair_root_task_id);
     const root = await redis.hgetall(keys.hash.task(task.repair_root_task_id));
     for (const taskId of (root.acceptance_repair_task_ids ?? '').split(',').filter(Boolean)) {
       independentFrom.add(taskId);
@@ -4821,12 +4836,17 @@ async function acceptanceReviewerConflictTask(
       .split(',')
       .filter((taskId) => taskId && taskId !== task.task_id)
       .reverse();
+    let priorReviewerFound = false;
     for (const taskId of priorResolutionIds) {
       if (await redis.hget(keys.hash.task(taskId), 'claimed_by')) {
         independentFrom.add(taskId);
+        priorReviewerFound = true;
         break;
       }
     }
+    // 第一代 reverify 必须与原验收者不同；之后只排除最近一次真实 reverify，允许
+    // 两个独立验收槽位轮换。永久排除原验收者会让有限静态池在第二代后耗尽。
+    if (!priorReviewerFound) independentFrom.add(task.repair_root_task_id);
   }
 
   for (const taskId of independentFrom) {
@@ -10483,20 +10503,6 @@ async function pmReviewLocked(
       },
     };
   }
-  if (
-    req.verdict === 'reject' && hash.type === 'acceptance' &&
-    requestedResolutionMode === 'repair' && acceptanceFor.length > 1 &&
-    !hash.pm_review_status
-  ) {
-    return {
-      ok: false,
-      data: null,
-      error: {
-        code: 'MULTI_SOURCE_REPAIR_TARGET_REQUIRED',
-        message: '多来源 acceptance 不得默认 fan-out repair；请用 reverify-only，或分别审查并返修具体来源任务。',
-      },
-    };
-  }
   if (req.verdict === 'reject' && hash.type === 'acceptance' && requestedResolutionMode === 'reverify') {
     for (const sourceTaskId of acceptanceFor) {
       const source = await redis.hgetall(keys.hash.task(sourceTaskId));
@@ -10910,6 +10916,16 @@ async function pmReviewLocked(
       if (!reverify.taskId && !reverify.needsPmDecision) {
         await markResolutionNeedsPmDecision(redis, hash.repair_root_task_id || taskId, 'reverify_schedule_failed');
       }
+    } else if (acceptanceFor.length > 1) {
+      // 多来源验收发现产品缺陷时，先冻结本次 reject 审计，再进入现有的
+      // repair_sources_required 两阶段决策。PM 必须 inspect 后显式点名最小来源；
+      // 在点名前绝不自动 fan-out，也不能因为门禁报错让 review 门铃永久重放。
+      await markAcceptanceFailureResolution(redis, taskId, [], true);
+      await markResolutionNeedsPmDecision(
+        redis,
+        hash.repair_root_task_id || hash.task_id,
+        `repair_sources_required:${taskId}`,
+      );
     } else {
       for (const sourceTaskId of acceptanceFor) {
         resolutions.push(await ensureRepairTask(redis, sourceTaskId, {
