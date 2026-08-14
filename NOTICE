@@ -1,0 +1,8 @@
+Biao
+Copyright 2026 Biao contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+Runtime and development dependencies are installed as separate npm packages
+and remain subject to their own license terms. Their resolved license metadata
+is checked as part of the release audit and continuous integration workflow.

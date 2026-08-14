@@ -769,7 +769,7 @@ Product acceptance covers plan submission, two independent Workers, lease/heartb
 
 ## Current boundaries
 
-Biao is a local/private multi-Agent development control plane, not an enterprise SaaS. It does not yet include:
+Biao is a local-first multi-Agent development control plane, not an enterprise SaaS. Its source code is available under [Apache-2.0](LICENSE), but it does not yet include:
 
 - native GitHub/GitLab PR and CI integration;
 - enterprise SSO, RBAC, or multi-tenancy;
@@ -777,6 +777,8 @@ Biao is a local/private multi-Agent development control plane, not an enterprise
 - model token, cost, or trace analytics;
 - cross-node deployment and elastic scaling.
 
-### Private distribution
+### Source availability and packages
 
-`package.json` remains `private: true` and `license: UNLICENSED`. Git clones and npm tarballs are for authorized local/private use only; they do not grant public permission to copy, modify, or redistribute. CI verifies private artifacts but does not publish to public npm or create public GitHub Releases. Open-sourcing requires a separate owner decision on license, package name, versioning, and release approval.
+Source code, documentation, and included project files are licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for project notices, [CONTRIBUTING.md](CONTRIBUTING.md) for contribution terms, and [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
+
+The root and web `package.json` files intentionally remain `private: true`: this prevents accidental npm publication while package naming, versioning, provenance, and release approval are established. CI verifies source and private package artifacts; it does not publish to npm or create GitHub Releases.

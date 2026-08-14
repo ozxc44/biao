@@ -1191,7 +1191,7 @@ npm run verify:package
 
 ## 当前边界
 
-Biao 当前定位是本地和私有环境的多 Agent 研发控制台，而不是完整企业 SaaS。目前尚未内置：
+Biao 当前定位是本地优先的多 Agent 研发控制台，而不是完整企业 SaaS。源代码以 [Apache-2.0](LICENSE) 公开，但目前尚未内置：
 
 - GitHub/GitLab PR 与 CI 原生联动；
 - 企业 SSO、RBAC 和多租户；
@@ -1201,6 +1201,8 @@ Biao 当前定位是本地和私有环境的多 Agent 研发控制台，而不�
 
 这些能力可以后续接入，但不影响当前本地多 Agent 调度、验证和验收闭环。
 
-### 私有分发策略
+### 源码开放与软件包发布
 
-当前 `package.json` 保持 `private: true` 与 `license: UNLICENSED`：仓库 clone 和 npm tarball 都只面向授权的本地/私有环境，不代表授予公众复制、修改或再分发许可。CI 只验证构建与私有制品完整性，不包含公开 npm publish 或 GitHub Release 发布流程；若未来需要开源或公开发布，必须先由所有者单独确定许可证、包名、版本与发布审批。
+源代码、文档和随仓库提供的项目文件均以 [Apache-2.0](LICENSE) 授权。项目声明见 [NOTICE](NOTICE)，贡献条款见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全漏洞请按 [SECURITY.md](SECURITY.md) 进行负责任披露。
+
+根目录和前端的 `package.json` 仍刻意保留 `private: true`，用于防止在包名、版本、来源证明和发布审批完成前误发 npm。CI 只验证源码与私有制品完整性，不会执行 npm publish 或创建 GitHub Release。
