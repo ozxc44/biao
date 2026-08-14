@@ -1,8 +1,15 @@
 # 真实 Harness 端到端验收剧本（发布前）
 
 自动化测试（`npm test`）的执行器全部是 mock/内联 stub；它们证明的是**平台协议与状态机**
-正确。发布前还需要用**真实 harness**（如本机已登录的 `codex` CLI）走一遍完整交付闭环，
-证明接入层（spawn、prompt、stdout 解析、Verify、report、PM 验收）在真实模型下可用。
+正确。发布前还需要用**真实 harness** 走一遍完整交付闭环，证明接入层（spawn、prompt、
+stdout 解析、Verify、report、PM 验收）在真实模型下可用。
+
+> 实测记录（2026-08-15）：本剧本已用真实 `kimi` CLI（0.29.2，kimi-code/k3）完整执行
+> 通过——领取 → 真实改写仓库 → 逐项 Verify → report done → PM accept → plan
+> completed → Supervisor 干净退出，全部通过标准满足。剧本不绑定 codex：`kind: codex`
+> 换成 `kind: kimi`（或任意 `custom` 执行器）同样适用。GUI-only 的 harness（无无头
+> CLI/API 入口）无法作为 Worker 自动执行，参见 [陌生 Agent 接入包](agent-adapter-kit.md)
+> 的边界说明。
 
 本剧本验证接入链路，不评审模型能力。全程使用隔离的端口 / Redis DB / SQLite / 工作区，
 不触碰生产运行库。

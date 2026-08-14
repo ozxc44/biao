@@ -266,6 +266,7 @@ export async function getDbStatus(redis: Redis): Promise<ApiResponse<{
   task_count: number;
   plan_count: number;
   by_status: Record<string, number>;
+  file_sizes: { main_bytes: number; wal_bytes: number };
   restore_projection: {
     restorable_tasks: number;
     restorable_plans: number;
@@ -307,6 +308,7 @@ export async function getDbStatus(redis: Redis): Promise<ApiResponse<{
       task_count: sqliteStore.getTaskCount(),
       plan_count: sqliteStore.getPlanCount(),
       by_status: sqliteStore.getTaskCountByStatus(),
+      file_sizes: sqliteStore.getFileSizes(),
       restore_projection: {
         restorable_tasks: sqliteStore.getRestorableTasks().length,
         restorable_plans: sqliteStore.getRestorablePlans().length,
@@ -3462,6 +3464,60 @@ async function terminalizePendingResolutionChildren(
 }
 
 /**
+ * A resolved source can legitimately receive a new repair after a later,
+ * independent acceptance discovers another defect.  Such a task is not a stale
+ * sibling of the old winner even though both share the source repair root.
+ */
+async function repairWasTriggeredAfterWinner(
+  redis: Redis,
+  child: Record<string, string>,
+  winner: Record<string, string>,
+): Promise<boolean> {
+  if (!child.trigger_review_task_id) return false;
+  const trigger = await redis.hgetall(keys.hash.task(child.trigger_review_task_id));
+  if (!trigger.task_id) return false;
+  const triggerAt = Number(trigger.pm_reviewed_at || trigger.done_at || trigger.created_at || 0);
+  const winnerAt = Number(winner.pm_reviewed_at || winner.done_at || winner.created_at || 0);
+  return triggerAt > winnerAt;
+}
+
+/**
+ * 防止已被 accepted winner 收敛的旧 repair 在回收/升级窗口重新被领取。
+ *
+ * 这里只处理已经是 pending 的 child；running/blocked/done 现场始终保留给执行器或
+ * PM，不能被后台清理打断。winner、root lineage 与 review 三项都必须闭合，避免仅凭
+ * 一个陈旧 resolved 字段误杀合法的新一代修复。
+ */
+async function terminalizeSupersededPendingRepair(
+  redis: Redis,
+  child: Record<string, string>,
+): Promise<boolean> {
+  if (!child.task_id || child.status !== 'pending' || !child.fix_for) return false;
+  const rootTaskId = child.repair_root_task_id || child.fix_for;
+  const root = await redis.hgetall(keys.hash.task(rootTaskId));
+  if (
+    !root.task_id || root.resolution_status !== 'resolved' ||
+    !root.resolved_by_task || root.resolved_by_task === child.task_id ||
+    !(root.resolution_task_ids ?? '').split(',').filter(Boolean).includes(child.task_id)
+  ) return false;
+  const winner = await redis.hgetall(keys.hash.task(root.resolved_by_task));
+  if (
+    winner.task_id !== root.resolved_by_task ||
+    winner.repair_root_task_id !== root.task_id ||
+    winner.status !== 'done' || winner.pm_review_status !== 'accepted'
+  ) return false;
+  if (await repairWasTriggeredAfterWinner(redis, child, winner)) return false;
+  const cancelled = await terminalizePendingResolutionChildren(
+    redis,
+    root,
+    [child.task_id],
+    `superseded_by_accepted_repair:${winner.task_id}`,
+    `修复 ${winner.task_id} 已验收，回收的旧 sibling 不再重新执行`,
+  );
+  return cancelled.includes(child.task_id);
+}
+
+/**
  * 旧版本只在根任务记录 generation，child 一直是 0；部分 reverify 创建路径还会
  * 漏增 resolution_attempts。确定性 task id 已包含真实代次，可据此幂等回填，
  * 但绝不降低现有计数，也不把不属于该根的碰撞任务纳入 lineage。
@@ -3721,6 +3777,20 @@ async function reconcileResolutionBacklogUnlocked(
       (candidate.status === 'done' && candidate.pm_review_status === 'rejected');
     if (!candidate.task_id || candidate.status === 'cancelled' || !candidateNeedsRepair) continue;
 
+    // A rejected source repair selected by a multi-source acceptance belongs to
+    // that acceptance decision, not to the source's ordinary retry loop. pmReview
+    // already reopened the acceptance root; startup reconciliation must not mint
+    // an unselected source repair before the PM makes the next explicit choice.
+    const selectedAcceptance = await selectedRepairAcceptanceRoot(redis, candidate);
+    if (selectedAcceptance?.task_id) {
+      const normalized = await normalizeRepairSourcesDecisionReason(redis, selectedAcceptance);
+      if (!needsPmDecisionTaskIds.includes(normalized.task_id)) {
+        needsPmDecisionTaskIds.push(normalized.task_id);
+      }
+      handledRoots.add(candidate.repair_root_task_id || candidate.fix_for || candidate.task_id);
+      continue;
+    }
+
     // 新 repair task 有 fix_for 时向上寻找真正的失败根；若根不是终态，说明当前
     // candidate 自身才是失败点，仍以 candidate 为来源处理。
     let chainRoot = candidate;
@@ -3779,6 +3849,41 @@ async function reconcileResolutionBacklogUnlocked(
       const decisionReverify = resolutionOwner.resolution_task_id
         ? await redis.hgetall(keys.hash.task(resolutionOwner.resolution_task_id))
         : {};
+      // A source repair may have been accepted after the rejection that originally
+      // required it. Reconciliation must then leave source selection and return to
+      // independent re-verification. We deliberately pass through the normal retry
+      // gate: exhausted roots become `reverify_retry_limit_reached` for one explicit
+      // PM continue, rather than silently minting unlimited acceptance attempts.
+      const repairDecisionRecovered = resolutionOwner.type === 'acceptance' &&
+        acceptanceSourceIds(resolutionOwner).length > 0 &&
+        (
+          (resolutionOwner.resolution_decision_reason ?? '').startsWith('repair_sources_required:') ||
+          (resolutionOwner.resolution_decision_reason ?? '').startsWith('acceptance_repair_required:')
+        ) &&
+        (await acceptanceReverifyRepairGate(redis, resolutionOwner)).allowed;
+      if (repairDecisionRecovered) {
+        await mutateTaskWithPlanProjection(redis, resolutionOwner.task_id, resolutionOwner.plan_id ?? '', {
+          resolution_status: 'required',
+          resolution_action: 'reverify',
+          resolution_task_id: '',
+          resolved_by_task: '',
+          resolution_decision_reason: '',
+        });
+        await persistTaskFromRedis(redis, resolutionOwner.task_id);
+        const reverify = await ensureAcceptanceReverifyTask(
+          redis,
+          resolutionOwner.task_id,
+          'startup-reconcile:accepted-repair',
+          { trigger: 'repair_accepted' },
+        );
+        if (reverify.needsPmDecision || !reverify.taskId) {
+          needsPmDecisionTaskIds.push(rootTaskId);
+        } else if (reverify.created) {
+          repairedTaskIds.push(rootTaskId);
+        }
+        handledRoots.add(rootTaskId);
+        continue;
+      }
       // 旧版对多来源 acceptance reverify 的 repair reject 曾经 fan-out 所有
       // acceptance_for，随后把先耗尽的无关来源写成根原因。即使根已在
       // needs_pm_decision，也要以当前 pointer 指向的最新不可变 reject 自愈；
@@ -3792,10 +3897,15 @@ async function reconcileResolutionBacklogUnlocked(
         decisionReverify.fix_for === resolutionOwner.task_id &&
         decisionReverify.repair_root_task_id === resolutionOwner.task_id;
       if (latestMultiSourceRepairReject) {
+        // A source repair selected from this review may itself have been rejected
+        // later.  Keep the root pointed at that newest immutable reject; falling
+        // back to resolution_task_id would repeatedly dispatch Workers with stale
+        // instructions from the older acceptance attempt.
+        const latestReject = await latestAcceptanceRepairReject(redis, resolutionOwner);
         await markResolutionNeedsPmDecision(
           redis,
           resolutionOwner.task_id,
-          `repair_sources_required:${decisionReverify.task_id}`,
+          `repair_sources_required:${latestReject?.task_id || decisionReverify.task_id}`,
         );
         needsPmDecisionTaskIds.push(resolutionOwner.task_id);
         handledRoots.add(rootTaskId);
@@ -4285,15 +4395,42 @@ async function latestAcceptanceRepairReject(
   const attemptIds = [...new Set([
     root.task_id,
     ...(root.resolution_task_ids ?? '').split(',').filter(Boolean),
+    // PM 显式选出的来源 repair 也是这条 acceptance 决策链的一部分。它被拒绝后，
+    // 下一代 Worker 必须拿到这条更新的拒绝原文，不能继续收到更早的 reverify。
+    ...(root.acceptance_repair_task_ids ?? '').split(',').filter(Boolean),
   ])];
+  const sources = new Set(acceptanceSourceIds(root));
   let latest: Record<string, string> | undefined;
   let latestAt = Number.NEGATIVE_INFINITY;
   for (const attemptId of attemptIds) {
     const attempt = attemptId === root.task_id ? root : await redis.hgetall(keys.hash.task(attemptId));
-    const requiresRepair = attempt.type === 'acceptance' &&
-      attempt.status === 'done' &&
-      attempt.pm_review_status === 'rejected' &&
+    const rejectedAcceptance = attempt.type === 'acceptance' &&
       attempt.pm_rejection_resolution_mode !== 'reverify';
+    const rejectedSelectedRepair = attempt.type !== 'acceptance' &&
+      attempt.repair_root_task_id && sources.has(attempt.fix_for ?? '');
+    // A selected source repair may finish after another sibling has already been
+    // accepted and closed that source root.  A later reject of that stale delivery
+    // is immutable audit evidence, but it is no longer an adverse acceptance
+    // decision: treating it as one would reopen the parent acceptance forever.
+    if (rejectedSelectedRepair) {
+      const sourceRoot = await redis.hgetall(keys.hash.task(attempt.repair_root_task_id));
+      if (
+        sourceRoot.task_id === attempt.repair_root_task_id &&
+        sourceRoot.resolution_status === 'resolved' &&
+        sourceRoot.resolved_by_task && sourceRoot.resolved_by_task !== attempt.task_id
+      ) {
+        const winner = await redis.hgetall(keys.hash.task(sourceRoot.resolved_by_task));
+        if (
+          winner.task_id === sourceRoot.resolved_by_task &&
+          winner.repair_root_task_id === sourceRoot.task_id &&
+          winner.status === 'done' && winner.pm_review_status === 'accepted' &&
+          !(await repairWasTriggeredAfterWinner(redis, attempt, winner))
+        ) continue;
+      }
+    }
+    const requiresRepair = attempt.status === 'done' &&
+      attempt.pm_review_status === 'rejected' &&
+      (rejectedAcceptance || rejectedSelectedRepair);
     if (!requiresRepair) continue;
     const at = Number(attempt.pm_reviewed_at || attempt.done_at || attempt.created_at || 0);
     if (latest && at < latestAt) continue;
@@ -4807,10 +4944,18 @@ async function resolveRepairLineage(
     ? await redis.hgetall(keys.hash.task(winner.repair_root_task_id))
     : {};
   if (root.task_id) {
+    const supersededChildIds: string[] = [];
+    for (const taskId of (root.resolution_task_ids ?? '').split(',').filter(Boolean)) {
+      if (!taskId || taskId === repairTaskId) continue;
+      const child = await redis.hgetall(keys.hash.task(taskId));
+      if (!(await repairWasTriggeredAfterWinner(redis, child, winner))) {
+        supersededChildIds.push(taskId);
+      }
+    }
     await terminalizePendingResolutionChildren(
       redis,
       root,
-      (root.resolution_task_ids ?? '').split(',').filter((taskId) => taskId && taskId !== repairTaskId),
+      supersededChildIds,
       `superseded_by_accepted_repair:${repairTaskId}`,
       `修复 ${repairTaskId} 已验收，其它未启动 sibling 自动撤销`,
     );
@@ -4868,9 +5013,19 @@ async function resolvePmConsumer(redis: Redis, planId: string): Promise<string> 
  */
 async function finalizeReclaimedTasks(redis: Redis, reclaimedTaskIds: string[]): Promise<string[]> {
   const failedTaskIds: string[] = [];
+  const resolutionRootIds = new Set<string>();
   for (const taskId of reclaimedTaskIds) {
     await persistTaskFromRedis(redis, taskId);
     const reclaimed = await redis.hgetall(keys.hash.task(taskId));
+    // running repair 在旧执行器退出后会先由 lease CAS 回到 pending。必须在任何
+    // Worker 再次扫描 pending 之前重放它所属根的闭环：若根已由另一 accepted
+    // repair 收敛，既有 sibling 清理会把这个失效 child 终态化为 cancelled；若根
+    // 仍在 repairing，则保持 pending，允许 fresh claim。这样不打断活 Worker，也
+    // 不会在 Supervisor 重启窗口复活已被赢家取代的重复 repair。
+    if (reclaimed.fix_for) {
+      resolutionRootIds.add(reclaimed.repair_root_task_id || reclaimed.fix_for);
+      await terminalizeSupersededPendingRepair(redis, reclaimed);
+    }
     if (reclaimed.status !== 'failed') continue;
     failedTaskIds.push(taskId);
     await ensureRepairTask(redis, taskId, {
@@ -4878,6 +5033,12 @@ async function finalizeReclaimedTasks(redis: Redis, reclaimedTaskIds: string[]):
       reason: reclaimed.failed_reason === 'max_retries_exceeded'
         ? 'Worker 租约多次过期，已达到任务重试上限。'
         : 'Worker 租约过期后的回收失败。',
+    });
+  }
+  if (resolutionRootIds.size > 0) {
+    await reconcileResolutionBacklogUnlocked(redis, {
+      migrateLegacyNamedFixes: false,
+      candidateIds: resolutionRootIds,
     });
   }
   return failedTaskIds;
@@ -5420,6 +5581,9 @@ async function claimUnlocked(
     for (const taskId of pendingIds) {
       const hash = await redis.hgetall(keys.hash.task(taskId));
       if (!hash.task_id || hash.status !== 'pending') continue;
+      // 防御升级前已经遗留在 pending 的 sibling：即使它没有经过本进程的 lease
+      // reclaim，也必须在候选进入调度前按 accepted winner 终态化。
+      if (await terminalizeSupersededPendingRepair(redis, hash)) continue;
       candidates.push(hashToTaskRecord(hash));
     }
     candidates.sort(
@@ -10229,6 +10393,36 @@ async function pmReviewLocked(
       },
     };
   }
+  // 旧 Worker 可能在 accepted winner 收敛根任务之前已经开始执行 sibling，并在
+  // winner 生效之后才交付。该 late delivery 必须保留为审计，但不能再次 accept
+  // 并篡改根的 resolved_by_task；只有同一 lineage 中真实 done+accepted winner 才
+  // 构成这个拒绝门禁，避免陈旧 resolved 字段误伤合法 repair。
+  if (!hash.pm_review_status && hash.fix_for) {
+    const rootTaskId = hash.repair_root_task_id || hash.fix_for;
+    const root = await redis.hgetall(keys.hash.task(rootTaskId));
+    const belongsToRoot = (root.resolution_task_ids ?? '').split(',').filter(Boolean).includes(taskId);
+    if (
+      belongsToRoot && root.resolution_status === 'resolved' &&
+      root.resolved_by_task && root.resolved_by_task !== taskId
+    ) {
+      const winner = await redis.hgetall(keys.hash.task(root.resolved_by_task));
+      if (
+        winner.task_id === root.resolved_by_task &&
+        winner.repair_root_task_id === root.task_id &&
+        winner.status === 'done' && winner.pm_review_status === 'accepted' &&
+        !(await repairWasTriggeredAfterWinner(redis, hash, winner))
+      ) {
+        return {
+          ok: false,
+          data: null,
+          error: {
+            code: 'REPAIR_SUPERSEDED_BY_ACCEPTED_WINNER',
+            message: `任务 ${taskId} 是迟到的修复交付；根任务已由 ${winner.task_id} 验收闭环，保留交付审计但不能用新的 accept/reject 改写 winner 或重开根任务。`,
+          },
+        };
+      }
+    }
+  }
   if (req.verdict === 'accept' && (hash.result_path || hash.result_json_path)) {
     try {
       const projectPath = resolveAndValidateWorkspacePath(hash.project_path, configuredWorkspaceRoots());
@@ -10747,7 +10941,9 @@ async function pmReviewLocked(
       await markResolutionNeedsPmDecision(
         redis,
         acceptanceOwner.task_id,
-        `repair_sources_required:${hash.trigger_review_task_id}`,
+        // 这次来源 repair 的 PM reject 才是下一代必须执行的最新不可变要求。
+        // 旧 trigger 仍保留在被拒 child 上作 provenance，但不能继续充当新任务说明。
+        `repair_sources_required:${taskId}`,
       );
     } else {
       resolutions.push(await ensureRepairTask(redis, taskId, {

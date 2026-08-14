@@ -5,7 +5,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -190,11 +190,13 @@ export class SqliteStore {
   private readonly restoreWorkspaceRoots?: string[];
   private readonly excludeSystemTemporaryProjects: boolean;
   private readonly systemTemporaryRoots: string[];
+  private readonly dbPath: string;
 
   constructor(dbPath: string, options: SqliteStoreOptions = {}) {
     this.restoreWorkspaceRoots = options.restoreWorkspaceRoots?.map((root) => resolve(root));
     this.excludeSystemTemporaryProjects = options.excludeSystemTemporaryProjects ?? false;
     this.systemTemporaryRoots = (options.systemTemporaryRoots ?? defaultSystemTemporaryRoots()).map((root) => resolve(root));
+    this.dbPath = dbPath;
     const fileBacked = dbPath !== ':memory:';
     if (fileBacked) {
       // Question 正文、项目路径和验收记录都属于本机私有审计数据。先以 0600 创建/
@@ -612,6 +614,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
   /** task 总数 */
   getTaskCount(): number {
     return (this.db.prepare('SELECT COUNT(*) as count FROM tasks').get() as { count: number }).count;
+  }
+
+  /** 主文件与 WAL 体积：仅用于 /db/status 观测展示，不触发任何自动清理。 */
+  getFileSizes(): { main_bytes: number; wal_bytes: number } {
+    if (this.dbPath === ':memory:') return { main_bytes: 0, wal_bytes: 0 };
+    try {
+      const mainBytes = statSync(this.dbPath).size;
+      const walPath = `${this.dbPath}-wal`;
+      const walBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+      return { main_bytes: mainBytes, wal_bytes: walBytes };
+    } catch {
+      return { main_bytes: 0, wal_bytes: 0 };
+    }
   }
 
   /** Redis 灾难恢复不能只看 task：Agent epoch 等空项目状态同样是安全真相。 */

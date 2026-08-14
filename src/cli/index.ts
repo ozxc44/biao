@@ -2117,6 +2117,7 @@ verify: []
           task_count: number;
           plan_count: number;
           by_status: Record<string, number>;
+          file_sizes?: { main_bytes: number; wal_bytes: number };
           restore_projection?: {
             restorable_tasks: number;
             restorable_plans: number;
@@ -2147,6 +2148,14 @@ verify: []
       console.log(`  plans: ${r.data.plan_count}`);
       console.log(`  tasks: ${r.data.task_count}`);
       console.log(`  按状态:`, JSON.stringify(r.data.by_status));
+      if (r.data.file_sizes) {
+        const mb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+        console.log(`  文件体积: ${mb(r.data.file_sizes.main_bytes)}（WAL ${mb(r.data.file_sizes.wal_bytes)}）`);
+        if (r.data.file_sizes.main_bytes > 200 * 1024 * 1024) {
+          console.log(`  提示: 审计库已较大；SQLite 记录是灾难恢复与历史审计的唯一依据，平台不会自动清理。`);
+          console.log(`        需要归档时请在停机窗口复制备份整个数据库文件（含 -wal/-shm），不要删除或截断。`);
+        }
+      }
       if (r.data.restore_projection) {
         const projection = r.data.restore_projection;
         console.log(`  可恢复投影: ${projection.restorable_plans} plans / ${projection.restorable_tasks} tasks`);

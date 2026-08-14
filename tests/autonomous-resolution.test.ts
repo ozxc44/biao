@@ -802,6 +802,11 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
   });
 
   it('显式选源 repair 被拒绝后只重新打开 acceptance，不短暂再生来源根门铃', async () => {
+    // fixture 需要让旧 acceptance review 的审计时间晚于本轮真实 reject，才能模拟
+    // 生产中的单调时间序。余量必须远大于整测套件负载下的时钟漂移（曾用 +100ms
+    // 导致全量运行时偶发“最新不可变拒绝记录”选序翻转），固定 10s/20s 消除竞态。
+    const seededReviewAt = Date.now() + 10_000;
+    const laterReviewAt = seededReviewAt + 10_000;
     for (const sourceId of ['reselect-source-a', 'reselect-source-b']) {
       await seedTask(sourceId);
       await redis.zrem(keys.zset.status.pending, sourceId);
@@ -860,7 +865,7 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
       pm_reject_reason: '最新拒绝：快速同步仍缺少可观察状态',
       pm_review_comment: '最新真实 E2E 仍未看到 applying',
       pm_fix_instructions: '以最新拒绝为准补齐时序状态机',
-      pm_reviewed_at: String(Date.now() + 100),
+      pm_reviewed_at: String(seededReviewAt),
       fix_for: acceptanceId, repair_root_task_id: acceptanceId,
     });
 
@@ -905,12 +910,98 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
       resolution_status: 'needs_pm_decision',
       resolution_action: 'inspect',
-      resolution_decision_reason: `repair_sources_required:${latestReviewId}`,
+      resolution_decision_reason: `repair_sources_required:${repairId}`,
     });
     const intake = await pmIntake(redis, { consumer: 'pm-autonomous' });
     expect(intake.data?.items.filter((item) => item.kind === 'resolution_required').map((item) => item.task_id))
       .toEqual([acceptanceId]);
     expect(await redis.exists(keys.hash.task('reselect-source-b-repair-2'))).toBe(0);
+
+    // fixture 的旧 acceptance review 使用了未来时间；把本轮真实后继 reject 调整为
+    // 单调更晚，模拟生产中不可变审计的正常时间顺序。
+    await redis.hset(keys.hash.task(repairId), 'pm_reviewed_at', String(laterReviewAt));
+    await reconcileResolutionBacklog(redis);
+    expect(await redis.hget(keys.hash.task(acceptanceId), 'resolution_decision_reason'))
+      .toBe(`repair_sources_required:${repairId}`);
+    expect(await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-reselect-next',
+      repair_source_task_id: 'reselect-source-b',
+    })).toMatchObject({
+      ok: true,
+      data: { created_task_ids: ['reselect-source-b-repair-2'] },
+    });
+    const nextGoal = await redis.hget(keys.hash.task('reselect-source-b-repair-2'), 'goal_md');
+    expect(nextGoal).toContain(`触发本轮返修的不可变验收记录：\`${repairId}\``);
+    expect(nextGoal).toContain('修复仍不完整');
+    expect(nextGoal).toContain('重新选择来源并补齐闭环');
+  });
+
+  it('已闭合来源的迟到 sibling reject 只保留审计，不重开验收选源', async () => {
+    const now = Date.now();
+    for (const sourceId of ['stale-audit-source-a', 'stale-audit-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, now, sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(now),
+      });
+    }
+    const rootId = 'stale-audit-acceptance';
+    const winnerId = 'stale-audit-source-a-repair-1';
+    const siblingId = 'stale-audit-source-a-repair-2';
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: ['stale-audit-source-a', 'stale-audit-source-b'],
+      depends_on: ['stale-audit-source-a', 'stale-audit-source-b'],
+      max_retries: 2,
+    });
+    await seedTask(winnerId);
+    await seedTask(siblingId);
+    await redis.zrem(keys.zset.status.pending, rootId, winnerId, siblingId);
+    await redis.zadd(keys.zset.status.failed, now, rootId);
+    await redis.zadd(keys.zset.status.done, now + 1, winnerId, now + 2, siblingId);
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      pm_reviewed_at: String(now),
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${siblingId}`,
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      acceptance_repair_task_ids: `${winnerId},${siblingId}`,
+    });
+    await redis.hset(keys.hash.task('stale-audit-source-a'), {
+      resolution_status: 'resolved',
+      resolution_action: 'repair',
+      resolution_task_id: winnerId,
+      resolution_task_ids: `${winnerId},${siblingId}`,
+      resolved_by_task: winnerId,
+    });
+    await redis.hset(keys.hash.task(winnerId), {
+      status: 'done', pm_review_status: 'accepted',
+      // 未来时间戳只用于固化“winner 早于迟到 sibling reject”的审计顺序；余量放大到
+      // 10s/20s，避免整测套件负载下真实时钟越过 ±1s 窗口翻转选序（同上例竞态）。
+      pm_reviewed_at: String(now + 10_000),
+      fix_for: 'stale-audit-source-a', repair_root_task_id: 'stale-audit-source-a',
+    });
+    await redis.hset(keys.hash.task(siblingId), {
+      status: 'done', pm_review_status: 'rejected',
+      pm_reviewed_at: String(now + 20_000),
+      fix_for: 'stale-audit-source-a', repair_root_task_id: 'stale-audit-source-a',
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: 'reverify_retry_limit_reached',
+      resolution_task_id: '',
+    });
+    expect(await redis.exists(keys.hash.task('stale-audit-source-a-repair-3'))).toBe(0);
   });
 
   it('一条验收拒绝要求多个来源时，PM 可一次选定最小返修子集', async () => {
@@ -1700,6 +1791,70 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
       status: 'cancelled',
       resolution_decision_reason: 'superseded_by_accepted_repair:winner-cleans-siblings-repair-2',
     });
+  });
+
+  it('late sibling delivery cannot displace an already accepted repair winner', async () => {
+    await seedTask('late-sibling-root');
+    await seedTask('late-sibling-root-repair-1');
+    await seedTask('late-sibling-root-repair-2');
+    const now = Date.now();
+    await redis.zrem(
+      keys.zset.status.pending,
+      'late-sibling-root',
+      'late-sibling-root-repair-1',
+      'late-sibling-root-repair-2',
+    );
+    await redis.zadd(keys.zset.status.done, now, 'late-sibling-root');
+    await redis.zadd(keys.zset.status.done, now, 'late-sibling-root-repair-1');
+    await redis.zadd(keys.zset.status.done, now + 1, 'late-sibling-root-repair-2');
+    await redis.hset(keys.hash.task('late-sibling-root'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      resolution_status: 'resolved',
+      resolution_action: 'repair',
+      resolution_task_id: 'late-sibling-root-repair-1',
+      resolution_task_ids: 'late-sibling-root-repair-1,late-sibling-root-repair-2',
+      resolved_by_task: 'late-sibling-root-repair-1',
+    });
+    await redis.hset(keys.hash.task('late-sibling-root-repair-1'), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      fix_for: 'late-sibling-root',
+      repair_root_task_id: 'late-sibling-root',
+    });
+    await redis.hset(keys.hash.task('late-sibling-root-repair-2'), {
+      status: 'done',
+      pm_review_status: '',
+      fix_for: 'late-sibling-root',
+      repair_root_task_id: 'late-sibling-root',
+    });
+
+    const rejectedReview = await pmReview(redis, 'late-sibling-root-repair-2', {
+      verdict: 'reject',
+      reviewed_by: 'pm-late',
+      comment: 'late empty delivery',
+    });
+    expect(rejectedReview).toMatchObject({
+      ok: false,
+      error: { code: 'REPAIR_SUPERSEDED_BY_ACCEPTED_WINNER' },
+    });
+
+    const acceptedReview = await pmReview(redis, 'late-sibling-root-repair-2', {
+      verdict: 'accept',
+      reviewed_by: 'pm-late',
+      comment: 'late green delivery',
+    });
+
+    expect(acceptedReview).toMatchObject({
+      ok: false,
+      error: { code: 'REPAIR_SUPERSEDED_BY_ACCEPTED_WINNER' },
+    });
+    expect(await redis.hgetall(keys.hash.task('late-sibling-root'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolution_task_id: 'late-sibling-root-repair-1',
+      resolved_by_task: 'late-sibling-root-repair-1',
+    });
+    expect(await redis.hget(keys.hash.task('late-sibling-root-repair-2'), 'pm_review_status')).toBe('');
   });
 
   it('独立验收失败后，来源 repair accepted 只安排新的独立复验；复验 accepted 才关闭失败验收', async () => {

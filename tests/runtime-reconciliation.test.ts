@@ -164,6 +164,102 @@ describe('低频 runtime reconciliation', () => {
     expect(await eventCount('dead-worker-task', 'task_ready')).toBe(1);
   });
 
+  it('回收已被 accepted winner 取代的 running repair 后先终态化，不能被 Supervisor 再次领取', async () => {
+    await seedTask('resolved-repair-root');
+    await seedTask('resolved-repair-root-repair-1', {
+      fix_for: 'resolved-repair-root',
+      repair_root_task_id: 'resolved-repair-root',
+    });
+    await seedTask('resolved-repair-root-repair-2', {
+      fix_for: 'resolved-repair-root',
+      repair_root_task_id: 'resolved-repair-root',
+    });
+    const now = Date.now();
+    await redis.zrem(
+      keys.zset.status.pending,
+      'resolved-repair-root',
+      'resolved-repair-root-repair-1',
+    );
+    await redis.zadd(keys.zset.status.done, now, 'resolved-repair-root');
+    await redis.zadd(keys.zset.status.done, now, 'resolved-repair-root-repair-1');
+    await redis.hset(keys.hash.task('resolved-repair-root'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      resolution_status: 'resolved',
+      resolution_action: 'repair',
+      resolution_task_id: 'resolved-repair-root-repair-1',
+      resolution_task_ids: 'resolved-repair-root-repair-1,resolved-repair-root-repair-2',
+      resolved_by_task: 'resolved-repair-root-repair-1',
+    });
+    await redis.hset(keys.hash.task('resolved-repair-root-repair-1'), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      fix_for: 'resolved-repair-root',
+      repair_root_task_id: 'resolved-repair-root',
+    });
+    await redis.hset(keys.hash.task('resolved-repair-root-repair-2'), {
+      fix_for: 'resolved-repair-root',
+      repair_root_task_id: 'resolved-repair-root',
+    });
+
+    await agentRegister(redis, 'stale-repair-worker', 'test', ['code']);
+    // 模拟旧版本在根收敛前已经领走 sibling，随后部署时执行器退出：lease 不再
+    // 有效，但 task/agent 仍保留 running 审计。新版 claim 门禁本身不会再制造它。
+    await redis.zrem(keys.zset.status.pending, 'resolved-repair-root-repair-2');
+    await redis.zadd(keys.zset.status.running, 1, 'resolved-repair-root-repair-2');
+    await redis.hset(keys.hash.task('resolved-repair-root-repair-2'), {
+      status: 'running',
+      claimed_by: 'stale-repair-worker',
+      claimed_at: String(now),
+      expire_at: '1',
+    });
+    await redis.hset(keys.hash.agent('stale-repair-worker'), {
+      status: 'busy',
+      current_task: 'resolved-repair-root-repair-2',
+    });
+
+    const first = await service.reconcileRuntimeState(redis);
+    const second = await service.reconcileRuntimeState(redis);
+
+    expect(first.data?.reclaimed).toEqual(['resolved-repair-root-repair-2']);
+    expect(second.data?.reclaimed).toEqual([]);
+    expect((await getTask(redis, 'resolved-repair-root-repair-2')).data).toMatchObject({
+      status: 'cancelled',
+      cancel_reason: '修复 resolved-repair-root-repair-1 已验收，回收的旧 sibling 不再重新执行',
+      resolution_decision_reason: 'superseded_by_accepted_repair:resolved-repair-root-repair-1',
+    });
+    expect(await redis.zscore(keys.zset.status.pending, 'resolved-repair-root-repair-2')).toBeNull();
+    expect(await redis.zscore(keys.zset.status.cancelled, 'resolved-repair-root-repair-2')).not.toBeNull();
+    expect((await getTask(redis, 'resolved-repair-root')).data).toMatchObject({
+      resolution_status: 'resolved',
+      resolved_by_task: 'resolved-repair-root-repair-1',
+    });
+
+    // 升级前若已经直接遗留 pending sibling，普通 claim 也必须执行相同门禁，
+    // 不能依赖 Supervisor 恰好先跑一次 reconciliation。
+    await seedTask('resolved-repair-root-repair-3');
+    await redis.hset(keys.hash.task('resolved-repair-root-repair-3'), {
+      fix_for: 'resolved-repair-root',
+      repair_root_task_id: 'resolved-repair-root',
+    });
+    await redis.hset(
+      keys.hash.task('resolved-repair-root'),
+      'resolution_task_ids',
+      'resolved-repair-root-repair-1,resolved-repair-root-repair-2,resolved-repair-root-repair-3',
+    );
+    await agentRegister(redis, 'pending-sibling-worker', 'test', ['code']);
+    const noDuplicate = await claim(redis, {
+      agent_id: 'pending-sibling-worker',
+      blocking: false,
+      preferred_project: PROJECT_PATH,
+    });
+    expect(noDuplicate).toMatchObject({ ok: true, data: null });
+    expect((await getTask(redis, 'resolved-repair-root-repair-3')).data).toMatchObject({
+      status: 'cancelled',
+      resolution_decision_reason: 'superseded_by_accepted_repair:resolved-repair-root-repair-1',
+    });
+  });
+
   it('依赖就绪事件曾丢失时恢复 waiting_dependency，重复调用仍只写一次 dependency_ready', async () => {
     await seedTask('recovered-dependency');
     await seedTask('dependency-blocked', { depends_on: ['recovered-dependency'] });
