@@ -5,6 +5,7 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
+import { createHmac } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -75,6 +76,31 @@ import {
   QUESTION_CHECKPOINT_MAX_CHARS,
 } from '../communication/question-context.js';
 
+type ScopedBiaoConfig = BiaoConfig & { workerApiToken?: string };
+
+const WORKER_TOKEN_CONTEXT = 'biao-worker-api-token-v1';
+
+/** Derive a one-way, scope-specific bearer without persisting a second secret. */
+export function deriveWorkerApiToken(ownerToken: string): string {
+  return createHmac('sha256', ownerToken).update(WORKER_TOKEN_CONTEXT).digest('hex');
+}
+
+/**
+ * Worker credentials are deliberately limited to the execution data plane.
+ * Identity-looking fields such as reviewed_by/consumer are audit metadata, not
+ * authorization, so they must never promote a Worker request into a PM request.
+ */
+function workerRequestAllowed(method: string, pathname: string): boolean {
+  const path = pathname.replace(/^\/api(?=\/)/, '');
+  if (method === 'GET' || method === 'HEAD') {
+    // Read access is also fail-closed: a future PM endpoint must not become Worker-readable
+    // merely because it was not added to a denylist. These are the only reads used by BiaoClient.
+    return path === '/ownership' || /^\/task\/[^/]+$/.test(path);
+  }
+  if (method !== 'POST') return false;
+  return /^(?:\/register|\/heartbeat|\/agent\/offline|\/claim|\/report|\/question|\/lease\/renew|\/ownership\/(?:declare|release)|\/task\/[^/]+\/block)$/.test(path);
+}
+
 const INSTALL_PACKAGE_PLACEHOLDER = '__BIAO_PKG_POSIX__';
 
 function posixSingleQuote(value: string): string {
@@ -144,6 +170,17 @@ const API_ENDPOINTS: Record<string, string> = {
 };
 
 const API_HINT = 'API 路径在根路径（无 /api 前缀，也兼容 /api 前缀）。curl http://localhost:7331/health 验证。';
+
+/**
+ * Redis 的 `$` 只能安全用于一次阻塞式 XREAD。这里采用非阻塞轮询，如果每轮继续
+ * 使用 `$`，游标会反复跳到“此刻最新”并永久漏掉连接后的事件。建连时将它冻结为
+ * 当前 stream 尾部的真实 ID；显式 last_id 则原样保留用于断线续传。
+ */
+export async function resolveEventStreamCursor(redis: Redis, requested: string): Promise<string> {
+  if (requested !== '$') return requested;
+  const latest = await redis.xrevrange(keys.stream.events, '+', '-', 'COUNT', 1);
+  return latest[0]?.[0] ?? '0-0';
+}
 
 function isLocalOwnerSessionPath(pathname: string): boolean {
   return /^(?:\/api)?\/auth\/(?:session|local-session)$/.test(pathname);
@@ -445,6 +482,15 @@ const requestSchemas = {
         claim_token: nonEmptyString,
         body: { type: 'string', minLength: 1, maxLength: QUESTION_BODY_MAX_CHARS },
         checkpoint: { type: 'string', maxLength: QUESTION_CHECKPOINT_MAX_CHARS },
+        requested_ownership: {
+          type: 'object',
+          minProperties: 1,
+          additionalProperties: false,
+          properties: {
+            files: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 512 } },
+            modules: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 512 } },
+          },
+        },
       },
     },
   },
@@ -458,6 +504,7 @@ const requestSchemas = {
         consumer: safeIdentifier,
         plan_id: safeIdentifier,
         answer: { type: 'string', minLength: 1, maxLength: QUESTION_ANSWER_MAX_CHARS },
+        ownership_decision: { type: 'string', enum: ['approved', 'rejected'] },
       },
     },
   },
@@ -503,6 +550,14 @@ const requestSchemas = {
       properties: {
         action: { type: 'string', enum: ['inspect', 'continue', 'cancel'] },
         decided_by: nonEmptyString,
+        repair_source_task_id: nonEmptyString,
+        repair_source_task_ids: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 64,
+          uniqueItems: true,
+          items: nonEmptyString,
+        },
       },
     },
   },
@@ -566,7 +621,7 @@ function findWebDist(): string | null {
 
 export async function createHttpServer(
   redis: Redis,
-  config: BiaoConfig,
+  config: ScopedBiaoConfig,
   options: { webDist?: string | null } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -637,12 +692,23 @@ export async function createHttpServer(
       if (publicApiPath || publicFrontendEntry || isLocalOwnerSessionPath(requestUrl.pathname)) return;
 
       const bearerAuthenticated = req.headers.authorization === `Bearer ${config.apiToken}`;
+      const workerAuthenticated = Boolean(
+        config.workerApiToken &&
+        req.headers.authorization === `Bearer ${config.workerApiToken}`,
+      );
       const humanAuthenticated = hasLocalOwnerSession(req.headers.cookie, config);
-      if (!bearerAuthenticated && !humanAuthenticated) {
+      if (!bearerAuthenticated && !workerAuthenticated && !humanAuthenticated) {
         return reply.status(401).send({
           ok: false,
           data: null,
           error: { code: 'UNAUTHORIZED', message: '需要有效的 Bearer API token' },
+        });
+      }
+      if (workerAuthenticated && !workerRequestAllowed(req.method, requestUrl.pathname)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'WORKER_SCOPE_DENIED', message: 'Worker 凭据无权执行 PM/Owner 控制面操作' },
         });
       }
     });
@@ -900,15 +966,21 @@ export async function createHttpServer(
       return getTask(redis, task_id);
     });
 
-    // GET /tasks?plan_id=&status=&limit= —— 批量查询任务（对应 biao task list）
+    // GET /tasks?plan_id=&status=&limit=&offset= —— 批量查询任务（对应 biao task list）
     app.get('/tasks', async (req) => {
-      const { plan_id, status, limit } = req.query as { plan_id?: string; status?: string; limit?: string };
-      const opts: { plan_id?: string; status?: string; limit?: number } = {};
+      const { plan_id, status, limit, offset } = req.query as {
+        plan_id?: string; status?: string; limit?: string; offset?: string;
+      };
+      const opts: { plan_id?: string; status?: string; limit?: number; offset?: number } = {};
       if (plan_id) opts.plan_id = plan_id;
       if (status) opts.status = status;
       if (limit) {
         const n = Number(limit);
         if (!Number.isNaN(n)) opts.limit = n;
+      }
+      if (offset) {
+        const n = Number(offset);
+        if (!Number.isNaN(n)) opts.offset = n;
       }
       return getTasks(redis, opts);
     });
@@ -922,7 +994,7 @@ export async function createHttpServer(
     // POST /task/:task_id/cancel —— 撤销 pending 任务（对应 biao task cancel）
     app.post('/task/:task_id/cancel', async (req) => {
       const { task_id } = req.params as { task_id: string };
-      return cancelTask(redis, task_id);
+      return cancelTask(redis, task_id, req.body as { reason?: string });
     });
 
     // 历史伪完成退出验收：不复用 reset，不清空 result/review；必须带理由与显式确认。
@@ -1249,7 +1321,7 @@ export async function createHttpServer(
       });
 
       const lastId = (req.query as { last_id?: string }).last_id ?? '$';
-      let cursor = lastId;
+      let cursor = await resolveEventStreamCursor(redis, lastId);
       let closed = false;
       let heartbeat: NodeJS.Timeout | undefined;
 

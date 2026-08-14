@@ -78,6 +78,40 @@ function writeResult(projectPath: string, taskId: string, content: string): stri
 }
 
 describe('acceptance_ready 恢复与自我验收禁止', () => {
+  it('review 层拒绝执行者用同一审计身份自验收普通任务', async () => {
+    await planSubmit(redis, join(FIXTURES, 'test-plan'));
+    await agentRegister(redis, 'same-agent', 'mock', ['code']);
+    const claimed = await claim(redis, { agent_id: 'same-agent', blocking: false, timeout_ms: 50 });
+    expect(claimed.data?.task_id).toBe('test-m0-plan-01-be');
+    const delivered = await report(redis, {
+      task_id: claimed.data!.task_id,
+      agent_id: 'same-agent',
+      claim_token: claimed.data!.claim_token,
+      status: 'done',
+      verify_results: [{ cmd: 'echo hello', exit_code: 0, passed: true }],
+    });
+    expect(delivered.ok).toBe(true);
+
+    const selfReview = await pmReview(redis, claimed.data!.task_id, {
+      verdict: 'accept',
+      reviewed_by: 'same-agent',
+    });
+    expect(selfReview).toMatchObject({
+      ok: false,
+      error: { code: 'PM_REVIEW_SELF_FORBIDDEN' },
+    });
+    expect(await redis.hget(keys.hash.task(claimed.data!.task_id), 'pm_review_status')).toBe('');
+
+    const independentReview = await pmReview(redis, claimed.data!.task_id, {
+      verdict: 'accept',
+      reviewed_by: 'independent-pm',
+    });
+    expect(independentReview).toMatchObject({
+      ok: true,
+      data: { review_status: 'accepted' },
+    });
+  });
+
   it('reset 依赖任务后，acceptance_ready 可再次产生（恢复监视）', async () => {
     await planSubmit(redis, join(FIXTURES, 'test-plan'));
     await agentRegister(redis, 'w1', 'mock', ['code']);
@@ -125,6 +159,10 @@ describe('acceptance_ready 恢复与自我验收禁止', () => {
       task_id: c2.data!.task_id, agent_id: 'w2', claim_token: c2.data!.claim_token,
       status: 'done',
     });
+    const readyEvent = (await eventsByType('acceptance_ready')).at(-1)!;
+    expect((await unackedEvents(redis, { consumer: readyEvent.consumer! })).data).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'acceptance_ready', task_id: 'test-m0-plan-03-qa' })]),
+    );
     // T03 acceptance_for 含 T01：w1 在 claim 阶段就不能拿走验收，避免把自验收风险交给 report 才发现。
     const selfClaim = await claim(redis, { agent_id: 'w1', blocking: false, timeout_ms: 50 });
     expect(selfClaim).toMatchObject({ ok: true, data: null });
@@ -132,6 +170,9 @@ describe('acceptance_ready 恢复与自我验收禁止', () => {
     await agentRegister(redis, 'reviewer', 'mock', ['acceptance']);
     const c3 = await claim(redis, { agent_id: 'reviewer', blocking: false, timeout_ms: 50 });
     expect(c3.data?.task_id).toBe('test-m0-plan-03-qa');
+    expect((await unackedEvents(redis, { consumer: readyEvent.consumer! })).data?.some(
+      (event) => event.type === 'acceptance_ready' && event.task_id === c3.data?.task_id,
+    )).toBe(false);
     const plan = await getPlan(redis, 'test-m0-plan');
     const resultPath = writeResult(
       plan.data.project_path,

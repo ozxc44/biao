@@ -40,9 +40,12 @@ const INTERNAL_LOCK_FILE_FD = 5;
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_BIAO_URL = 'http://127.0.0.1:7331';
 const DEFAULT_CONSUMER = 'pm';
+const DEFAULT_PM_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
+const MIN_PM_AGENT_TIMEOUT_MS = 100;
+const MAX_PM_AGENT_TIMEOUT_MS = 60 * 60 * 1000;
+const PM_AGENT_KILL_GRACE_MS = 250;
 const PM_ACTIONABLE_KINDS = new Set([
   'review_requested',
-  'acceptance_ready',
   'question_asked',
   'resolution_required',
   // 兼容未来服务把 resolution 状态直接投影为 kind 的版本。
@@ -67,6 +70,7 @@ function usage() {
   BIAO_PM_CONSUMER=pm
   BIAO_API_TOKEN=...                  # 仅用于本脚本读取 intake，不会传给子进程
   BIAO_PM_AGENT_LOCK_DIR=/tmp/...     # 可选本机锁目录
+  BIAO_PM_AGENT_TIMEOUT_MS=600000     # Agent 卡死后的回收时限；默认 10 分钟
 
 行为：
   - 无事项：成功且静默，不启动任何 Agent。
@@ -86,7 +90,7 @@ function fail(message) {
 function readOptions(argv) {
   const values = new Map();
   const planValues = [];
-  const valueFlags = new Set(['--biao-url', '--consumer', '--plans', '--plan', '--command', '--lock-dir']);
+  const valueFlags = new Set(['--biao-url', '--consumer', '--plans', '--plan', '--command', '--lock-dir', '--agent-timeout-ms']);
 
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
@@ -116,6 +120,16 @@ function readOptions(argv) {
   const command = (values.get('--command') ?? process.env.BIAO_PM_AGENT_CMD ?? '').trim();
   const lockDir = (values.get('--lock-dir') ?? process.env.BIAO_PM_AGENT_LOCK_DIR ?? tmpdir()).trim();
   if (!lockDir) fail('锁目录不能为空');
+  const rawTimeout = values.get('--agent-timeout-ms')
+    ?? process.env.BIAO_PM_AGENT_TIMEOUT_MS
+    ?? String(DEFAULT_PM_AGENT_TIMEOUT_MS);
+  if (!/^\d+$/.test(rawTimeout)) fail('PM Agent timeout 必须是整数毫秒');
+  const agentTimeoutMs = Number(rawTimeout);
+  if (!Number.isSafeInteger(agentTimeoutMs)
+    || agentTimeoutMs < MIN_PM_AGENT_TIMEOUT_MS
+    || agentTimeoutMs > MAX_PM_AGENT_TIMEOUT_MS) {
+    fail(`PM Agent timeout 必须在 ${MIN_PM_AGENT_TIMEOUT_MS}-${MAX_PM_AGENT_TIMEOUT_MS}ms 之间`);
+  }
 
   return {
     biaoUrl,
@@ -123,6 +137,7 @@ function readOptions(argv) {
     planIds,
     command,
     lockDir,
+    agentTimeoutMs,
     requireDrained: argv.includes('--require-drained'),
   };
 }
@@ -390,7 +405,7 @@ function childEnvironment() {
   }
   // 这些都是 bootstrap 生成的非凭据定位信息。内置 adapter 必须知道外置 runtime
   // 和受控 workspace；尤其 npm 安装布局中 packageRoot 内不会存在 `.biao`。
-  for (const key of ['BIAO_RUNTIME_DIR', 'BIAO_PREFERRED_PROJECT', 'BIAO_WORKSPACE_ROOTS']) {
+  for (const key of ['BIAO_RUNTIME_DIR', 'BIAO_PREFERRED_PROJECT', 'BIAO_WORKSPACE_ROOTS', 'BIAO_PM_TARGET']) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   env.BIAO_PM_AGENT_WAKE = '1';
@@ -401,7 +416,20 @@ function childEnvironment() {
   return env;
 }
 
-async function invokeAgent(command, payload) {
+function terminateAgentProcessGroup(child, signal) {
+  if (!child.pid) return;
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-child.pid, signal);
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+    return;
+  }
+  child.kill(signal);
+}
+
+async function invokeAgent(command, payload, timeoutMs) {
   await new Promise((resolve, reject) => {
     // bootstrap 写入的是一个绝对 adapter 路径。若该完整字符串确实是文件，直接
     // exec，避免路径中的空格或 shell 元字符被拆分；只有显式的“命令 + 参数”字符串
@@ -418,21 +446,69 @@ async function invokeAgent(command, payload) {
       shell: directExecutable === undefined,
       stdio: ['pipe', 'inherit', 'inherit'],
       env: childEnvironment(),
+      // 独立进程组使超时回收覆盖 adapter 启动的 codex/kimi 等后代；只杀外层
+      // shell 会留下孤儿进程并永久占住真实 Agent 会话。
+      detached: process.platform !== 'win32',
     });
     let settled = false;
+    let terminating = false;
+    let closedDuringTermination = false;
+    let killTimer;
+    const signalHandlers = new Map();
+    const removeSignalHandlers = () => {
+      for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+      signalHandlers.clear();
+    };
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
+      clearTimeout(killTimer);
+      removeSignalHandlers();
       callback(value);
+    };
+    const beginTermination = (message) => {
+      if (settled || terminating) return;
+      terminating = true;
+      try {
+        terminateAgentProcessGroup(child, 'SIGTERM');
+      } catch (error) {
+        settle(reject, error);
+        return;
+      }
+      killTimer = setTimeout(() => {
+        try {
+          // 即使外层 adapter 已因 SIGTERM 退出，也要再次杀整个进程组；其后代可能
+          // 忽略了 TERM，并且此时仍会让 Supervisor 误以为没有可重试空间。
+          terminateAgentProcessGroup(child, 'SIGKILL');
+        } catch (error) {
+          settle(reject, error);
+          return;
+        }
+        const suffix = closedDuringTermination ? '，已回收进程组' : '，已强制终止进程组';
+        settle(reject, new Error(`${message}${suffix}；门铃保留供 Supervisor 下轮重试`));
+      }, PM_AGENT_KILL_GRACE_MS);
     };
     child.once('error', (error) => settle(reject, error));
     child.once('close', (code, signal) => {
+      if (terminating) {
+        closedDuringTermination = true;
+        return;
+      }
       if (code === 0) settle(resolve);
       else settle(reject, new Error(signal
         ? `PM Agent 命令被信号 ${signal} 终止`
         : `PM Agent 命令退出码为 ${code ?? 'unknown'}`));
     });
     child.stdin.once('error', (error) => settle(reject, error));
+    const timeout = setTimeout(() => {
+      beginTermination(`PM Agent 命令超过 ${timeoutMs}ms 未退出`);
+    }, timeoutMs);
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      const handler = () => beginTermination(`PM Agent 唤醒器收到 ${signal}`);
+      signalHandlers.set(signal, handler);
+      process.once(signal, handler);
+    }
     // 唯一跨进程数据：允许的五个字段；绝不含 task/event/result/body/token。
     child.stdin.end(`${JSON.stringify(payload)}\n`);
   });
@@ -440,12 +516,17 @@ async function invokeAgent(command, payload) {
 
 async function runLocked(options) {
   const items = await readIntake(options);
-  const summary = summarizeActionable(items, options.planIds);
-  if (summary.count === 0) return 0;
+  const initialSummary = summarizeActionable(items, options.planIds);
+  if (initialSummary.count === 0) return 0;
   if (!options.command) {
     console.error('发现 PM 待处理事项，但未配置 PM Agent 命令；请设置 BIAO_PM_AGENT_CMD 或传入 --command。');
     return EXIT_CONFIG;
   }
+
+  // 首次扫描只负责发现候选门铃。真正启动模型前再读一次当前事实，收窄“另一 PM
+  // 已处理，但本进程仍按旧快照唤醒”的竞态窗口。二次结果为空时必须继续静默退出。
+  const summary = summarizeActionable(await readIntake(options), options.planIds);
+  if (summary.count === 0) return 0;
 
   const wakePayload = {
     biaoUrl: options.biaoUrl,
@@ -454,7 +535,7 @@ async function runLocked(options) {
     kinds: summary.kinds,
     count: summary.count,
   };
-  await invokeAgent(options.command, wakePayload);
+  await invokeAgent(options.command, wakePayload, options.agentTimeoutMs);
   if (options.requireDrained) {
     const remaining = summarizeActionable(await readIntake(options), options.planIds);
     if (remaining.count > 0) {

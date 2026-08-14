@@ -4,7 +4,7 @@
  */
 
 import Redis from 'ioredis';
-import { createHttpServer } from './http.js';
+import { createHttpServer, deriveWorkerApiToken } from './http.js';
 import { parseWorkspaceRoots } from './security.js';
 import { setSqliteStore, dbRestore, reconcileResolutionBacklog, isBiaoNamespaceEmpty } from './service.js';
 import { SqliteStore } from '../db/sqlite-store.js';
@@ -37,7 +37,7 @@ export function resolveServerConfig(
   overrides: Partial<BiaoConfig> = {},
   env: NodeJS.ProcessEnv = process.env,
   argv: string[] = process.argv.slice(2),
-): BiaoConfig {
+): BiaoConfig & { workerApiToken?: string } {
   const args = parseArgs(argv);
   const apiToken = nonEmpty(overrides.apiToken) ?? nonEmpty(env.BIAO_API_TOKEN);
   const dataDir = nonEmpty(env.BIAO_DATA_DIR);
@@ -55,6 +55,7 @@ export function resolveServerConfig(
     redisUrl: args.redisUrl ?? overrides.redisUrl ?? env.BIAO_REDIS_URL ?? 'redis://localhost:6379',
     authEnabled: overrides.authEnabled ?? Boolean(apiToken),
     apiToken,
+    workerApiToken: apiToken ? deriveWorkerApiToken(apiToken) : undefined,
     workspaceRoots: (overrides.workspaceRoots ?? parseWorkspaceRoots(env.BIAO_WORKSPACE_ROOTS)).map((root) => resolve(root)),
     sqlitePath,
     streamMaxlen: overrides.streamMaxlen ?? 10_000,

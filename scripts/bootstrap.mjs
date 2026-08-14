@@ -156,6 +156,15 @@ ${body}
 `;
 }
 
+function credentialFreeWrapper(body, packageRoot) {
+  return `#!/usr/bin/env sh
+set -eu
+BIAO_PACKAGE_ROOT=${shellQuote(resolve(packageRoot))}
+readonly BIAO_PACKAGE_ROOT
+${body}
+`;
+}
+
 // runtime-dir 可能尚不存在。先 realpath 最深的已存在祖先，再拼回缺失段，
 // 这样既支持首次安装，也不会让符号链接绕过 node_modules/packageRoot 边界。
 function canonicalPotentialPath(path) {
@@ -197,8 +206,12 @@ const BIAO_GENERATED_FILES = [
   'pm-intake',
   'pm-start',
   'pm-agent',
+  'pm-heartbeat',
   'codex-pm-agent',
   'supervisor',
+  'agent-kit',
+  'worker-agent',
+  'supervisor-config',
   'worker-codex',
   'worker-kimi',
   'worker-custom',
@@ -359,6 +372,9 @@ export const PREBUILT_RUNTIME_INPUTS = [
   'web/dist/index.html',
   'web/dist/manifest.json',
   'bin/biao.js',
+  'bin/biao-adapter-kit.js',
+  'bin/biao-worker-agent.js',
+  'bin/biao-supervisor-config.js',
   'bin/biao-worker.js',
   'bin/cli-worker.js',
   'bin/codex-worker.js',
@@ -368,6 +384,9 @@ export const PREBUILT_RUNTIME_INPUTS = [
   'scripts/install.sh',
   'scripts/pm-agent.mjs',
   'scripts/codex-pm-agent.mjs',
+  'scripts/adapter-kit.mjs',
+  'scripts/worker-agent.mjs',
+  'scripts/supervisor-config.mjs',
   'scripts/supervisor.mjs',
   'scripts/redis-probe.mjs',
 ];
@@ -572,6 +591,10 @@ export function bootstrap(options) {
     `BIAO_API_TOKEN=${shellQuote(token)}`,
     `BIAO_PM_AGENT=${shellQuote(options.pmAgent ?? '')}`,
     `BIAO_PM_AGENT_CMD=${shellQuote(pmAgentCommand)}`,
+    `BIAO_PM_AGENT_TIMEOUT_MS=${shellQuote('600000')}`,
+    `BIAO_PM_AGENT_ROUTES=${shellQuote('')}`,
+    `BIAO_PM_SLOTS=${shellQuote('')}`,
+    `BIAO_WORKER_SLOTS=${shellQuote('')}`,
     '',
   ].join('\n');
 
@@ -595,6 +618,14 @@ export function bootstrap(options) {
   }
 
   const runtimeWrapper = (body) => wrapper(body, repoRoot);
+  // The runtime config keeps the Owner token for PM/Supervisor compatibility.
+  // Worker launchers immediately replace it with a one-way scoped bearer before
+  // starting any Worker process; the Owner token never crosses the exec boundary.
+  const workerRuntimeWrapper = (body) => runtimeWrapper(`if [ -n "\${BIAO_API_TOKEN:-}" ]; then
+  BIAO_API_TOKEN=$(printf '%s' "$BIAO_API_TOKEN" | node -e 'const { createHmac } = require("node:crypto"); const chunks = []; process.stdin.on("data", chunk => chunks.push(chunk)); process.stdin.on("end", () => process.stdout.write(createHmac("sha256", Buffer.concat(chunks)).update("biao-worker-api-token-v1").digest("hex")));')
+  export BIAO_API_TOKEN
+fi
+${body}`);
 
   writeExecutable(
     join(setupDir, 'doctor'),
@@ -607,6 +638,14 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e 
 else
   echo "[missing] Node.js 20.19+ / 22.12-26.x 和 npm" >&2
   failed=1
+fi
+if command -v node >/dev/null 2>&1; then
+  if node -e 'const {createRequire}=require("node:module"); const req=createRequire(process.argv[1]); const Database=req("better-sqlite3"); const db=new Database(":memory:"); db.prepare("SELECT 1 AS ok").get(); db.close();' "$BIAO_PACKAGE_ROOT/package.json" >/dev/null 2>&1; then
+    echo "[ok] SQLite 原生驱动可加载"
+  else
+    echo "[missing] SQLite 原生驱动无法加载；请确保安装和运行使用同一 Node 版本，并在 Biao 安装目录执行 npm rebuild better-sqlite3。若 npm 提示 allow-scripts，先执行 npm approve-scripts better-sqlite3。" >&2
+    failed=1
+  fi
 fi
 if command -v redis-cli >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
   if BIAO_REDIS_PROBE_URL=$redis_probe_url node "$BIAO_PACKAGE_ROOT/scripts/redis-probe.mjs" >/dev/null 2>&1; then
@@ -688,7 +727,65 @@ fi
 fingerprint_suffix=$(printf '%s' "$BIAO_API_TOKEN" | node -e 'const { createHash } = require("node:crypto"); const chunks = []; process.stdin.on("data", chunk => chunks.push(chunk)); process.stdin.on("end", () => process.stdout.write(createHash("sha256").update(Buffer.concat(chunks)).digest("hex").slice(-12)));')
 printf '[biao] API Token 已配置（SHA-256 指纹末尾：…%s）。\n' "$fingerprint_suffix"`),
   );
-  writeExecutable(join(setupDir, 'start'), runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/dist/server/main.js"'));
+  writeExecutable(join(setupDir, 'start'), runtimeWrapper(`server_pid=''
+supervisor_pid=''
+shutdown() {
+  # 先让 Supervisor 回收 PM/Worker 子进程树，再停止 API 服务。两者同时 TERM 会让
+  # pm-agent 失去清理窗口，旧 adapter 可能短暂成为孤儿并与重启后的 PM 重复处理。
+  if [ -n "$supervisor_pid" ]; then
+    kill "$supervisor_pid" 2>/dev/null || true
+    wait "$supervisor_pid" 2>/dev/null || true
+    supervisor_pid=''
+  fi
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=''
+  fi
+  exit 0
+}
+trap shutdown INT TERM
+
+# 本机运行日志：server.log 与 supervisor.log 默认在 .biao/logs 下；单个文件超过
+# BIAO_LOG_MAX_BYTES（默认 5MB）时在启动时轮转一份 .1。路径可用 BIAO_LOG_DIR 覆盖。
+log_dir="\${BIAO_LOG_DIR:-\$SCRIPT_DIR/logs}"
+mkdir -p "$log_dir"
+rotate_log() {
+  if [ -f "$1" ] && [ "\$(wc -c < "$1")" -gt "\${BIAO_LOG_MAX_BYTES:-5242880}" ]; then
+    mv -f "$1" "$1.1"
+  fi
+}
+rotate_log "$log_dir/server.log"
+rotate_log "$log_dir/supervisor.log"
+echo "[biao] 日志目录：$log_dir（server.log / supervisor.log）"
+
+node "$BIAO_PACKAGE_ROOT/dist/server/main.js" >> "$log_dir/server.log" 2>&1 &
+server_pid=$!
+
+# 服务与共享 Supervisor 由同一个启动器托管：不再出现“服务健康、但没有任何单元
+# 负责发现门铃、恢复等待任务或启动已配置 Worker slot”的孤岛状态。Supervisor 在
+# 全部计划暂时闭环时会自行退出；这里低频重启它，以便随后新增任务仍可被发现。
+# config.env 设 BIAO_SUPERVISOR_STAY_RESIDENT=1 时 Supervisor 闭环不退出、留守复查，
+# 下面的正常退出分支不再触发，本循环只承担异常退出的短退避重启。
+# 如果 Supervisor 异常退出，则使用独立的短退避立即重启；Worker 完成后的下一项
+# 调度仍由未退出的同一 Supervisor 直接处理，不能因为一次 Worker 退出而丢失监视。
+while kill -0 "$server_pid" 2>/dev/null; do
+  node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" >> "$log_dir/supervisor.log" 2>&1 &
+  supervisor_pid=$!
+  supervisor_exit=0
+  wait "$supervisor_pid" || supervisor_exit=$?
+  supervisor_pid=''
+  kill -0 "$server_pid" 2>/dev/null || break
+  if [ "$supervisor_exit" -eq 0 ]; then
+    sleep "\${BIAO_SUPERVISOR_INTERVAL:-60}"
+  else
+    echo "[biao] Supervisor 异常退出（exit=\${supervisor_exit}）；\${BIAO_SUPERVISOR_RESTART_DELAY:-5}s 后自动重启。" >&2
+    sleep "\${BIAO_SUPERVISOR_RESTART_DELAY:-5}"
+  fi
+done
+
+wait "$server_pid"
+exit $?`));
   writeExecutable(
     join(setupDir, 'pm'),
     runtimeWrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$BIAO_PACKAGE_ROOT/bin/biao.js" "$@"'),
@@ -712,6 +809,15 @@ exec node "$BIAO_PACKAGE_ROOT/bin/biao.js" watchdog`),
     runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/pm-agent.mjs" "$@"'),
   );
   writeExecutable(
+    join(setupDir, 'pm-heartbeat'),
+    `#!/usr/bin/env sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# 所有项目共用同一个轻量门控；本地文件缺失时 bootstrap 只需补回这层薄包装。
+exec "$SCRIPT_DIR/pm" pm heartbeat --once "$@"
+`,
+  );
+  writeExecutable(
     join(setupDir, 'codex-pm-agent'),
     runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/codex-pm-agent.mjs" "$@"'),
   );
@@ -720,16 +826,32 @@ exec node "$BIAO_PACKAGE_ROOT/bin/biao.js" watchdog`),
     runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" "$@"'),
   );
   writeExecutable(
+    join(setupDir, 'agent-kit'),
+    credentialFreeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/adapter-kit.mjs" "$@"', repoRoot),
+  );
+  writeExecutable(
+    join(setupDir, 'worker-agent'),
+    credentialFreeWrapper(`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIAO_RUNTIME_DIR=$SCRIPT_DIR
+export BIAO_RUNTIME_DIR
+exec node "$BIAO_PACKAGE_ROOT/scripts/worker-agent.mjs" "$@"`, repoRoot),
+  );
+  writeExecutable(
+    join(setupDir, 'supervisor-config'),
+    credentialFreeWrapper(`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$BIAO_PACKAGE_ROOT/scripts/supervisor-config.mjs" --config "$SCRIPT_DIR/config.env" "$@"`, repoRoot),
+  );
+  writeExecutable(
     join(setupDir, 'worker-codex'),
-    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-codex-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/codex-worker.js" "$@"'),
+    workerRuntimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-codex-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/codex-worker.js" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'worker-kimi'),
-    runtimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-kimi-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/kimi-worker.js" "$@"'),
+    workerRuntimeWrapper('export BIAO_AGENT_ID="${BIAO_AGENT_ID:-kimi-1}"\nexport BIAO_EXIT_ON_IDLE="${BIAO_EXIT_ON_IDLE:-1}"\nexec node "$BIAO_PACKAGE_ROOT/bin/kimi-worker.js" "$@"'),
   );
   writeExecutable(
     join(setupDir, 'worker-custom'),
-    runtimeWrapper(`if [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
+    workerRuntimeWrapper(`if [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
   exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"
 fi
 if [ -z "\${BIAO_EXEC_CMD:-}" ]; then
@@ -761,7 +883,11 @@ exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"`),
 
 设置 \`BIAO_PM_AGENT_CMD\` 后，\`.biao/supervisor\` 会在同一个共享 Supervisor 轮询进程中按需唤醒 PM Agent，不需要第二个 cron 或 launchd 轮询器。它只在有最小 PM 待办时启动一次 Agent，并使用 \`--require-drained\` 复查事项是否真的被处理；若仍在平台，下个低频共享轮次会重试。
 
+\`.biao/pm-heartbeat\` 是兼容调度器可调用的轻量一次性门控：先扫描最小 intake；没有已交付待 Review、Question、需决策或异常状态时静默退出，绝不启动 PM Agent，也不消耗模型 token。\`acceptance_ready\` 只表示独立验收任务可由 Worker 领取，不会提前启动 PM 模型。生产环境优先复用 \`.biao/start\` 托管的唯一共用 Supervisor，不为每个 PM 建独立定时心跳。
+
 clone 后需要 Codex 直接担任按需 PM 时，推荐 bootstrap 使用 \`--pm-agent codex\`。它会把 \`BIAO_PM_AGENT_CMD\` 安全指向仓库内的 \`.biao/codex-pm-agent\` 适配器；没有门铃时不会启动 Codex，也不新增第二个轮询进程。
+
+多个 PM 可用 \`.biao/supervisor-config pm add\` 加入同一个 Supervisor。每个 PM slot 的 \`consumer\` 必须与其 Plan 声明的 \`pm_consumer\` 一致；Supervisor 才会把验收、Question 和异常裁决送到对应 PM 队列。不同 PM slot 可并行唤醒，同一 slot 不重复启动；未处理事项保留重试，绝不自动 review、answer 或 ack。配置变更只在安全重启 Supervisor 后加载。
 
 \`.biao/pm-agent --once\` 仍保留为兼容的一次性门铃，不是交互式 PM 工作流，也不替代 \`.biao/pm-start --once\`：
 
@@ -814,7 +940,7 @@ BIAO_QUESTION: {"body":"需要 PM 决定的问题","checkpoint":"已完成内容
 - 重置任务后旧结果和旧验收失效，必须重新执行和验收。
 - 不直接修改 Worker 正在持有 ownership 的文件。
 - 不替 Worker 向人类追问：Worker 的阻塞决策必须经平台 Question；PM 读取并回答后，Worker 用新 claim 继续。
-- retry 耗尽后先用 \`.biao/pm task resolution <task_id>\` 只读证据；只通过 \`--action continue\` 额外放行一代或通过 \`--action cancel\` 终止修复链。不要用 \`task reset --force\` 打断链，只有 continue/cancel 成功后才 ack 对应门铃。
+- retry 耗尽后先用 \`.biao/pm task resolution <task_id>\` 只读证据；只通过 \`--action continue\` 额外放行一代或通过 \`--action cancel\` 终止修复链。retry-limit 链 cancel 后不会自行复活；操作者可再次显式 continue 重开一代，旧审计不变。不要用 \`task reset --force\` 打断链，只有 continue/cancel 成功后才 ack 对应门铃。
 - Supervisor 门铃不是已处理证明；只在完成验收、答复或处置后显式 ack 对应事件。
 
 ## 常用命令
@@ -901,6 +1027,8 @@ export function formatCompletion(result) {
   PM 入口：  ${command('pm-start')} --once
   PM 唤醒器：配置 BIAO_PM_AGENT_CMD 后由 ${command('supervisor')} 按需启动
   PM 手册：  ${join(setupDir, 'PM_AGENT.md')}
+  Agent 接入：${command('agent-kit')} contract --role worker --json
+  Slot 配置：${command('supervisor-config')} worker list
   Codex：     ${command('worker-codex')}
   Kimi：      ${command('worker-kimi')}`;
 }

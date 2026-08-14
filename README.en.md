@@ -155,7 +155,7 @@ Open the address printed by the server directly in a browser. On the first visit
 
 The console defaults to Chinese in every new tab; switch to English in the upper-right. Language state survives refresh in that tab only.
 
-`doctor` checks Node, npm, Redis, workspace roots, and optional Codex/Kimi executables. Codex becomes required when configured with `--pm-agent codex`. A successful doctor run proves runtime readiness, not project acceptance.
+`doctor` checks Node, npm, whether the native SQLite driver really loads under the current Node runtime, Redis, workspace roots, and optional Codex/Kimi executables. Codex becomes required when configured with `--pm-agent codex`. If install and launch used different Node versions, or npm blocked the `better-sqlite3` install script, doctor fails with a `npm rebuild better-sqlite3` repair command; when npm reports `allow-scripts`, approve `better-sqlite3` first. A successful doctor run proves runtime readiness, not project acceptance.
 
 ### PM and shared Supervisor
 
@@ -171,17 +171,23 @@ This checks health, status, and minimal intake and runs one shared Supervisor pa
 .biao/pm-start --consumer pm --interval 60
 ```
 
-The production entry combines PM bells and Worker slots in one process:
+Add Worker slots without hand-editing JSON; the production entry combines PM bells and Worker slots in one process:
 
 ```bash
-BIAO_WORKER_SLOTS='[
-  {"kind":"codex","agentId":"codex-a","project":"/path/to/workspace/my-project","types":["code","docs"]},
-  {"kind":"kimi","agentId":"kimi-a","project":"/path/to/workspace/my-project","types":["review","acceptance"]},
-  {"kind":"custom","agentId":"custom-a","project":"/path/to/workspace/my-project","command":"/absolute/path/to/executor","types":["research"]}
-]' .biao/supervisor --consumer pm --interval 60
+.biao/supervisor-config worker add --id codex-a --kind codex \
+  --project /path/to/workspace/my-project --types code,docs
+.biao/supervisor-config worker add --id kimi-a --kind kimi \
+  --project /path/to/workspace/my-project --types review,acceptance
+.biao/start
 ```
 
-Idle slots share one low-frequency cycle instead of running separate claim timers. Running Workers retain only the heartbeat and lease renewal needed for active work. The Supervisor stops when all managed plans are terminal. Under the normal state machine, terminal plans have no actionable intake; a later reset, repair, or new task is discovered on the next start.
+No separate online Worker daemon is required. The Supervisor claims new pending/repair/reverify work for a matching slot and starts the Codex, Kimi, or unfamiliar-Agent harness only after a real claim. It immediately checks for the next item when one finishes. Idle slots share one low-frequency cycle instead of running separate claim timers. The owner-only config command never prints credentials; safely restart only the Supervisor to load a changed slot list. The Supervisor stops when all managed plans are terminal. Under the normal state machine, terminal plans have no actionable intake; a later reset, repair, or new task is discovered on the next start, or immediately when `BIAO_SUPERVISOR_STAY_RESIDENT=1` keeps the process resident.
+
+An unfamiliar Agent does not need to reverse-engineer the API. Give it the credential-free
+`.biao/agent-kit` launcher (or the packaged `biao-adapter-kit` command) and let it follow
+`contract → scaffold → check` to build a single-file Worker or PM adapter. The local Supervisor
+then owns the Worker slot or per-Plan PM route. See the
+[unfamiliar Agent adapter kit](docs/agent-adapter-kit.md).
 
 Single-Worker compatibility launchers remain available and exit on idle by default:
 
@@ -207,8 +213,22 @@ The root `AGENTS.md` is the stable clone entry. It directs an unconfigured Agent
 - **Worker:** use one or more slots in `.biao/supervisor`; the single-Worker `.biao/worker-codex`, `.biao/worker-kimi`, and `.biao/worker-custom` launchers remain available for compatibility.
 - **Interactive PM:** read `.biao/PM_AGENT.md`, run `.biao/pm-start --once`, inspect scoped detail, take the real review/Question/recovery action, then ack only the handled bell.
 - **On-demand PM Agent:** bootstrap with `--pm-agent codex`, or explicitly configure `BIAO_PM_AGENT_CMD`; the shared Supervisor invokes it only when minimal intake exists.
+- **Stuck PM recovery:** a PM adapter that does not exit is terminated as a process group after 10 minutes by default, its consumer lock is released, and the unacked bell is retried on a later Supervisor pass. Configure `BIAO_PM_AGENT_TIMEOUT_MS` between 100ms and one hour when needed.
 
-The shared Supervisor accepts `--once` for one bounded pass, `--interval 60` for low-frequency resident operation, and `--plans plan-a,plan-b` to restrict managed plans. Its PM Agent adapter uses `--require-drained` after the subprocess exits: it fetches minimal intake again and treats the wake as incomplete when actionable items remain, clearing local deduplication so a later shared cycle can retry. It never turns process exit into review, answer, or ack.
+Multiple PMs can be registered as slots. Each slot owns one unique consumer, and managed Plans must declare the same `pm_consumer`; this routes review, Question, and abnormal-decision work into that PM's queue:
+
+```bash
+.biao/supervisor-config pm add --id pm-codex-main --consumer pm \
+  --command /absolute/runtime/.biao/codex-pm-agent \
+  --target <your-codex-thread-id>
+.biao/supervisor-config pm add --id pm-kimi --consumer pm-kimi \
+  --command /absolute/path/kimi-pm-adapter --target kimi-session-id
+.biao/supervisor-config pm list
+```
+
+One shared Supervisor reads plans/events/reconcile once per cycle and only the minimal queue for each configured consumer. Different PM slots may wake concurrently; one slot is never launched twice while still running. Nonzero adapter exits or undrained work remain queued for retry. Restart only the Supervisor at a safe boundary to load changed slots.
+
+The shared Supervisor accepts `--once` for one bounded pass, `--interval 60` for low-frequency resident operation, and `--plans plan-a,plan-b` to restrict managed plans. Pass `--stay-resident` (or set `BIAO_SUPERVISOR_STAY_RESIDENT=1`) to keep the process alive after every managed plan closes: it re-checks at the same shared interval, and newly active plans revive worker slots under a fresh registration epoch, closing the gap between a drained exit and the next launcher restart. Its PM Agent adapter uses `--require-drained` after the subprocess exits: it fetches minimal intake again and treats the wake as incomplete when actionable items remain, clearing local deduplication so a later shared cycle can retry. It never turns process exit into review, answer, or ack.
 
 ### Useful bootstrap options
 
@@ -443,7 +463,7 @@ BIAO_PREFERRED_PROJECT="/path/to/workspace/my-project" \
 node bin/biao-worker.js
 ```
 
-The generic Worker owns scheduling and Verify; the command performs the task and returns its execution status. `BIAO_EXEC_CMD` currently uses simple space splitting, so its executable path and fixed arguments must not contain spaces.
+The generic Worker owns scheduling and Verify; the command performs the task and returns its execution status. When `BIAO_EXEC_CMD` or a custom slot `command` names an existing absolute executable, Biao launches that full path as one command, including paths with spaces. Put complex fixed arguments in a single-file wrapper; compatibility command strings that are not existing absolute files still use simple space splitting.
 
 ### HTTP Worker lifecycle
 
@@ -601,8 +621,9 @@ failed acceptance ───────┘       repairs the original implementa
 
 - Original failed/rejected audit is never erased.
 - Repairs inherit project, ownership, Verify, and retry bounds; a PM may explicitly grant minimal adjacent repair ownership.
-- `--reverify-only` creates fresh independent acceptance when source code is already accepted/resolved and only evidence is defective.
-- Retry exhaustion becomes `needs_pm_decision`. Inspect `.biao/pm task resolution <task_id>`, then choose `--action continue` or `--action cancel`; do not bypass repair with reset.
+- `--reverify-only` creates fresh independent acceptance when source code is already accepted/resolved and only evidence is defective. A multi-source acceptance is never fanned out into repairs automatically: use reverify-only, review the concrete source separately, or explicitly select a source for a migrated `repair_sources_required` decision with `--repair-source-task <task_id>`.
+- Retry exhaustion becomes `needs_pm_decision`. Inspect `.biao/pm task resolution <task_id>`, then choose `--action continue` or `--action cancel`; do not bypass repair with reset. A cancelled retry-limit chain stays silent, but an operator may explicitly run `--action continue` again to reopen one generation without erasing rejection, failure, or cancellation audit history.
+- `task reset`, including `--force`, cannot interrupt a running task while either its lease or `expire_at` is still valid (`TASK_RUNNING_ACTIVE`). The shared Supervisor/watchdog reclaims lost executions. Rejected and cancelled/resolved repair audit chains are immutable; continue the existing lineage explicitly or create a new task.
 - An accepted repair resolves the source while preserving its history. Any declared independent repair acceptance is still required.
 - Downstream tasks wait for accepted or resolved prerequisites.
 
@@ -677,6 +698,10 @@ Minimal intake omits task bodies, logs, Verify, ownership, and Question text. Th
 | --- | --- | --- |
 | `BIAO_HOST` | `127.0.0.1` | Listen address |
 | `BIAO_PORT` | `7331` | Port |
+| `BIAO_LOG_DIR` | `.biao/logs` | Log directory for `.biao/start`-hosted processes (server.log / supervisor.log) |
+| `BIAO_LOG_MAX_BYTES` | `5242880` | Rotate a log file to `.1` on the next `.biao/start` when it exceeds this size |
+| `BIAO_SUPERVISOR_STAY_RESIDENT` | empty | `1` keeps the Supervisor alive after all plans close, re-checking for new plans |
+| `BIAO_MAX_CONCURRENT_TASKS` | empty | Cap on concurrently executing tasks per Supervisor; empty = unlimited (one per slot) |
 | `BIAO_REDIS_URL` | `redis://localhost:6379` | Redis URL |
 | `BIAO_SQLITE_PATH` | package `data/biao.sqlite` | Audit/recovery database |
 | `BIAO_WORKSPACE_ROOTS` | empty | Allowed roots, platform-path-delimiter separated |
@@ -713,7 +738,7 @@ With a token configured, API clients use Bearer authorization; the local loopbac
 | `cancelled` | Withdrawn terminal state |
 | `superseded` | Legacy false-completion retired with audit intact |
 
-Agent online state derives from heartbeat leases. Normal shutdown records offline reason and last task. A crashed active process stops renewal and remains visible until watchdog safely reclaims the expired lease. Resetting a completed task clears its old result, Verify, and PM Review; it needs fresh acceptance. Cancelled and superseded tasks cannot be reset.
+Agent online state derives from heartbeat leases. Normal shutdown records offline reason and last task. A crashed active process stops renewal and remains visible until watchdog safely reclaims the expired lease. Resetting an ordinary completed task clears its old result, Verify, and PM Review; it needs fresh acceptance. Active running tasks, rejected/closed repair audit chains, cancelled tasks, and superseded tasks cannot be reset.
 
 ## Testing Biao
 

@@ -58,12 +58,14 @@ export function buildCodexInvocation(
   task: ClaimedTask,
   agentId = 'codex',
 ): { args: string[]; stdin: string } {
+  const requestedModel = task.model_override?.trim();
   return {
     // Worker 只继承 Codex 认证，不继承用户/项目级 rules 和 config；否则一台机器上的
     // “PM-first”等全局指令会改写平台已分配的 Worker 角色。ephemeral 也避免常驻
     // Supervisor 为每个短任务积累会话。网络仅在 Agent 实际运行期间开放。
     args: [
       'exec', '--ephemeral', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
+      ...(requestedModel ? ['-m', requestedModel] : []),
       '--color', 'never',
       '-c', 'sandbox_workspace_write.network_access=true',
       '-c', 'model_reasoning_effort="high"',
@@ -116,11 +118,13 @@ export function buildCodexPrompt(task: ClaimedTask, agentId = 'codex'): string {
 - 不得创建或修改以下文件：${protectedArtifacts.join('、')}。
 - 这些文件由 Worker 调度器专属维护；你退出后，调度器会根据执行结果与验证结果生成并提交可审计产物。
 - 不要自行写报告文件；请在最终输出清楚写明改动摘要和验证摘要，供调度器收集。
+- 禁止对所有权之外的文件执行 git checkout/restore/reset/clean 或任何“清理变更”；那些变更可能属于并行 Agent，必须保留现场并通过 BIAO_QUESTION 交给 PM。
 - 最终输出还必须单独包含一行机器可读清单：
   BIAO_CHANGED_FILES: ["相对路径/文件一", "相对路径/文件二"]
   只列本任务实际修改过的相对路径；没有修改时写 []，不要写绝对路径或审计产物路径。
 - 若确实缺少 PM 决策：不要向当前人类会话提问、不要修改 plan；停止后在最终输出单独一行
   BIAO_QUESTION: {"body":"需要 PM 决定的问题","checkpoint":"已完成和待恢复的上下文"}
+  若问题是申请新增文件/模块范围，必须同时包含："requested_ownership":{"files":["相对路径或 glob"],"modules":["模块名"]}；文字中的“允许扩权”不会生效。
   平台会持久化问题、释放当前 claim，回答后重新 claim 时会携带 answer/checkpoint。
 ${buildQuestionResumeContext(task)}
 `;

@@ -72,6 +72,87 @@ function fakeRedis(): Redis {
 }
 
 describe('HTTP bearer authentication', () => {
+  it.each(['/status', '/plans', '/questions?consumer=pm', '/ownership/active'])(
+    'denies scoped Worker bearer access to control-plane read %s',
+    async (url) => {
+      const app = await createHttpServer(fakeRedis(), {
+        ...config(),
+        workerApiToken: 'worker-only-secret',
+      } as BiaoConfig & { workerApiToken: string });
+
+      try {
+        const response = await app.inject({
+          method: 'GET',
+          url,
+          headers: { authorization: 'Bearer worker-only-secret' },
+        });
+        expect(response.statusCode).toBe(403);
+        expect(response.json()).toMatchObject({
+          ok: false,
+          error: { code: 'WORKER_SCOPE_DENIED' },
+        });
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  it.each([
+    ['/task/example/review', { verdict: 'accept', reviewed_by: 'forged-pm' }],
+    ['/question/example/answer', { consumer: 'pm', answer: 'forged answer', answered_by: 'forged-pm' }],
+    ['/task/example/resolution', { action: 'inspect', decided_by: 'forged-pm' }],
+    ['/intake/ack', { consumer: 'pm', event_id: 'forged-event' }],
+    ['/task/example/reset', {}],
+  ])('rejects a scoped Worker bearer before PM-only mutation %s can trust request-body identity', async (url, payload) => {
+    const app = await createHttpServer(fakeRedis(), {
+      ...config(),
+      workerApiToken: 'worker-only-secret',
+    } as BiaoConfig & { workerApiToken: string });
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url,
+        headers: { authorization: 'Bearer worker-only-secret' },
+        payload,
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({
+        ok: false,
+        data: null,
+        error: { code: 'WORKER_SCOPE_DENIED', message: 'Worker 凭据无权执行 PM/Owner 控制面操作' },
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('keeps Worker lifecycle mutations available to the scoped Worker bearer', async () => {
+    const app = await createHttpServer(fakeRedis(), {
+      ...config(),
+      workerApiToken: 'worker-only-secret',
+    } as BiaoConfig & { workerApiToken: string });
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/task/example/block',
+        headers: { authorization: 'Bearer worker-only-secret' },
+        payload: {
+          agent_id: 'worker-1',
+          claim_token: 'claim-token',
+          reason: 'waiting_dependency',
+        },
+      });
+
+      expect(response.statusCode).not.toBe(401);
+      expect(response.statusCode).not.toBe(403);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('lets a human establish a durable local Owner browser session without receiving the Agent bearer token', async () => {
     const app = await createHttpServer(fakeRedis(), config());
     const localBrowserHeaders = {

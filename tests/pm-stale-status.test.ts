@@ -148,6 +148,20 @@ describe('agent 在线状态按心跳租约派生', () => {
     expect(status.data).toMatchObject({ attention: { stale_running_agents: 1 } });
   });
 
+  it('同名 Agent 新注册成 idle 时，仍把旧 running lease 计为当前异常', async () => {
+    await agentRegister(redis, 'restarted-agent', 'mock', ['code']);
+    await redis.hset(keys.hash.task('orphan-running-task'), {
+      task_id: 'orphan-running-task', status: 'running', claimed_by: 'restarted-agent',
+    });
+    await redis.zadd(keys.zset.status.running, Date.now() + 60_000, 'orphan-running-task');
+    await redis.set(keys.string.lease('orphan-running-task'), 'old-token', 'PX', 60_000);
+    await redis.hset(keys.hash.agent('restarted-agent'), { status: 'idle', current_task: '' });
+
+    const status = await getStatus(redis);
+
+    expect(status.data).toMatchObject({ attention: { stale_running_agents: 1 } });
+  });
+
   it('原始登记信息可审计（registered_at/last_heartbeat 保留）', async () => {
     await agentRegister(redis, 'audit-agent', 'mock', ['code']);
     await redis.hset(keys.hash.agent('audit-agent'), {

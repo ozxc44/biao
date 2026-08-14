@@ -111,11 +111,17 @@ verify: []
 `);
   };
 
-  // Owner tasks intentionally have no initial ownership. The test claims the waiting task
-  // first, then uses the real explicit ownership API to model a competing writer preempting it.
-  writeTask('01-owner-report.md', ids.reportOwner, agents.reportOwner, { priority: 9 });
+  // 两个 owner 都必须在任务书中持有对应范围；高优先级只授权抢占冲突，不能扩张任务范围。
+  // 测试仍先 claim waiting task，再由 owner 的合法范围触发真实 preempt。
+  writeTask('01-owner-report.md', ids.reportOwner, agents.reportOwner, {
+    priority: 9,
+    ownership: 'src/auto-resume/report/**',
+  });
   writeTask('02-wait-report.md', ids.reportWaiter, agents.reportWaiter, { ownership: 'src/auto-resume/report/**' });
-  writeTask('03-owner-release.md', ids.releaseOwner, agents.releaseOwner, { priority: 9 });
+  writeTask('03-owner-release.md', ids.releaseOwner, agents.releaseOwner, {
+    priority: 9,
+    ownership: 'src/auto-resume/release/**',
+  });
   writeTask('04-wait-release.md', ids.releaseWaiter, agents.releaseWaiter, { ownership: 'src/auto-resume/release/**' });
   writeTask('05-dependency-owner.md', ids.dependencyOwner, agents.dependencyOwner);
   writeTask('06-dependency-waiter.md', ids.dependencyWaiter, agents.dependencyWaiter, { dependsOn: ids.dependencyOwner });

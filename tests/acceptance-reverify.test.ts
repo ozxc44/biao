@@ -163,6 +163,7 @@ async function persistTaskFixture(store: SqliteStore, taskId: string): Promise<v
     failure_reason: h.failed_reason ?? '',
     fix_for: h.fix_for ?? '',
     repair_root_task_id: h.repair_root_task_id ?? '',
+    trigger_review_task_id: h.trigger_review_task_id ?? '',
     resolution_status: h.resolution_status ?? '',
     resolution_action: h.resolution_action ?? '',
     resolution_task_id: h.resolution_task_id ?? '',
@@ -249,6 +250,8 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
       verify: JSON.stringify(VERIFY),
       fix_for: 'evidence-acceptance',
       repair_root_task_id: 'evidence-acceptance',
+      trigger_review_task_id: 'evidence-acceptance',
+      goal_md: expect.stringContaining('review task: `evidence-acceptance`'),
     });
     expect((await claimAs('evidence-reviewer-1', ['acceptance'])).data).toBeNull();
 
@@ -357,13 +360,43 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
       status: 'done',
       pm_review_status: 'rejected',
       pm_rejection_resolution_mode: 'reverify',
+      resolution_generation: '1',
     });
     expect(await redis.hgetall(keys.hash.task('repeat-acceptance'))).toMatchObject({
       resolution_task_id: 'repeat-acceptance-reverify-2',
       resolution_generation: '2',
+      resolution_attempts: '2',
+    });
+    expect(await redis.hgetall(keys.hash.task('repeat-acceptance-reverify-2'))).toMatchObject({
+      resolution_generation: '2',
+      trigger_review_task_id: 'repeat-acceptance-reverify-1',
+      goal_md: expect.stringContaining('review task: `repeat-acceptance-reverify-1`'),
     });
     expect((await claimAs('repeat-reviewer-2', ['acceptance'])).data).toBeNull();
-    expect((await claimAs('repeat-reviewer-3', ['acceptance'])).data?.task_id).toBe('repeat-acceptance-reverify-2');
+    const secondAttempt = await claimAs('repeat-reviewer-3', ['acceptance']);
+    expect(secondAttempt.data?.task_id).toBe('repeat-acceptance-reverify-2');
+    expect((await report(redis, {
+      task_id: secondAttempt.data!.task_id,
+      agent_id: 'repeat-reviewer-3',
+      claim_token: secondAttempt.data!.claim_token,
+      status: 'done',
+      result_path: writeResult(secondAttempt.data!.task_id, '# 复验二\n\n- 结论：✅ PASS\n'),
+      verify_results: [{ cmd: VERIFY[0].cmd, exit_code: 0, passed: true }],
+    })).ok).toBe(true);
+    expect((await pmReview(redis, secondAttempt.data!.task_id, {
+      verdict: 'reject',
+      reviewed_by: 'pm',
+      reject_reason: '第三轮仍只需重做验收证据',
+      resolution_mode: 'reverify',
+    })).data?.fix_task_id).toBe('repeat-acceptance-reverify-3');
+
+    // 独立性必须排除来源实现者、原验收者和最近一次复验者，但不能永久耗尽
+    // 所有历史复验者；更早的独立验收者可以轮换回来继续 fresh reverify。
+    expect((await claimAs('repeat-implementer', ['acceptance'])).data).toBeNull();
+    expect((await claimAs('repeat-reviewer-1', ['acceptance'])).data).toBeNull();
+    expect((await claimAs('repeat-reviewer-3', ['acceptance'])).data).toBeNull();
+    expect((await claimAs('repeat-reviewer-2', ['acceptance'])).data?.task_id)
+      .toBe('repeat-acceptance-reverify-3');
   });
 
   it('启动补偿会按持久化的 reverify 模式补建 fresh attempt，而不是退化成来源 repair', async () => {
@@ -388,6 +421,41 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     expect(await reconcileResolutionBacklog(redis)).toEqual({
       repaired_task_ids: [],
       needs_pm_decision_task_ids: [],
+    });
+  });
+
+  it('启动补偿会回填历史 reverify 的代际与根 attempts 计数', async () => {
+    await completeCode('metadata-source', 'metadata-implementer');
+    await pmReview(redis, 'metadata-source', { verdict: 'accept', reviewed_by: 'pm' });
+    await completeAcceptance('metadata-acceptance', ['metadata-source'], 'metadata-reviewer-1');
+    await redis.hset(keys.hash.task('metadata-acceptance'), 'max_retries', '3');
+    await pmReview(redis, 'metadata-acceptance', {
+      verdict: 'reject', reviewed_by: 'pm', reject_reason: '证据不足', resolution_mode: 'reverify',
+    });
+    const first = await claimAs('metadata-reviewer-2', ['acceptance']);
+    expect((await report(redis, {
+      task_id: first.data!.task_id,
+      agent_id: 'metadata-reviewer-2',
+      claim_token: first.data!.claim_token,
+      status: 'done',
+      result_path: writeResult(first.data!.task_id, '# 第一轮\n\n- 结论：✅ PASS\n'),
+      verify_results: [{ cmd: VERIFY[0].cmd, exit_code: 0, passed: true }],
+    })).ok).toBe(true);
+    expect((await pmReview(redis, first.data!.task_id, {
+      verdict: 'reject', reviewed_by: 'pm', reject_reason: '继续补证', resolution_mode: 'reverify',
+    })).data?.fix_task_id).toBe('metadata-acceptance-reverify-2');
+    expect(await redis.exists(keys.hash.task('metadata-acceptance-reverify-2'))).toBe(1);
+
+    await redis.hset(keys.hash.task('metadata-acceptance'), 'resolution_attempts', '1');
+    await redis.hset(keys.hash.task('metadata-acceptance-reverify-2'), 'resolution_generation', '0');
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task('metadata-acceptance'))).toMatchObject({
+      resolution_generation: '2',
+      resolution_attempts: '2',
+    });
+    expect(await redis.hgetall(keys.hash.task('metadata-acceptance-reverify-2'))).toMatchObject({
+      resolution_generation: '2',
     });
   });
 
@@ -627,10 +695,12 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
       resolved_by_task: 'retry-acceptance-reverify-2',
     });
     expect((await redis.hget(keys.hash.task('retry-acceptance'), 'resolution_task_ids') ?? '').split(',')).toEqual([
-      'retry-source-repair-1',
       'retry-acceptance-reverify-1',
-      'retry-source-repair-2',
       'retry-acceptance-reverify-2',
+    ]);
+    expect((await redis.hget(keys.hash.task('retry-acceptance'), 'acceptance_repair_task_ids') ?? '').split(',')).toEqual([
+      'retry-source-repair-1',
+      'retry-source-repair-2',
     ]);
     expect(await redis.hgetall(keys.hash.task('retry-acceptance-reverify-1'))).toEqual(failedReverify1);
     expect((await claimAs('retry-downstream-worker', ['code'])).data?.task_id).toBe('retry-downstream');
@@ -751,13 +821,15 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     expect(await redis.hgetall(keys.hash.task('reverify-limit-acceptance'))).toMatchObject({
       resolution_status: 'needs_pm_decision',
       resolution_action: 'inspect',
-      resolution_task_id: 'reverify-limit-source-repair-2',
+      resolution_task_id: 'reverify-limit-acceptance-reverify-1',
       resolution_generation: '1',
       resolution_decision_reason: 'reverify_retry_limit_reached',
     });
     expect((await redis.hget(keys.hash.task('reverify-limit-acceptance'), 'resolution_task_ids') ?? '').split(',')).toEqual([
-      'reverify-limit-source-repair-1',
       'reverify-limit-acceptance-reverify-1',
+    ]);
+    expect((await redis.hget(keys.hash.task('reverify-limit-acceptance'), 'acceptance_repair_task_ids') ?? '').split(',')).toEqual([
+      'reverify-limit-source-repair-1',
       'reverify-limit-source-repair-2',
     ]);
     expect(await redis.hgetall(keys.hash.task('reverify-limit-acceptance-reverify-1'))).toEqual(failedReverify);
@@ -792,6 +864,35 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     expect(await redis.exists(keys.hash.task('multi-acceptance-repair-1'))).toBe(0);
     expect(await redis.exists(keys.hash.task('source-a-repair-1'))).toBe(0);
     expect(await redis.exists(keys.hash.task('source-b-repair-1'))).toBe(0);
+  });
+
+  it('多来源验收不得默认 fan-out repair，必须改为独立复验或分别处理来源', async () => {
+    for (const sourceId of ['no-fanout-source-a', 'no-fanout-source-b']) {
+      await completeCode(sourceId, `worker-${sourceId}`);
+      expect((await pmReview(redis, sourceId, {
+        verdict: 'accept', reviewed_by: `pm-${sourceId}`,
+      })).ok).toBe(true);
+    }
+    const acceptanceId = 'no-fanout-acceptance';
+    await completeAcceptance(
+      acceptanceId,
+      ['no-fanout-source-a', 'no-fanout-source-b'],
+      'acceptance-worker',
+    );
+
+    const rejected = await pmReview(redis, acceptanceId, {
+      verdict: 'reject',
+      reviewed_by: 'pm-no-fanout',
+      reject_reason: '只有一个来源需要修复',
+    });
+
+    expect(rejected).toMatchObject({
+      ok: false,
+      error: { code: 'MULTI_SOURCE_REPAIR_TARGET_REQUIRED' },
+    });
+    expect(await redis.hget(keys.hash.task(acceptanceId), 'pm_review_status')).toBe('');
+    expect(await redis.exists(keys.hash.task('no-fanout-source-a-repair-1'))).toBe(0);
+    expect(await redis.exists(keys.hash.task('no-fanout-source-b-repair-1'))).toBe(0);
   });
 
   it('单来源验收的显式扩权相对来源 ownership 校验，并只写入来源 repair', async () => {
@@ -849,8 +950,9 @@ describe('acceptance reject -> source repair -> independent reverify', () => {
     expect(root).toMatchObject({
       resolution_status: 'needs_pm_decision',
       resolution_action: 'inspect',
-      // 冲突不得把已验收来源 repair 从 lineage/末次指针中抹掉。
-      resolution_task_id: 'collision-source-repair-1',
+      // 来源 repair 另存为关联审计，不得污染 acceptance 根的 reverify 指针。
+      resolution_task_id: '',
+      acceptance_repair_task_ids: 'collision-source-repair-1',
       resolution_generation: '0',
     });
     expect((root.resolution_task_ids ?? '').split(',').filter(Boolean)).not.toContain(collisionId);

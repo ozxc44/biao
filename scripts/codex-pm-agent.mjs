@@ -12,6 +12,7 @@ import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const MAX_WAKE_BYTES = 16 * 1024;
+const CODEX_THREAD_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const ALLOWED_KEYS = new Set(['biaoUrl', 'consumer', 'planIds', 'kinds', 'count']);
 const ALLOWED_KINDS = new Set([
   'review_requested',
@@ -27,6 +28,17 @@ const ALLOWED_KINDS = new Set([
 function fail(message, code = 2) {
   console.error(`[codex-pm-agent] 门铃载荷无效：${message}`);
   return code;
+}
+
+function resolveTargetThreadId() {
+  // Supervisor 的逐 Plan 路由必须覆盖旧的全局兼容配置；否则切换 Plan/PM 时会
+  // 被残留的 BIAO_PM_THREAD_ID 带回错误会话。
+  const threadId = process.env.BIAO_PM_TARGET?.trim() || process.env.BIAO_PM_THREAD_ID?.trim();
+  if (!threadId) return undefined;
+  if (!CODEX_THREAD_ID_RE.test(threadId)) {
+    throw new Error('BIAO_PM_TARGET/BIAO_PM_THREAD_ID 必须是 8-128 位的 Codex 会话 ID');
+  }
+  return threadId;
 }
 
 function validateWake(raw) {
@@ -196,27 +208,27 @@ Plan 范围：${plans}
 - 这是本机 CLI 闭环，必须直接使用 shell/exec 运行上述 runtime 绝对 launcher；这些入口已配置好认证。
 - 禁止使用 Computer Use、桌面 Terminal、ZCode UI 或任何浏览器来代替 CLI，也不得改用浏览器访问 Biao。
 - 不要读取或调用任何 skill、memory、MCP、Connector 或插件；本提示已包含完整操作契约，外部工具失败不能改写任务范围。
-- 若某条 CLI 命令失败，直接记录其 stderr/exit code 并让本次会话非零退出；不要绕行 UI，事件会保留供下轮重试。
+- 唯一例外：pm intake 在“无待处理事项”时约定退出码为 2；看到该文案时，exit 2 是 drained 成功，不得自报失败。其它 CLI 命令若非零退出，直接记录其 stderr/exit code 并让本次会话非零退出；不要绕行 UI，事件会保留供下轮重试。
 
 必须完成一个真实闭环：
 1. 在当前 Biao 仓库先运行 \`${pmStartCommand}\`，再逐条运行 ${intakeCommandList} 主动读取详情；所有启动和 intake 命令都必须保留这些 Plan 过滤参数，禁止读取或处理其它 Plan。
-2. review/acceptance：读取 task、result、verify_results 和已有审查证据，执行足够的独立验证；通过才 accept，失败必须 reject 并写清可执行修复要求。done、退出码 0 或测试数量都不能替代 PM 验收。
+2. review/acceptance：读取 task、result、verify_results 和已有审查证据，执行足够的独立验证；通过才 accept，失败必须 reject 并写清可执行修复要求。done、退出码 0 或测试数量都不能替代 PM 验收。\`reverify-only\` 只允许 type=acceptance；普通 code/docs/research 任务即使只缺 report 或 verify_results，也必须使用正常 reject/repair，并把“仅补平台回执、不得改业务实现”等边界写入修复要求，禁止调用 acceptance 专用参数。
 3. question_asked：严格按每个受管 Plan 分别执行 ${questionCommands}。get/answer 成功返回的 asked_event_id 是唯一可 ack 的对应门铃；不得省略 Plan 过滤或跨 Plan 批量处理。根据任务书、代码和计划作出明确答复。Worker 必须经平台取得答复并 fresh claim；不要向当前人类提问，也不要让 Worker 绕过平台问人。
 4. failed/blocked/stale/resolution：按状态执行，禁止 reset 绕过修复链或清门铃：
    - 有 task_id 时先运行 \`${pmLauncher} task get <task_id>\` 读取当前真相。\`waiting_dependency / waiting_file_release\` 是平台与共享 Supervisor 的内部等待，正常不会打扰 PM；不得手工 resume 或 ack 催跑。\`waiting_pm_reply\` 必须走上面的 Question answer。
    - 未知 blocked 只有在证据确认外部条件已经消失时才运行 \`${pmLauncher} task resume <task_id>\`，随后重读 task/intake；条件仍存在就保留门铃。
    - stale_agent 或 running 已丢 lease 时运行 \`${pmLauncher} watchdog --auto-fix\`，再重读 task/intake；该命令只做安全的 lease/agent 恢复和遗留 resolution 补偿，不会自动验收。
-   - failed 先看 resolution/repair 状态：repairing 等 Worker，required Review 当前 repair，needs_pm_decision 先运行 \`${pmLauncher} task resolution <task_id>\`；证据支持时用 \`--action continue\`，明确终止时用 \`--action cancel\`。没有 resolution 的 legacy failed 运行一次 \`${pmLauncher} watchdog --auto-fix\` 补建 repair 后重读，不得 reset 原任务。
+   - failed 先看 resolution/repair 状态：repairing 等 Worker，required Review 当前 repair，needs_pm_decision 先运行 \`${pmLauncher} task resolution <task_id> --action inspect\`。注意 task resolution 不接受 --plan，范围由唯一 task_id 决定；不得为了附加 Plan 过滤而传入未支持参数。若 inspect 返回“合法返修来源”，必须结合最新 reject 证据从该集合中选择实际有缺陷的最小来源，再运行 \`${pmLauncher} task resolution <task_id> --action continue --repair-source-task <inspect 返回的合法来源>\`；多个来源用逗号分隔，禁止把 reverify/acceptance 任务自身当来源。来源当前显示 accepted/resolved、此前 repair 已耗尽或本轮尚无新实现，都不是拒绝调度的理由：该 continue 正是由验收根受控重开下一代，并把最新 reject 原文交给 Worker 去产生新实现。只要 inspect 给出合法来源且最新 reject 已明确实际缺陷，本轮就必须执行 continue，不得因“缺少新证据”“来源已解决”或“以前是空交付”保留同一门铃空转。其它可安全续跑项用 \`--action continue\`，明确终止时用 \`--action cancel\`。没有 resolution 的 legacy failed 运行一次 \`${pmLauncher} watchdog --auto-fix\` 补建 repair 后重读，不得 reset 原任务。
    - 对于 resolution，只有 continue/cancel 成功后才 ack；其它异常也必须等对应恢复动作成功、intake 当前事实消失后才 ack。真正无法自治时保留门铃并让本次会话非零退出；不要直接替 Worker 修改实现文件，也不要伪造成功结果。
 5. 只有事项实际处置完成后，才对对应 event 执行 \`${pmLauncher} pm ack --consumer ${consumerArg} --event-id <id>\`。绝不批量盲 ack、自动通过或把门铃当完成证明。
-6. 最后再次逐条运行 ${intakeCommandList}，确认本次门铃 Plan 范围内的可处理事项已清空；不得用无 Plan 过滤的 intake 代替。若因真实外部阻塞无法处置，保留未 ack 状态并在最终结果明确说明，不得假装闭环。
+6. 最后再次逐条运行 ${intakeCommandList}，确认本次门铃 Plan 范围内的可处理事项已清空；不得用无 Plan 过滤的 intake 代替。若输出“无待处理事项”并以 2 退出，按已清空成功处理。若因真实外部阻塞无法处置，保留未 ack 状态并在最终结果明确说明，不得假装闭环。
 
 保持平台被动、输出简短。你是 PM，不是本轮 Worker。`;
 }
 
 function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('用法：由 scripts/pm-agent.mjs 通过 stdin 传入五字段最小门铃；本脚本按需启动一次 ephemeral Codex PM 会话。');
+    console.log('用法：由 scripts/pm-agent.mjs 通过 stdin 传入五字段最小门铃；设置 BIAO_PM_THREAD_ID 时恢复该原 PM 会话，否则按需启动一次 ephemeral Codex PM 会话。');
     return 0;
   }
   let wake;
@@ -245,17 +257,40 @@ function main() {
   const sandbox = ['read-only', 'workspace-write'].includes(process.env.BIAO_CODEX_PM_SANDBOX ?? '')
     ? process.env.BIAO_CODEX_PM_SANDBOX
     : 'workspace-write';
-  const args = [
-    'exec', '--ephemeral', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
-    '--color', 'never',
-    '-c', 'sandbox_workspace_write.network_access=true',
-    '-c', 'model_reasoning_effort="high"',
-    '-s', sandbox, '-C', runtimeDir,
-    ...(project !== runtimeDir ? ['--add-dir', project] : []),
-    '-',
-  ];
+  let targetThreadId;
+  try {
+    targetThreadId = resolveTargetThreadId();
+  } catch (error) {
+    console.error(`[codex-pm-agent] PM 会话配置无效：${error instanceof Error ? error.message : String(error)}`);
+    return 3;
+  }
+  const args = targetThreadId
+    ? [
+      // 这条路径必须保留原会话身份和历史，不能退化成无上下文的 ephemeral PM。
+      // cwd 仍指向受控 project；Biao 凭据不跨入 Codex 子进程，提示中的 launcher 会在
+      // 实际读取平台时从受限 runtime 配置加载。
+      // PM 只通过本地 launcher 读取平台。显式关闭会话里继承的 MCP/Apps/Plugins，
+      // 避免无关 Connector 初始化失败（例如 HTTP 502）把已经恢复的 PM turn 标为
+      // interrupted，同时外层 resume 进程继续占锁、让 Supervisor 误判“仍在处理”。
+      'exec', 'resume', '--skip-git-repo-check',
+      '-c', 'mcp_servers={}',
+      '-c', 'plugins={}',
+      '-c', 'apps._default.enabled=false',
+      '-c', 'features.apps=false',
+      '-c', 'features.plugins=false',
+      targetThreadId, '-',
+    ]
+    : [
+      'exec', '--ephemeral', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
+      '--color', 'never',
+      '-c', 'sandbox_workspace_write.network_access=true',
+      '-c', 'model_reasoning_effort="high"',
+      '-s', sandbox, '-C', runtimeDir,
+      ...(project !== runtimeDir ? ['--add-dir', project] : []),
+      '-',
+    ];
   const result = spawnSync(codexBin, args, {
-    cwd: runtimeDir,
+    cwd: targetThreadId ? project : runtimeDir,
     input: buildPrompt(wake, runtimeDir),
     encoding: 'utf8',
     stdio: ['pipe', 'inherit', 'inherit'],

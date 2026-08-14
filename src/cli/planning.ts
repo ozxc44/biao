@@ -741,6 +741,8 @@ type RemoteTask = {
   acceptance_for?: string[];
   verify?: unknown[];
   goal_md?: string;
+  fix_for?: string;
+  repair_root_task_id?: string;
 };
 
 type ComparableTask = {
@@ -761,7 +763,7 @@ type ComparableTask = {
 };
 
 type FieldChange = { field: keyof ComparableTask; before: unknown; after: unknown };
-type RevisionAction = 'create' | 'update' | 'skip_running' | 'skip_blocked' | 'skip_terminal' | 'skip_cancelled' | 'skip_superseded' | 'missing_local' | 'unchanged';
+type RevisionAction = 'create' | 'update' | 'skip_running' | 'skip_blocked' | 'skip_terminal' | 'skip_cancelled' | 'skip_superseded' | 'missing_local' | 'audit_only' | 'unchanged';
 type RevisionChange = {
   task_id: string;
   status: string;
@@ -858,7 +860,7 @@ function printRevisionHuman(data: {
 }): void {
   console.log(`plan ${data.plan_id}（${data.mode}）`);
   console.log(`  状态：pending ${data.status.pending ?? 0} / running ${data.status.running ?? 0} / blocked ${data.status.blocked ?? 0} / done ${data.status.done ?? 0} / failed ${data.status.failed ?? 0} / cancelled ${data.status.cancelled ?? 0} / superseded ${data.status.superseded ?? 0}`);
-  console.log(`  动作：新增 ${data.summary.create} / 更新 pending ${data.summary.update} / 跳过 running ${data.summary.skip_running} / 跳过 blocked ${data.summary.skip_blocked} / 跳过 done/failed ${data.summary.skip_terminal} / 跳过 cancelled ${data.summary.skip_cancelled} / 跳过 superseded ${data.summary.skip_superseded} / 磁盘缺失 ${data.summary.missing_local} / 无变化 ${data.summary.unchanged}`);
+  console.log(`  动作：新增 ${data.summary.create} / 更新 pending ${data.summary.update} / 跳过 running ${data.summary.skip_running} / 跳过 blocked ${data.summary.skip_blocked} / 跳过 done/failed ${data.summary.skip_terminal} / 跳过 cancelled ${data.summary.skip_cancelled} / 跳过 superseded ${data.summary.skip_superseded} / 磁盘缺失 ${data.summary.missing_local} / 谱系审计 ${data.summary.audit_only} / 无变化 ${data.summary.unchanged}`);
   console.log(`  源目录：${data.plan_dir}`);
 
   if (data.mode === 'diff') {
@@ -868,6 +870,8 @@ function printRevisionHuman(data: {
         console.log('  + 磁盘新任务；submit 将创建 pending 任务');
       } else if (change.action === 'missing_local') {
         console.log('  磁盘不存在；submit 不会删除平台任务，请显式执行 task cancel');
+      } else if (change.action === 'audit_only') {
+        console.log('  平台生成的 repair/reverify 谱系记录；不属于磁盘声明任务');
       } else if (change.action === 'skip_blocked') {
         console.log('  平台会保留 blocked 状态与阻塞上下文；本地 MD 不覆盖');
       } else if (change.action === 'skip_cancelled') {
@@ -889,7 +893,7 @@ function printRevisionHuman(data: {
     console.log(`\n可执行操作：
   [1] 重新 submit（只覆盖 pending，其余状态保留）：biao plan revise ${data.plan_id} --submit
   [2] 加新任务：biao task add --plan ${data.plan_id} --task-id <id> --title "..."
-  [3] 强制 reset running（危险，会打断 Worker）：biao task reset <task_id> --force
+  [3] 恢复已失去 lease 的旧 running：先用 biao watchdog --auto-fix（在线 Worker 禁止 reset）
   [4] 查看 diff：biao plan revise ${data.plan_id} --diff
 
 撤销不该做的 pending 任务：biao task cancel <task_id>`);
@@ -962,7 +966,12 @@ export async function runPlanRevise(args: string[], api: CliApi): Promise<void> 
     }
     for (const [taskId, remote] of remotes) {
       if (!locals.has(taskId)) {
-        changes.push({ task_id: taskId, status: remote.status ?? 'unknown', action: 'missing_local', changed_fields: [] });
+        changes.push({
+          task_id: taskId,
+          status: remote.status ?? 'unknown',
+          action: remote.fix_for || remote.repair_root_task_id ? 'audit_only' : 'missing_local',
+          changed_fields: [],
+        });
       }
     }
     changes.sort((left, right) => left.task_id.localeCompare(right.task_id));
@@ -975,6 +984,7 @@ export async function runPlanRevise(args: string[], api: CliApi): Promise<void> 
       skip_cancelled: 0,
       skip_superseded: 0,
       missing_local: 0,
+      audit_only: 0,
       unchanged: 0,
     } satisfies Record<RevisionAction, number>;
     for (const change of changes) summary[change.action]++;

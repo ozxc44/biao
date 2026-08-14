@@ -110,6 +110,7 @@ button { color: inherit; }
 
 .project-heading { align-items: flex-end; margin-bottom: 14px; }
 .project-heading p:not(.eyebrow) { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.project-heading-actions, .plan-detail-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .create-plan { position: relative; }
 .create-plan-form { position: absolute; right: 0; top: calc(100% + 8px); z-index: 15; width: min(480px, calc(100vw - 28px)); padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: white; box-shadow: var(--shadow); }
 .create-plan-form label:not(:first-child) { margin-top: 12px; }
@@ -142,6 +143,13 @@ button { color: inherit; }
 .column-header { display: flex; justify-content: space-between; align-items: center; padding: 2px 3px 9px; color: #475569; font-weight: 750; }
 .column-count { min-width: 24px; padding: 1px 7px; border-radius: 99px; background: white; color: var(--muted); text-align: center; font-size: 11px; }
 .column-body { display: grid; gap: 7px; }.column-empty { padding: 15px 0; color: #8693a2; text-align: center; font-size: 11px; }
+.column-subgroup { display: grid; gap: 7px; min-width: 0; }
+.column-subgroup + .column-subgroup { margin-top: 10px; padding-top: 10px; border-top: 1px solid #d8dee5; }
+.column-subgroup-title { display: flex; align-items: center; justify-content: space-between; padding: 0 2px; color: var(--muted); font-size: 10px; font-weight: 750; }
+.column-expand-button { width: 100%; padding: 7px 9px; border: 1px solid #cbd5e1; border-radius: 7px; background: rgba(255, 255, 255, .8); color: #475569; font-size: 10px; font-weight: 700; cursor: pointer; }
+.column-expand-button:hover { border-color: #94a3b8; background: white; color: var(--text); }
+.column-expand-button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.column-active .column-header { color: var(--blue); }.column-audit .column-header { color: var(--red); }
 .column-running .column-header { color: var(--blue); }.column-review_pending .column-header { color: var(--amber); }.column-accepted .column-header { color: var(--green); }.column-rejected .column-header, .column-failed .column-header { color: var(--red); }.column-blocked .column-header { color: #9a6700; }
 
 .task-card { min-width: 0; border-left: 3px solid #94a3b8; border-radius: 8px; background: white; box-shadow: 0 2px 8px rgba(30, 41, 59, .05); overflow: hidden; }
@@ -152,6 +160,7 @@ button { color: inherit; }
 .task-card-top { display: flex; justify-content: space-between; gap: 8px; }.task-id, .task-priority { color: var(--muted); font-size: 10px; }.task-id { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .task-title { margin: 4px 0 7px; font-size: 12px; overflow-wrap: anywhere; }
 .task-meta { display: flex; flex-wrap: wrap; gap: 4px; }.tag { padding: 2px 5px; border-radius: 4px; background: #edf1f5; color: #52606f; font-size: 9px; }.tag.assignee { background: #e9e7ff; color: #5842ad; }
+.repair-tag { align-self: flex-start; max-width: 100%; margin-top: 6px; overflow-wrap: anywhere; }
 .task-agent, .countdown, .task-reason { margin-top: 7px; font-size: 10px; overflow-wrap: anywhere; }.task-agent, .countdown { color: var(--blue); }.task-reason { padding: 6px; border-radius: 5px; background: #fff0f1; color: var(--red); }
 .resolution-status { display: inline-flex; align-self: flex-start; width: fit-content; max-width: 100%; margin-top: 7px; padding: 3px 6px; border-radius: 5px; font-size: 10px; font-weight: 700; line-height: 1.3; overflow-wrap: anywhere; }
 .resolution-status.resolution-blue { background: #dbeafe; color: #1d4ed8; }.resolution-status.resolution-green { background: #dcfce7; color: var(--green); }.resolution-status.resolution-amber { background: #fef3c7; color: #9a6700; }.resolution-status.resolution-red { background: #fee2e2; color: var(--red); }
@@ -189,6 +198,7 @@ button { color: inherit; }
   .app { padding-top: 14px; }
   .app-header, .project-heading, .plan-detail-header { align-items: flex-start; flex-direction: column; }
   .header-actions { width: 100%; justify-content: space-between; }
+  .project-heading-actions, .plan-detail-actions { width: 100%; justify-content: flex-start; }
   .token-control { margin-left: auto; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .board { grid-template-columns: 1fr; }

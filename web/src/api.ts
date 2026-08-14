@@ -17,6 +17,29 @@ export interface PlanSummary {
   status: string;
   project_path: string;
   task_count: number;
+  runtime_task_count?: number;
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
+}
+
+export interface RootTaskLifecycle {
+  total: number;
+  pending: number;
+  running: number;
+  blocked: number;
+  review_pending: number;
+  accepted: number;
+  failed: number;
+  needs_pm_decision: number;
+  cancelled: number;
+  declared_total: number;
+  consistent: boolean;
+}
+
+export interface ReviewCounts {
+  pending: number;
+  accepted: number;
+  rejected: number;
 }
 
 export interface AgentInfo {
@@ -49,6 +72,9 @@ export interface StatusData {
     accepted: number;
     rejected: number;
   };
+  /** 以声明根任务计数；repair/reverify 仅保留在 reviews 审计中。 */
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
   /** 当前需要处理的异常；旧 tasks/reviews 字段仍保留原始审计总数。 */
   attention?: StatusAttention;
   /** 已闭环失败/拒绝与历史 Agent 的独立统计。 */
@@ -80,6 +106,8 @@ export interface TaskSummary {
   claimed_at?: number;
   expire_at?: number;
   done_at?: number;
+  created_at?: number;
+  updated_at?: number;
   status?: string;
   retries?: number;
   max_retries?: number;
@@ -94,6 +122,11 @@ export interface TaskSummary {
   failure_reason?: string;
   blocked_reason?: string;
   blocked_at?: number;
+  cancelled_at?: number;
+  cancel_reason?: string;
+  superseded_at?: number;
+  superseded_by?: string;
+  superseded_reason?: string;
   /**
    * 自动修复闭环字段。它们不改写原始 status/PM Review：
    * failed/rejected 仍是可审计事实，resolved 只表示后续修复已独立验收。
@@ -119,6 +152,10 @@ export interface PlanData {
   status: string;
   project_path: string;
   task_count: number;
+  declared_task_count?: number;
+  runtime_task_count?: number;
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
   created_at: number;
   phases: string[];
   tasks: {
@@ -245,6 +282,21 @@ export interface TaskReviewInfo {
   claimed_by: string;
   done_at: string | number;
   pm_review_status: string;
+  pm_reject_reason?: string;
+  pm_fix_instructions?: string;
+  pm_rejection_resolution_mode?: string;
+  failure_reason?: string;
+  block_reason?: string;
+  fix_for?: string;
+  repair_root_task_id?: string;
+  resolution_status?: string;
+  resolution_action?: string;
+  resolution_task_id?: string;
+  resolution_task_ids?: string[];
+  resolved_by_task?: string;
+  resolution_generation?: number;
+  resolution_attempts?: number;
+  resolution_decision_reason?: string;
   result_md: string;
   result_json: Record<string, unknown>;
   changed_files: string[];
@@ -286,11 +338,11 @@ export async function resetTask(taskId: string, force: boolean): Promise<{ task_
   });
 }
 
-export async function cancelTask(taskId: string): Promise<{ task_id: string; status: string }> {
+export async function cancelTask(taskId: string, reason: string): Promise<{ task_id: string; status: string }> {
   return request<{ task_id: string; status: string }>(`/task/${encodeURIComponent(taskId)}/cancel`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify({ reason }),
   });
 }
 

@@ -73,6 +73,9 @@ function seedPrebuiltPackage(root: string): void {
     'web/dist/assets/app.js',
     'web/dist/assets/app.css',
     'bin/biao-worker.js',
+    'bin/biao-adapter-kit.js',
+    'bin/biao-worker-agent.js',
+    'bin/biao-supervisor-config.js',
     'bin/cli-worker.js',
     'bin/codex-worker.js',
     'bin/kimi-worker.js',
@@ -81,6 +84,9 @@ function seedPrebuiltPackage(root: string): void {
     'scripts/install.sh',
     'scripts/pm-agent.mjs',
     'scripts/codex-pm-agent.mjs',
+    'scripts/adapter-kit.mjs',
+    'scripts/worker-agent.mjs',
+    'scripts/supervisor-config.mjs',
     'scripts/supervisor.mjs',
     'scripts/redis-probe.mjs',
   ]) {
@@ -112,6 +118,13 @@ function seedPrebuiltPackage(root: string): void {
   );
   const logoPath = join(root, 'web', 'dist', 'assets', 'logo.svg');
   writeFileSync(logoPath, '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
+  const sqliteModule = join(root, 'node_modules', 'better-sqlite3');
+  mkdirSync(sqliteModule, { recursive: true });
+  writeFileSync(join(sqliteModule, 'package.json'), '{"main":"index.cjs"}\n');
+  writeFileSync(
+    join(sqliteModule, 'index.cjs'),
+    'module.exports = class Database { prepare() { return { get() { return { ok: 1 }; } }; } close() {} };\n',
+  );
 }
 
 function writeExecutable(path: string, body: string): void {
@@ -137,6 +150,7 @@ describe('clone 后自举配置', () => {
     const packageJson = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')) as { files?: string[] };
     expect(packageJson.files).toContain('scripts/pm-agent.mjs');
     expect(packageJson.files).toContain('scripts/codex-pm-agent.mjs');
+    expect(packageJson.files).toContain('scripts/adapter-kit.mjs');
   });
 
   it('正确解析 shell 入口转交的确认与跳过选项', async () => {
@@ -242,26 +256,52 @@ describe('clone 后自举配置', () => {
     expect(config).toContain("BIAO_WORKSPACE_ROOTS='");
     expect(config).toContain("BIAO_API_TOKEN='test-token'");
     expect(config).toContain(`BIAO_PREFERRED_PROJECT='${realpathSync(project)}'`);
+    expect(config).toContain("BIAO_PM_AGENT_ROUTES=''");
+    expect(config).toContain("BIAO_PM_AGENT_TIMEOUT_MS='600000'");
+    expect(config).toContain("BIAO_PM_SLOTS=''");
+    expect(config).toContain("BIAO_WORKER_SLOTS=''");
     expect(statSync(join(root, '.biao', 'config.env')).mode & 0o777).toBe(0o600);
 
-    for (const name of ['doctor', 'start', 'copy-token', 'token-status', 'pm', 'pm-intake', 'pm-start', 'pm-agent', 'codex-pm-agent', 'supervisor', 'worker-codex', 'worker-kimi', 'worker-custom']) {
+    for (const name of ['doctor', 'start', 'copy-token', 'token-status', 'pm', 'pm-intake', 'pm-start', 'pm-agent', 'pm-heartbeat', 'codex-pm-agent', 'supervisor', 'agent-kit', 'worker-agent', 'supervisor-config', 'worker-codex', 'worker-kimi', 'worker-custom']) {
       expect(statSync(join(root, '.biao', name)).mode & 0o111).not.toBe(0);
     }
     const doctor = readFileSync(join(root, '.biao', 'doctor'), 'utf8');
     expect(doctor).toContain('Node.js 20.19+');
+    expect(doctor).toContain('better-sqlite3');
+    expect(doctor).toContain('SQLite 原生驱动');
     expect(doctor).toContain('scripts/redis-probe.mjs');
     expect(doctor).toContain('unset BIAO_API_TOKEN');
     expect(doctor).not.toContain('redis-cli -u');
     expect(readFileSync(join(root, '.biao', 'supervisor'), 'utf8')).toContain('scripts/supervisor.mjs');
     expect(readFileSync(join(root, '.biao', 'pm-start'), 'utf8')).toContain('pm start');
     expect(readFileSync(join(root, '.biao', 'pm-agent'), 'utf8')).toContain('scripts/pm-agent.mjs');
+    const heartbeat = readFileSync(join(root, '.biao', 'pm-heartbeat'), 'utf8');
+    expect(heartbeat).toContain('"$SCRIPT_DIR/pm" pm heartbeat --once');
+    expect(heartbeat).not.toContain(root);
+    const agentKit = readFileSync(join(root, '.biao', 'agent-kit'), 'utf8');
+    expect(agentKit).toContain('scripts/adapter-kit.mjs');
+    expect(agentKit).not.toContain('config.env');
+    const workerAgent = readFileSync(join(root, '.biao', 'worker-agent'), 'utf8');
+    expect(workerAgent).toContain('scripts/worker-agent.mjs');
+    expect(workerAgent).toContain('BIAO_RUNTIME_DIR');
+    expect(workerAgent).not.toContain('config.env');
+    const supervisorConfig = readFileSync(join(root, '.biao', 'supervisor-config'), 'utf8');
+    expect(supervisorConfig).toContain('scripts/supervisor-config.mjs');
+    expect(supervisorConfig).toContain('SCRIPT_DIR/config.env');
+    expect(supervisorConfig).not.toContain('. "$SCRIPT_DIR/config.env"');
     const codexPmAgent = readFileSync(join(root, '.biao', 'codex-pm-agent'), 'utf8');
     expect(codexPmAgent).toContain('scripts/codex-pm-agent.mjs');
     expect(codexPmAgent).toContain('BIAO_RUNTIME_DIR=$SCRIPT_DIR');
     expect(codexPmAgent).toContain('export BIAO_RUNTIME_DIR');
-    expect(readFileSync(join(root, '.biao', 'worker-codex'), 'utf8')).toContain('BIAO_EXIT_ON_IDLE');
-    expect(readFileSync(join(root, '.biao', 'worker-custom'), 'utf8')).toContain('bin/biao-worker.js');
-    expect(readFileSync(join(root, '.biao', 'worker-custom'), 'utf8')).toContain('"--help"');
+    const workerLaunchers = ['worker-codex', 'worker-kimi', 'worker-custom']
+      .map((name) => readFileSync(join(root, '.biao', name), 'utf8'));
+    expect(workerLaunchers[0]).toContain('BIAO_EXIT_ON_IDLE');
+    expect(workerLaunchers[2]).toContain('bin/biao-worker.js');
+    expect(workerLaunchers[2]).toContain('"--help"');
+    for (const launcher of workerLaunchers) {
+      expect(launcher).toContain('biao-worker-api-token-v1');
+      expect(launcher).toContain('export BIAO_API_TOKEN');
+    }
 
     const guide = readFileSync(join(root, '.biao', 'PM_AGENT.md'), 'utf8');
     expect(guide).toContain('.biao/pm-intake');
@@ -575,8 +615,11 @@ describe('clone 后自举配置', () => {
     'pm-intake',
     'pm-start',
     'pm-agent',
+    'pm-heartbeat',
     'codex-pm-agent',
     'supervisor',
+    'agent-kit',
+    'worker-agent',
     'worker-codex',
     'worker-kimi',
     'worker-custom',
@@ -771,6 +814,34 @@ describe('clone 后自举配置', () => {
     expect(run.stdout).toContain('[optional] 未安装 codex');
   });
 
+  it('doctor 在 SQLite 原生驱动缺失或 ABI 不兼容时失败并给出修复入口', async () => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    bootstrap({
+      repoRoot: root,
+      workspace,
+      project: workspace,
+      token: 'test-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+    rmSync(join(root, 'node_modules', 'better-sqlite3'), { recursive: true, force: true });
+
+    const fakeBin = makeControlledPath(root, 'Darwin');
+    writeExecutable(join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n');
+    writeExecutable(join(fakeBin, 'redis-cli'), '#!/bin/sh\nprintf "PONG\\n"\n');
+    const run = spawnSync('/bin/sh', [join(root, '.biao', 'doctor')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: fakeBin },
+    });
+
+    expect(run.status).toBe(1);
+    expect(`${run.stdout}${run.stderr}`).toContain('[missing] SQLite 原生驱动');
+    expect(`${run.stdout}${run.stderr}`).toContain('npm rebuild better-sqlite3');
+  });
+
   it('全新 clone 同时安装根目录和 web 依赖后再构建', async () => {
     const { bootstrap } = await loadBootstrap();
     const root = makeRoot();
@@ -883,6 +954,10 @@ describe('clone 后自举配置', () => {
     const start = readFileSync(join(consumer, '.biao', 'start'), 'utf8');
     expect(start).toContain(`BIAO_PACKAGE_ROOT=${shellSingleQuoted(packageRoot)}`);
     expect(start).toContain('dist/server/main.js');
+    expect(start).toContain('scripts/supervisor.mjs');
+    expect(start).toContain('BIAO_SUPERVISOR_INTERVAL');
+    expect(start).toContain('BIAO_SUPERVISOR_RESTART_DELAY');
+    expect(start.indexOf('wait "$supervisor_pid"')).toBeLessThan(start.indexOf('kill "$server_pid"'));
     expect(start).toContain('. "$SCRIPT_DIR/config.env"');
   });
 

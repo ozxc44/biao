@@ -599,6 +599,16 @@ describe('plan revise 的 preview / diff / submit 闭环', () => {
           goal_md: '# 平台任务\n', project_path: root,
         },
       },
+      'pending-task-repair-1': {
+        ok: true,
+        data: {
+          task_id: 'pending-task-repair-1', plan_id: 'p1', title: '修复尝试', type: 'code', phase: 'impl',
+          status: 'failed', assignee: 'auto', priority: 6, ownership: { files: [], modules: [] },
+          depends_on: [], timeout_seconds: 3600, max_retries: 2, acceptance_for: [], verify: [],
+          goal_md: '# 平台生成的修复审计\n', project_path: root,
+          fix_for: 'pending-task', repair_root_task_id: 'pending-task',
+        },
+      },
     };
     return { root, taskRecords };
   }
@@ -609,6 +619,7 @@ describe('plan revise 的 preview / diff / submit 闭环', () => {
       if (request.path === '/plan/p1') return planResponse(root, {
         pending: [{ task_id: 'pending-task', status: 'pending' }],
         running: [{ task_id: 'running-only', status: 'running' }],
+        failed: [{ task_id: 'pending-task-repair-1', status: 'failed' }],
       });
       const taskId = decodeURIComponent(request.path.replace('/task/', ''));
       return taskRecords[taskId] ?? { ok: true, data: null };
@@ -622,13 +633,14 @@ describe('plan revise 的 preview / diff / submit 闭环', () => {
       ok: true,
       data: {
         operation: 'plan_revise', mode: 'preview', plan_id: 'p1',
-        summary: { create: 1, update: 1, missing_local: 1 },
+        summary: { create: 1, update: 1, missing_local: 1, audit_only: 1 },
       },
     });
     expect(result.data.changes).toEqual(expect.arrayContaining([
       expect.objectContaining({ task_id: 'pending-task', action: 'update' }),
       expect.objectContaining({ task_id: 'new-task', action: 'create' }),
       expect.objectContaining({ task_id: 'running-only', action: 'missing_local' }),
+      expect.objectContaining({ task_id: 'pending-task-repair-1', action: 'audit_only' }),
     ]));
     expect(mock.requests.some((request) => request.method === 'POST')).toBe(false);
   });
@@ -653,7 +665,8 @@ describe('plan revise 的 preview / diff / submit 闭环', () => {
     expect(outcome.stdout).toContain('磁盘不存在；submit 不会删除平台任务');
     expect(outcome.stdout).toContain('[1] 重新 submit');
     expect(outcome.stdout).toContain('[2] 加新任务');
-    expect(outcome.stdout).toContain('[3] 强制 reset running');
+    expect(outcome.stdout).toContain('[3] 恢复已失去 lease 的旧 running');
+    expect(outcome.stdout).toContain('在线 Worker 禁止 reset');
     expect(outcome.stdout).toContain('[4] 查看 diff');
     expect(mock.requests.some((request) => request.method === 'POST')).toBe(false);
   });

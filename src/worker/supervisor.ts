@@ -147,6 +147,8 @@ export interface SupervisedProjectOptions {
 /** Supervisor 内部流转的最小事项（与 PM intake 的 IntakeItem 对齐） */
 export interface SupervisorItem {
   kind: string;
+  /** 事项所属的 PM intake consumer；仅用于本机槽位路由，不含任何业务正文。 */
+  consumer?: string;
   plan_id?: string;
   task_id?: string;
   question_id?: string;
@@ -157,7 +159,10 @@ export interface SupervisorItem {
 
 /** 项目稳定去重键（同一事项只提醒一次） */
 function itemDedupeKey(it: SupervisorItem): string {
-  return `${it.kind}:${it.event_id ?? it.task_id ?? it.agent_id ?? ''}`;
+  // event_id 是投递尝试，不是逻辑事项身份；服务重发同一任务的新 event_id 时不能
+  // 绕过本机冷却并再次唤醒模型。Question/Agent 状态分别使用自己的稳定身份。
+  const subject = it.question_id ?? it.task_id ?? it.agent_id ?? it.plan_id ?? '';
+  return `${it.consumer ?? ''}:${it.kind}:${subject}`;
 }
 
 /** 单个受管项目：封装去重、闭环判定、claim/等待策略 */
@@ -168,6 +173,8 @@ export class SupervisedProject {
   private readonly reminded = new Set<string>();
   /** 已被 PM ack 的事项（静音，不再重复提醒，直到状态真正变化由 pendingItems 不再返回） */
   private readonly acked = new Set<string>();
+  /** event ack 仍按平台 event_id 输入；映射回稳定逻辑键后静音。 */
+  private readonly eventKeys = new Map<string, string>();
   /** 是否已暂停（项目闭环后暂停提醒/等待） */
   paused = false;
 
@@ -198,6 +205,7 @@ export class SupervisedProject {
     const fresh: SupervisorItem[] = [];
     for (const it of all) {
       const key = itemDedupeKey(it);
+      if (it.event_id) this.eventKeys.set(it.event_id, key);
       // 已 ack：静音（不再响铃）；去重集合里已存在：本轮不重复
       if (this.acked.has(key)) continue;
       if (this.reminded.has(key)) continue;
@@ -220,11 +228,8 @@ export class SupervisedProject {
   /** PM ack 后把对应事项加入静音集合（不再重复提醒）。
    *  真正的状态变化由 pendingItems 不再返回该事项来体现；Supervisor 不复制平台详情。 */
   markAcked(eventId: string): void {
-    for (const key of [...this.reminded]) {
-      if (key.endsWith(`:${eventId}`)) {
-        this.acked.add(key);
-      }
-    }
+    const key = this.eventKeys.get(eventId);
+    if (key) this.acked.add(key);
   }
 }
 
@@ -653,6 +658,11 @@ export interface SharedWorkerCoordinatorOptions {
   slots: SupervisorWorkerSlot[];
   /** 指定后，所有 slot 的服务端 claim 都只会领取这些 plan。 */
   planIds?: string[];
+  /**
+   * 同时执行的真实任务数上限；未传时不限制（每个 slot 本身一次只持有一个任务）。
+   * 用于 slot 数多于机器并发能力时限制同时启动的执行器数量。
+   */
+  maxConcurrentTasks?: number;
   signal?: AbortSignal;
   /** 唯一 Supervisor 等待循环的 doorbell；不把任何 event 正文传给 Worker。 */
   onWake?: () => void;
@@ -674,6 +684,11 @@ export class SharedWorkerCoordinator {
   private readonly signal?: AbortSignal;
   private readonly onWake?: () => void;
   private readonly onError?: (message: string) => void;
+  /** 复活 plans_terminal 软停机时为 slot 重建全新 Agent 生命周期所需。 */
+  private readonly biaoUrl: string;
+  private readonly apiToken?: string;
+  /** 同时执行的真实任务数上限；undefined = 不限制。 */
+  private readonly maxConcurrentTasks?: number;
   private started = false;
   private scheduling = false;
   /** 当前 claim 调度轮次的完成信号；offlineAll 必须等待它发现并启动的任务。 */
@@ -690,6 +705,11 @@ export class SharedWorkerCoordinator {
     this.signal = opts.signal;
     this.onWake = opts.onWake;
     this.onError = opts.onError;
+    this.biaoUrl = opts.biaoUrl;
+    this.apiToken = opts.apiToken;
+    this.maxConcurrentTasks = opts.maxConcurrentTasks && opts.maxConcurrentTasks > 0
+      ? opts.maxConcurrentTasks
+      : undefined;
     const planIds = [...new Set((opts.planIds ?? []).map((planId) => planId.trim()).filter(Boolean))];
     this.preferredPlanIds = planIds.length > 0 ? planIds : undefined;
     this.slots = opts.slots.map((slot) => ({
@@ -752,6 +772,29 @@ export class SharedWorkerCoordinator {
     this.offline = true;
   }
 
+  /**
+   * plans_terminal 是“队列暂时清空”的软停机，不是进程终止：留守（stay-resident）
+   * 或重入的 Supervisor 在后续轮次发现新的活跃项目时，slot 以全新 Agent 生命周期
+   * （新 registration epoch）重新注册并继续调度。旧 epoch 已显式 offline，服务端
+   * 按设计不复活它，因此这里必须换新 client。supervisor_signal/exit 是硬停机，
+   * 永不复活；offlining 进行中也不允许复活。
+   */
+  reviveAfterPlansTerminal(): void {
+    if (this.offlining || !this.offline) return;
+    if (this.shutdownReason !== 'plans_terminal') return;
+    if (this.signal?.aborted) return;
+    // 复活必须原子：任何一个 slot 仍有在途任务都不动，等下一轮再试。
+    if (this.slots.some((slot) => slot.running || slot.settled)) return;
+    this.shutdownReason = undefined;
+    this.offline = false;
+    for (const slot of this.slots) {
+      slot.client = new BiaoClient(this.biaoUrl, slot.agentId, this.apiToken);
+    }
+    // 软停机期间 wake() 被抑制，新工作的调度请求可能已丢失；复活即补发一次，
+    // 让当轮 refreshIdlePresence/scheduleIfRequested 直接领取新任务。
+    this.scheduleRequested = true;
+  }
+
   /** 仅设置一个共享重试信号；所有 slot 都不会自行轮询。 */
   wake(): void {
     if (this.shutdownReason || this.offlining || this.offline) return;
@@ -812,9 +855,14 @@ export class SharedWorkerCoordinator {
         // 已发出的 claim 必须处理其返回值，避免把服务端已领取的任务静默丢弃；
         // 但关停开始后不再向后续 slot 发起新 claim。
         if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline) break;
+        // 并发闸：同时执行的任务达到上限时本轮不再发起新 claim；在跑任务 settle
+        // 后会再次 wake，下一轮自然补位，不会饿死后续 slot。
+        if (this.maxConcurrentTasks !== undefined && this.activeCount() >= this.maxConcurrentTasks) break;
         if (slot.running) continue;
         const preferredTypes = normalizePreferredTypes(slot.preferredTypes ?? supportedTaskTypes(slot.capabilities));
-        const key = `${slot.preferredProject ?? '*'}\u0000${preferredTypes.join(',')}\u0000${this.preferredPlanIds?.join(',') ?? '*'}`;
+        // assignee 可按 agent_id 或 agent_type 定向。即使 project/type/plan 完全相同，
+        // Codex 的空 claim 也不能证明 Kimi/custom 槽位没有自己的定向任务。
+        const key = `${slot.agentId}\u0000${slot.agentType}\u0000${slot.preferredProject ?? '*'}\u0000${preferredTypes.join(',')}\u0000${this.preferredPlanIds?.join(',') ?? '*'}`;
         // 一个完全相同的 claim 范围在同一轮已经明确空队列时，不再重复请求。
         if (unavailableClaimScopes.has(key)) continue;
         let claimed: { ok: boolean; data: ClaimedTask | null };
@@ -909,9 +957,18 @@ export class SharedWorkerCoordinator {
 export interface BiaoSupervisorRuntimeOptions {
   biaoUrl: string;
   consumer?: string;
+  /**
+   * 一个 Supervisor 共享轮次需要读取的 PM 队列。未传时保持单 consumer 兼容；
+   * 传入后每个 consumer 各读一次 /intake，但 /plans、/events、/reconcile 仍只读一次。
+   */
+  pmConsumers?: string[];
   /** 只管理指定 plan；未传则从 /plans 全量发现。 */
   planIds?: string[];
   apiToken?: string;
+  /** Worker data-plane bearer; never reused by the PM/Supervisor transport. */
+  workerApiToken?: string;
+  /** 同时执行的真实任务数上限；未传时不限制。来自 --max-concurrent-tasks / BIAO_MAX_CONCURRENT_TASKS。 */
+  maxConcurrentTasks?: number;
   workers?: SupervisorWorkerSlot[];
   pollIntervalMs?: number;
   signal?: AbortSignal;
@@ -931,6 +988,7 @@ export interface BiaoSupervisorRuntimeOptions {
 export class BiaoSupervisorRuntime {
   private readonly opts: Required<Pick<BiaoSupervisorRuntimeOptions, 'consumer'>> & BiaoSupervisorRuntimeOptions;
   private readonly transport: BiaoSupervisorTransport;
+  private readonly pmConsumers: string[];
   private readonly plans = new Map<string, { snapshot: BiaoPlanSnapshot; project: SupervisedProject }>();
   private readonly intakeItems = new Map<string, SupervisorItem[]>();
   private readonly seenEvents = new Set<string>();
@@ -946,6 +1004,10 @@ export class BiaoSupervisorRuntime {
 
   constructor(opts: BiaoSupervisorRuntimeOptions) {
     this.opts = { ...opts, consumer: opts.consumer ?? 'pm' };
+    const configuredConsumers = (opts.pmConsumers ?? []).map((value) => value.trim()).filter(Boolean);
+    this.pmConsumers = configuredConsumers.length > 0
+      ? [...new Set(configuredConsumers)]
+      : [this.opts.consumer];
     this.transport = new BiaoSupervisorTransport({
       biaoUrl: opts.biaoUrl,
       apiToken: opts.apiToken,
@@ -967,6 +1029,9 @@ export class BiaoSupervisorRuntime {
           await this.workers?.offlineAll('plans_terminal');
           return;
         }
+        // 上一轮曾因全部闭环软停机（留守或重入场景）：发现新活跃项目时先复活
+        // slot 生命周期，再恢复 presence 与调度，避免协调器永久下线。
+        this.workers?.reviveAfterPlansTerminal();
         await this.workers?.refreshIdlePresence();
         await this.workers?.scheduleIfRequested();
       },
@@ -990,9 +1055,12 @@ export class BiaoSupervisorRuntime {
     if (opts.workers && opts.workers.length > 0) {
       this.workers = new SharedWorkerCoordinator({
         biaoUrl: opts.biaoUrl,
-        apiToken: opts.apiToken,
+        // Programmatic callers predating scoped credentials keep working; the
+        // production launcher always supplies workerApiToken explicitly.
+        apiToken: opts.workerApiToken ?? opts.apiToken,
         slots: opts.workers,
         planIds: opts.planIds,
+        maxConcurrentTasks: opts.maxConcurrentTasks,
         signal: opts.signal,
         onWake: () => this.supervisor.wake(),
         onError: opts.onError,
@@ -1029,9 +1097,12 @@ export class BiaoSupervisorRuntime {
   }
 
   private async refresh(): Promise<void> {
-    const [plans, intake, eventPage, reconciliation] = await Promise.all([
+    const [plans, intakes, eventPage, reconciliation] = await Promise.all([
       this.transport.plans(),
-      this.transport.intake(this.opts.consumer, this.opts.planIds),
+      Promise.all(this.pmConsumers.map(async (consumer) => ({
+        consumer,
+        intake: await this.transport.intake(consumer, this.opts.planIds),
+      }))),
       this.transport.events(this.eventCursor, this.eventsSince),
       this.transport.reconcile(),
     ]);
@@ -1041,7 +1112,9 @@ export class BiaoSupervisorRuntime {
     if (eventPage.nextCursor) this.eventCursor = eventPage.nextCursor;
     const plansAddedRunnableWork = this.syncPlans(plans);
     this.intakeItems.clear();
-    for (const item of intake.items) this.pushIntakeItem(item);
+    for (const { consumer, intake } of intakes) {
+      for (const item of intake.items) this.pushIntakeItem({ ...item, consumer });
+    }
 
     let shouldWakeWorkers = false;
     for (const event of events) {

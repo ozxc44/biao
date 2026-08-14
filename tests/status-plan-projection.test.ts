@@ -8,6 +8,7 @@ import {
   cancelTask,
   createQuestion,
   dbRestore,
+  getPlan,
   getPlans,
   getStatus,
   planSubmit,
@@ -122,6 +123,7 @@ async function seedTasks(
     fix_for?: string;
     resolution_task_id?: string;
     resolution_task_ids?: string;
+    resolved_by_task?: string;
     resolution_attempts?: string;
     max_retries?: string;
     pm_accept_effects_applied?: string;
@@ -159,6 +161,7 @@ async function seedTasks(
       resolution_action: '',
       resolution_task_id: task.resolution_task_id ?? '',
       resolution_task_ids: task.resolution_task_ids ?? '',
+      resolved_by_task: task.resolved_by_task ?? '',
       repair_root_task_id: task.repair_root_task_id ?? '',
       fix_for: task.fix_for ?? '',
       resolution_attempts: task.resolution_attempts ?? '0',
@@ -349,7 +352,9 @@ describe('plan/status materialized projection', () => {
       reviews: { accepted: 9_999 },
     });
     expect(plansRound.taskHashReads).toBe(0);
-    expect(statusRound.taskHashReads).toBe(0);
+    // /status 允许读取当前 running task 来核对 lease 与 Agent current_task，
+    // 以发现同名 Worker 重注册后被在线状态掩盖的孤儿；仍不得读取万级终态历史。
+    expect(statusRound.taskHashReads).toBeLessThanOrEqual(1);
     expect(statusRound.terminalHistoryReads).toBe(0);
     expect(plansRound.commands).toBeLessThan(30);
     expect(statusRound.commands).toBeLessThan(50);
@@ -393,6 +398,172 @@ describe('plan/status materialized projection', () => {
     expect(status.history).toMatchObject({ resolved_failed: 0, resolved_rejected: 1 });
   });
 
+  it('keeps rejected repair-chain ancestors as audit without counting resolved children as current attention', async () => {
+    await seedPlan(PLAN_ID, 4);
+    await seedTasks([
+      {
+        task_id: 'resolved-root', status: 'done', pm_review_status: 'rejected',
+        resolution_status: 'resolved', resolution_task_id: 'resolved-repair-2',
+        resolution_task_ids: 'resolved-repair-1,resolved-repair-2',
+        resolved_by_task: 'resolved-repair-2',
+      },
+      {
+        task_id: 'resolved-repair-1', status: 'done', pm_review_status: 'rejected',
+        repair_root_task_id: 'resolved-root', fix_for: 'resolved-root',
+      },
+      {
+        task_id: 'resolved-repair-2', status: 'done', pm_review_status: 'accepted',
+        repair_root_task_id: 'resolved-root', fix_for: 'resolved-repair-1',
+      },
+      {
+        task_id: 'current-rejected', status: 'done', pm_review_status: 'rejected',
+      },
+    ]);
+
+    const status = (await getStatus(redis)).data as {
+      reviews: { pending: number; accepted: number; rejected: number };
+      attention: { failed: number; rejected: number; needs_pm_decision: number };
+      history: { resolved_failed: number; resolved_rejected: number };
+    };
+    expect(status.reviews).toEqual({ pending: 0, accepted: 1, rejected: 3 });
+    expect((status as typeof status & { root_reviews: typeof status.reviews }).root_reviews)
+      .toEqual({ pending: 0, accepted: 1, rejected: 1 });
+    expect(status.attention).toMatchObject({ rejected: 1, needs_pm_decision: 0 });
+    expect(status.history).toMatchObject({ resolved_rejected: 2 });
+  });
+
+  it('publishes root review counts separately from immutable attempt audit counts', async () => {
+    await seedPlan(PLAN_ID, 3);
+    await seedTasks([
+      { task_id: 'clean-accepted-root', status: 'done', pm_review_status: 'accepted' },
+      {
+        task_id: 'repaired-root', status: 'done', pm_review_status: 'rejected',
+        resolution_status: 'resolved', resolution_task_id: 'repaired-root-repair-2',
+        resolution_task_ids: 'repaired-root-repair-1,repaired-root-repair-2',
+        resolved_by_task: 'repaired-root-repair-2',
+      },
+      {
+        task_id: 'repaired-root-repair-1', status: 'done', pm_review_status: 'rejected',
+        fix_for: 'repaired-root', repair_root_task_id: 'repaired-root',
+      },
+      {
+        task_id: 'repaired-root-repair-2', status: 'done', pm_review_status: 'accepted',
+        fix_for: 'repaired-root-repair-1', repair_root_task_id: 'repaired-root',
+      },
+      {
+        task_id: 'reviewing-root', status: 'done', pm_review_status: 'rejected',
+        resolution_status: 'required', resolution_task_id: 'reviewing-root-repair-1',
+        resolution_task_ids: 'reviewing-root-repair-1',
+      },
+      {
+        task_id: 'reviewing-root-repair-1', status: 'done',
+        fix_for: 'reviewing-root', repair_root_task_id: 'reviewing-root',
+      },
+    ]);
+
+    const plan = (await getPlans(redis)).data!.plans[0];
+    expect(plan.reviews).toEqual({ pending: 1, accepted: 2, rejected: 3 });
+    expect(plan.root_reviews).toEqual({ pending: 1, accepted: 2, rejected: 0 });
+
+    const status = (await getStatus(redis)).data as {
+      reviews: { pending: number; accepted: number; rejected: number };
+      root_reviews: { pending: number; accepted: number; rejected: number };
+    };
+    expect(status.reviews).toEqual({ pending: 1, accepted: 2, rejected: 3 });
+    expect(status.root_reviews).toEqual({ pending: 1, accepted: 2, rejected: 0 });
+  });
+
+  it('publishes a complete mutually exclusive root lifecycle whose total matches the declared plan', async () => {
+    await seedPlan(PLAN_ID, 4);
+    await seedTasks([
+      { task_id: 'root-accepted', status: 'done', pm_review_status: 'accepted' },
+      {
+        task_id: 'root-repairing', status: 'done', pm_review_status: 'rejected',
+        resolution_status: 'repairing', resolution_task_id: 'root-repairing-repair-1',
+        resolution_task_ids: 'root-repairing-repair-1',
+      },
+      {
+        task_id: 'root-repairing-repair-1', status: 'pending', fix_for: 'root-repairing',
+        repair_root_task_id: 'root-repairing',
+      },
+      {
+        task_id: 'root-decision', status: 'failed', resolution_status: 'needs_pm_decision',
+      },
+      {
+        task_id: 'root-cancelled', status: 'done', pm_review_status: 'rejected',
+        resolution_status: 'cancelled',
+      },
+    ]);
+
+    const plan = (await getPlans(redis)).data!.plans[0] as unknown as {
+      root_tasks: Record<string, number | boolean>;
+    };
+    expect(plan.root_tasks).toMatchObject({
+      total: 4,
+      declared_total: 4,
+      accepted: 1,
+      pending: 1,
+      needs_pm_decision: 1,
+      cancelled: 1,
+      consistent: true,
+    });
+    const classified = ['pending', 'running', 'blocked', 'review_pending', 'accepted', 'failed', 'needs_pm_decision', 'cancelled']
+      .reduce((sum, field) => sum + Number(plan.root_tasks[field]), 0);
+    expect(classified).toBe(4);
+
+    const status = (await getStatus(redis)).data as unknown as {
+      root_tasks: Record<string, number>;
+    };
+    expect(status.root_tasks).toMatchObject({
+      total: 4,
+      accepted: 1,
+      pending: 1,
+      needs_pm_decision: 1,
+      cancelled: 1,
+    });
+  });
+
+  it('projects the current active child ahead of a stale needs-decision root marker', async () => {
+    await seedPlan(PLAN_ID, 1);
+    await seedTasks([
+      {
+        task_id: 'stale-decision-root', status: 'failed', resolution_status: 'needs_pm_decision',
+        resolution_task_id: 'stale-decision-root-reverify-3',
+        resolution_task_ids: 'stale-decision-root-reverify-1,stale-decision-root-reverify-2,stale-decision-root-reverify-3',
+      },
+      {
+        task_id: 'stale-decision-root-reverify-3', status: 'running',
+        fix_for: 'stale-decision-root', repair_root_task_id: 'stale-decision-root',
+      },
+    ]);
+
+    const plan = (await getPlans(redis)).data!.plans[0];
+    expect(plan.status).toBe('active');
+    expect(plan.root_tasks).toMatchObject({ running: 1, needs_pm_decision: 0 });
+  });
+
+  it('uses the plan task registry for both plan summary and detail even when a pending status index is missing', async () => {
+    await seedPlan(PLAN_ID, 1);
+    await seedTasks([{ task_id: 'registry-root', status: 'failed' }]);
+    await redis.hset(keys.hash.task('registry-ghost-repair'), {
+      task_id: 'registry-ghost-repair', plan_id: PLAN_ID, project_path: PROJECT_PATH,
+      title: 'registry ghost', type: 'code', phase: 'impl', assignee: 'auto', priority: '5',
+      status: 'pending', fix_for: 'registry-root', repair_root_task_id: 'registry-root',
+      ownership_files: '', depends_on: '', created_at: String(Date.now()),
+    });
+    await redis.sadd(keys.planStatusProjection.taskIdsByPlan(PLAN_ID), 'registry-ghost-repair');
+    await redis.sadd(keys.planStatusProjection.dirtyPlans, PLAN_ID);
+
+    const summary = (await getPlans(redis)).data!.plans[0] as unknown as { runtime_task_count: number };
+    const detail = (await getPlan(redis, PLAN_ID)).data as {
+      runtime_task_count: number;
+      tasks: { pending: Array<{ task_id: string }> };
+    };
+    expect(summary.runtime_task_count).toBe(2);
+    expect(detail.runtime_task_count).toBe(2);
+    expect(detail.tasks.pending.map((task) => task.task_id)).toContain('registry-ghost-repair');
+  });
+
   it('publishes a ready, correct projection as part of SQLite restore', async () => {
     const store = new SqliteStore(':memory:');
     const plan: PlanRow = {
@@ -426,10 +597,46 @@ describe('plan/status materialized projection', () => {
       });
       expect(first.taskHashReads).toBe(0);
       expect(second.taskHashReads).toBe(0);
-      expect(await redis.get(keys.planStatusProjection.ready)).toBe('1');
+      expect(await redis.get(keys.planStatusProjection.ready)).toBe('5');
     } finally {
       store.close();
     }
+  });
+
+  it('rebuilds registries when the ready marker belongs to an older projection version', async () => {
+    await seedPlan(PLAN_ID, 2);
+    await seedTasks([
+      { task_id: 'upgrade-root', status: 'done', pm_review_status: 'accepted' },
+      {
+        task_id: 'upgrade-root-repair-1',
+        status: 'done',
+        pm_review_status: 'accepted',
+        fix_for: 'upgrade-root',
+        repair_root_task_id: 'upgrade-root',
+      },
+    ]);
+    await redis.set(keys.planStatusProjection.ready, '4');
+    await redis.set(keys.planStatusProjection.agentIdsReady, '4');
+    await redis.sadd(keys.planStatusProjection.planIds, 'stale-plan');
+    await redis.sadd(keys.planStatusProjection.taskIdsByPlan(PLAN_ID), 'missing-hash-task');
+    await redis.hset(keys.planStatusProjection.aggregateByPlan(PLAN_ID), {
+      version: '4', status: 'active', runtime_task_count: '1',
+    });
+
+    const detail = await getPlan(redis, PLAN_ID);
+
+    expect(detail.data).toMatchObject({
+      task_count: 2,
+      runtime_task_count: 2,
+      root_tasks: { total: 1, accepted: 1, consistent: false },
+    });
+    expect(await redis.get(keys.planStatusProjection.ready)).toBe('5');
+    expect(await redis.get(keys.planStatusProjection.agentIdsReady)).toBe('5');
+    expect(await redis.smembers(keys.planStatusProjection.planIds)).toEqual([PLAN_ID]);
+    expect((await redis.smembers(keys.planStatusProjection.taskIdsByPlan(PLAN_ID))).sort()).toEqual([
+      'upgrade-root',
+      'upgrade-root-repair-1',
+    ]);
   });
 
   it('moves a terminal plan back to current work through the transition-maintained dirty index', async () => {
@@ -453,7 +660,7 @@ describe('plan/status materialized projection', () => {
 
   it.each([
     ['reset', async () => taskReset(redis, 'atomic-task', { force: true, reset_by: 'pm-test' }), 'pending', 'eval'],
-    ['cancel', async () => cancelTask(redis, 'atomic-task'), 'cancelled', 'multi'],
+    ['cancel', async () => cancelTask(redis, 'atomic-task', { reason: '原子投影测试' }), 'cancelled', 'multi'],
   ])('commits %s truth and projection dirty in the same Redis transaction', async (_name, operation, expectedStatus, commitKind) => {
     await seedPlan(PLAN_ID, 1);
     await seedTasks([{ task_id: 'atomic-task', status: expectedStatus === 'pending' ? 'done' : 'pending', pm_review_status: expectedStatus === 'pending' ? 'accepted' : '' }]);
@@ -961,7 +1168,7 @@ phase: impl
     expect(ownerBefore).toBeTruthy();
     expect(ownerAfter).toBe(ownerBefore);
     expect(renewedTtl).toBeGreaterThan(20_000);
-    expect(await verifier.get(keys.planStatusProjection.ready)).toBe('1');
+    expect(await verifier.get(keys.planStatusProjection.ready)).toBe('5');
   });
 
   it('an expired failed-index owner cannot delete the newer owner ready marker', async () => {
@@ -1018,7 +1225,9 @@ phase: impl
   it('does not publish ready when the legacy backfill has a Redis command error', async () => {
     await seedPlan(PLAN_ID, 1);
     await seedTasks([{ task_id: 'legacy-task', status: 'done', pm_review_status: 'accepted' }]);
-    await redis.set(keys.planStatusProjection.aggregateByPlan(PLAN_ID), 'wrong-type');
+    // 旧投影自身即使 WRONGTYPE 也应由版本升级删除并重建；这里破坏权威 task hash，
+    // 验证真实扫描错误仍会 fail closed，绝不发布 ready。
+    await redis.set(keys.hash.task('legacy-task'), 'wrong-type');
 
     await expect(getPlans(redis)).rejects.toThrow('backfill failed');
     expect(await redis.get(keys.planStatusProjection.ready)).toBeNull();
@@ -1084,6 +1293,38 @@ phase: impl
       expect.objectContaining({ task_id: 'decision-root' }),
     ]);
     expect(await redis.zrange(keys.intakeActionableFailed.pending, 0, -1)).toEqual(['decision-root']);
+  });
+
+  it('keeps needs-decision resolution silent while a referenced child is still active', async () => {
+    await seedPlan(PLAN_ID, 2);
+    await seedTasks([
+      {
+        task_id: 'active-decision-root',
+        status: 'failed',
+        resolution_status: 'needs_pm_decision',
+        resolution_task_id: 'active-decision-child',
+        resolution_task_ids: 'active-decision-child',
+      },
+      {
+        task_id: 'active-decision-child',
+        status: 'pending',
+        repair_root_task_id: 'active-decision-root',
+      },
+    ]);
+    await redis.zadd(keys.intakeActionableFailed.pending, Date.now(), 'active-decision-root');
+    await redis.set(keys.intakeActionableFailed.ready, '1');
+    await redis.set(keys.planStatusProjection.agentIdsReady, '1');
+
+    const whileActive = await pmIntake(redis, { consumer: 'pm' });
+    expect(whileActive.data?.items).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'resolution_required', task_id: 'active-decision-root' }),
+    ]));
+
+    await redis.hset(keys.hash.task('active-decision-child'), 'status', 'failed');
+    const afterFailure = await pmIntake(redis, { consumer: 'pm' });
+    expect(afterFailure.data?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'resolution_required', task_id: 'active-decision-root' }),
+    ]));
   });
 
   it('does not delete a newly actionable failed candidate while cleaning a stale snapshot', async () => {

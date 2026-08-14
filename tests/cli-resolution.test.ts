@@ -64,6 +64,7 @@ async function resolutionServer(options: { fail?: boolean } = {}) {
         attempts: action === 'continue' ? 2 : 1,
         max_retries: 1,
         available_actions: action === 'cancel' ? ['inspect'] : ['inspect', 'continue', 'cancel'],
+        repair_source_candidates: ['annotation-03-realtime-refresh', 'annotation-19-data-collection-integration'],
         ...(action === 'continue' ? { created_task_ids: ['source-task-repair-2'] } : {}),
       },
     }));
@@ -86,6 +87,7 @@ describe('retry 耗尽后的 PM resolution CLI', () => {
     expect(outcome.stdout).toContain('repair_retry_limit_reached');
     expect(outcome.stdout).toContain('source-task-repair-1');
     expect(outcome.stdout).toContain('inspect, continue, cancel');
+    expect(outcome.stdout).toContain('合法返修来源：annotation-03-realtime-refresh, annotation-19-data-collection-integration');
   });
 
   it('inspect 支持 JSON，供一次性 PM Agent 无损读取', async () => {
@@ -117,6 +119,25 @@ describe('retry 耗尽后的 PM resolution CLI', () => {
     expect(outcome.stdout).toContain('repairing');
   });
 
+  it('多来源验收 continue 会将 PM 点名的返修来源透传给平台', async () => {
+    const mock = await resolutionServer();
+
+    const outcome = await runCli([
+      'task', 'resolution', 'source-task', '--action', 'continue',
+      '--repair-source-task', 'annotation-03-realtime-refresh',
+    ], mock.url);
+
+    expect(outcome.code).toBe(0);
+    expect(mock.requests[0]).toMatchObject({
+      method: 'POST',
+      body: {
+        action: 'continue',
+        decided_by: 'pm-resolution',
+        repair_source_task_id: 'annotation-03-realtime-refresh',
+      },
+    });
+  });
+
   it('cancel 可显式记录决策者，并支持 JSON 返回终态', async () => {
     const mock = await resolutionServer();
 
@@ -137,6 +158,7 @@ describe('retry 耗尽后的 PM resolution CLI', () => {
     ['非法 action', ['task', 'resolution', 'source-task', '--action', 'retry'], 'inspect、continue 或 cancel'],
     ['空决策者', ['task', 'resolution', 'source-task', '--action', 'continue', '--decided-by', ''], '--decided-by'],
     ['inspect 不接受决策者', ['task', 'resolution', 'source-task', '--decided-by', 'pm-owner'], 'inspect'],
+    ['inspect 不接受返修来源', ['task', 'resolution', 'source-task', '--repair-source-task', 'source-a'], '只能与 --action continue'],
     ['服务端不支持 reason', ['task', 'resolution', 'source-task', '--action', 'continue', '--reason', '不应伪造'], '未知参数：--reason'],
     ['未知参数', ['task', 'resolution', 'source-task', '--force'], '未知参数：--force'],
     ['重复 action', ['task', 'resolution', 'source-task', '--action', 'continue', '--action', 'cancel'], '重复参数：--action'],
@@ -170,6 +192,7 @@ describe('retry 耗尽后的 PM resolution CLI', () => {
     expect(outcome.code).toBe(0);
     expect(outcome.stdout).toContain('inspect|continue|cancel');
     expect(outcome.stdout).toContain('--decided-by');
+    expect(outcome.stdout).toContain('--repair-source-task');
     expect(mock.requests).toHaveLength(0);
   });
 

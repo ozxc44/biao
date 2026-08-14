@@ -5,9 +5,11 @@ import { PlanDetailView } from './components/PlanDetailView';
 import { ProjectListView } from './components/ProjectListView';
 import { LanguageSwitcher } from './i18n/LanguageSwitcher';
 import { useI18n } from './i18n/I18nContext';
+import { planSelectionUrl, selectedPlanFromSearch } from './navigation';
 
 export default function App() {
-  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(() =>
+    typeof window === 'undefined' ? null : selectedPlanFromSearch(window.location.search));
   const [authRevision, setAuthRevision] = useState(0);
   const [humanSession, setHumanSession] = useState<{ loading: boolean; authenticated: boolean; available: boolean; error: string | null }>({
     loading: true, authenticated: false, available: false, error: null,
@@ -36,6 +38,18 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    const restoreFromUrl = () => setSelectedPlanId(selectedPlanFromSearch(window.location.search));
+    window.addEventListener('popstate', restoreFromUrl);
+    return () => window.removeEventListener('popstate', restoreFromUrl);
+  }, []);
+
+  const selectPlan = (planId: string | null, replace = false) => {
+    const nextUrl = planSelectionUrl(window.location.href, planId);
+    window.history[replace ? 'replaceState' : 'pushState']({}, '', nextUrl);
+    setSelectedPlanId(planId);
+  };
+
   const enterLocalOwnerSession = async () => {
     const session = await beginLocalOwnerSession();
     setHumanSession({ loading: false, authenticated: session.authenticated, available: session.local_session_available, error: null });
@@ -43,7 +57,7 @@ export default function App() {
   };
 
   const signOut = () => {
-    setSelectedPlanId(null);
+    selectPlan(null, true);
     setHumanSession((current) => ({ ...current, authenticated: false }));
     setAuthRevision((value) => value + 1);
   };
@@ -60,7 +74,7 @@ export default function App() {
         </div>
         <div className="header-actions">
           {selectedPlanId && (
-            <button type="button" className="btn secondary" onClick={() => setSelectedPlanId(null)}>
+            <button type="button" className="btn secondary" onClick={() => selectPlan(null)}>
               {t('common.backToProjects')}
             </button>
           )}
@@ -80,7 +94,7 @@ export default function App() {
       ) : selectedPlanId ? (
         <PlanDetailView planId={selectedPlanId} authRevision={authRevision} />
       ) : (
-        <ProjectListView onSelectPlan={setSelectedPlanId} authRevision={authRevision} />
+        <ProjectListView onSelectPlan={(planId) => selectPlan(planId)} authRevision={authRevision} />
       )}
     </div>
   );

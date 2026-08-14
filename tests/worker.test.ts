@@ -326,6 +326,25 @@ describe('BiaoClient', () => {
     });
   });
 
+  it('Question 扩权申请通过 Worker 数据面发送结构化 requested_ownership', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { question_id: 'q-scope' } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new BiaoClient('http://biao.test', 'worker-1', 'worker-token');
+    await client.createQuestion(
+      'task-1', 'claim-1', '需要增加测试文件', '实现已完成',
+      { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    );
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      requested_ownership: { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    });
+  });
+
   it('共享 Supervisor 的冲突搁置通过受控接口释放当前 claim', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { blocked: true } }), {
       status: 200,
@@ -352,6 +371,15 @@ describe('Worker Question marker', () => {
       body: '选 A 还是 B？', checkpoint: '已完成 parse',
     });
     expect(() => extractQuestionMarker('BIAO_QUESTION: ask PM')).toThrow('必须是单行 JSON');
+  });
+
+  it('解析结构化 requested_ownership，供 PM 显式批准后 fresh claim', () => {
+    expect(extractQuestionMarker(
+      'BIAO_QUESTION: {"body":"需要扩权","requested_ownership":{"files":["tests/new.test.ts"],"modules":["api-tests"]}}',
+    )).toEqual({
+      body: '需要扩权',
+      requestedOwnership: { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    });
   });
 
   it('只从最后一条 Codex final agent_message 中识别嵌入的合法 Question 标记', () => {

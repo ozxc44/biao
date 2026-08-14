@@ -10,6 +10,8 @@
 import {
   readdirSync,
   statSync,
+  lstatSync,
+  readlinkSync,
   readFileSync,
   existsSync,
 } from 'node:fs';
@@ -19,6 +21,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type {
   ClaimRequest,
   ClaimedTask,
+  OwnershipScope,
   VerifyCommand,
   VerifyResult,
 } from '../types/index.js';
@@ -256,6 +259,7 @@ export class BiaoClient {
     claimToken: string,
     body: string,
     checkpoint?: string,
+    requestedOwnership?: Partial<OwnershipScope>,
   ): Promise<any> {
     return this.api('/question', {
       method: 'POST',
@@ -265,6 +269,7 @@ export class BiaoClient {
         claim_token: claimToken,
         body,
         checkpoint,
+        requested_ownership: requestedOwnership,
       }),
     });
   }
@@ -315,6 +320,7 @@ function logReportLifecycle(
 export interface WorkerQuestion {
   body: string;
   checkpoint?: string;
+  requestedOwnership?: Partial<OwnershipScope>;
 }
 
 /**
@@ -378,7 +384,28 @@ export function extractQuestionMarker(stdout: string): WorkerQuestion | undefine
   const body = typeof candidate.body === 'string' ? candidate.body.trim() : '';
   if (!body) throw new Error('BIAO_QUESTION.body 不能为空');
   const checkpoint = typeof candidate.checkpoint === 'string' ? candidate.checkpoint.trim() : undefined;
-  return { body, checkpoint: checkpoint || undefined };
+  let requestedOwnership: Partial<OwnershipScope> | undefined;
+  if (candidate.requested_ownership !== undefined) {
+    const value = candidate.requested_ownership;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('BIAO_QUESTION.requested_ownership 必须是 JSON 对象');
+    }
+    const scope = value as Record<string, unknown>;
+    const parseEntries = (kind: 'files' | 'modules'): string[] | undefined => {
+      const entries = scope[kind];
+      if (entries === undefined) return undefined;
+      if (!Array.isArray(entries) || !entries.every((entry) => typeof entry === 'string')) {
+        throw new Error(`BIAO_QUESTION.requested_ownership.${kind} 必须是字符串数组`);
+      }
+      return entries;
+    };
+    requestedOwnership = { files: parseEntries('files'), modules: parseEntries('modules') };
+  }
+  return {
+    body,
+    ...(checkpoint ? { checkpoint } : {}),
+    ...(requestedOwnership ? { requestedOwnership } : {}),
+  };
 }
 
 /**
@@ -431,7 +458,21 @@ export async function resolveOwnershipConflict(
   if (ownRes.data.action === 'preempt') {
     // 我的 priority 更高，抢占
     console.log(`[worker:${agentId}]   🔥 抢占 ${glob}：我的 pri=${myPri} > 占用者 pri=${ownerPri} (${owner?.agent_id})`);
-    await client.declareOwnership(task.task_id, task.claim_token, [glob], true);
+    const declared = await client.declareOwnership(task.task_id, task.claim_token, [glob], true);
+    if (!declared?.ok) {
+      // check 与 force declare 之间 owner 可能已经变化。声明失败绝不能被投影为
+      // proceed，否则 Worker 会在没有 ownership 的情况下执行。安全释放旧 claim，
+      // 等平台 ownership doorbell 后再 fresh claim。
+      const blocked = await client.blockTask(task.task_id, task.claim_token, 'waiting_file_release');
+      if (!blocked?.ok) {
+        throw new Error(
+          `ownership 抢占失败且搁置失败：${declared?.error?.code ?? 'UNKNOWN'} / ` +
+          `${blocked?.error?.code ?? 'UNKNOWN'}`,
+        );
+      }
+      console.log(`[worker:${agentId}]   ⏸ ${glob} 抢占失败，已释放当前 claim，等待 ownership 恢复事件。`);
+      return false;
+    }
     return true;
   }
 
@@ -1068,6 +1109,143 @@ function attributablePlanMdViolations(
   return diffPlanMd(before, after).filter((violation) => reportedPlanFiles.has(violation.path));
 }
 
+/* ---------------- Git 工作树边界（Worker 真实 changed_files 与 ownership gate） ---------------- */
+
+export type ProjectFileSnapshot = Record<string, string>;
+
+export interface ProjectFileChange {
+  path: string;
+  changeType: 'modified' | 'created' | 'deleted';
+}
+
+/**
+ * 对 Git 已跟踪文件和未忽略的 untracked 文件做内容快照。
+ *
+ * 不能只保存 `git status` 的路径：一个文件在领取前已经 dirty，Worker 随后再次
+ * 修改时，前后 status 仍然都是 `M`。内容 hash 才能同时做到“排除原有 dirty”与
+ * “识别 dirty 文件在本次执行窗口内的再次变化”。忽略文件不属于交付源代码事实源；
+ * work/ 是 Biao 自己的控制面产物，也明确排除。
+ */
+export function snapshotProjectFiles(projectPath: string): ProjectFileSnapshot | undefined {
+  const listed = spawnSync(
+    'git',
+    ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+    { cwd: projectPath, encoding: 'buffer', stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  if (listed.status !== 0 || !listed.stdout) return undefined;
+
+  const paths = listed.stdout.toString('utf8').split('\0').filter(Boolean);
+  const snapshot: ProjectFileSnapshot = {};
+  for (const gitPath of new Set(paths)) {
+    const normalized = gitPath.split('\\').join('/');
+    if (normalized === 'work' || normalized.startsWith('work/')) continue;
+    const absolute = resolve(projectPath, gitPath);
+    const rel = relative(resolve(projectPath), absolute);
+    if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) continue;
+    try {
+      const stat = lstatSync(absolute);
+      if (stat.isSymbolicLink()) {
+        snapshot[normalized] = `symlink:${readlinkSync(absolute)}`;
+      } else if (stat.isFile()) {
+        snapshot[normalized] = `file:${createHash('sha256').update(readFileSync(absolute)).digest('hex')}`;
+      } else {
+        snapshot[normalized] = `other:${stat.mode}`;
+      }
+    } catch (error) {
+      // tracked 但当前已删除的文件仍由 ls-files --cached 返回。缺失本身是快照状态，
+      // 这样领取前已有的删除不会被误归因，本次执行中的删除则会产生 hash -> missing。
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') snapshot[normalized] = 'missing';
+      else throw error;
+    }
+  }
+  return snapshot;
+}
+
+export function diffProjectFiles(
+  before: ProjectFileSnapshot,
+  after: ProjectFileSnapshot,
+): ProjectFileChange[] {
+  const changes: ProjectFileChange[] = [];
+  for (const path of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    const beforeValue = before[path];
+    const afterValue = after[path];
+    if (beforeValue === afterValue) continue;
+    const beforeExists = beforeValue !== undefined && beforeValue !== 'missing';
+    const afterExists = afterValue !== undefined && afterValue !== 'missing';
+    changes.push({
+      path,
+      changeType: beforeExists && !afterExists
+        ? 'deleted'
+        : !beforeExists && afterExists
+          ? 'created'
+          : 'modified',
+    });
+  }
+  return changes.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function globPatternMatchesPath(pattern: string, filePath: string): boolean {
+  const normalizedPattern = pattern.trim().replace(/^\.\//, '').split('\\').join('/');
+  if (!normalizedPattern) return false;
+  let regex = '^';
+  for (let i = 0; i < normalizedPattern.length; i++) {
+    const char = normalizedPattern[i];
+    if (char === '*' && normalizedPattern[i + 1] === '*') {
+      i++;
+      if (normalizedPattern[i + 1] === '/') {
+        i++;
+        regex += '(?:.*/)?';
+      } else {
+        regex += '.*';
+      }
+    } else if (char === '*') {
+      regex += '[^/]*';
+    } else if (char === '?') {
+      regex += '[^/]';
+    } else {
+      regex += char.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${regex}$`).test(filePath);
+}
+
+function ownershipViolations(task: ClaimedTask, changes: ProjectFileChange[]): ProjectFileChange[] {
+  const ownershipFiles = task.ownership_files ?? [];
+  // ownership_modules 是语义/审计字段，不是文件路径授权。文件写门禁只接受
+  // claim 中由平台激活过的 ownership_files，避免把 module 标签隐式解释成扩权。
+  return changes.filter(({ path }) =>
+    !ownershipFiles.some((pattern) => globPatternMatchesPath(pattern, path)),
+  );
+}
+
+/**
+ * 共享工作区里另一个 Worker 在本执行窗口内落盘时，全局 Git 快照会同时看到它。
+ * 若该路径当前由另一个 Agent 的有效 ownership 覆盖，就不能把变更归责给本 Worker。
+ * 没有他人 ownership 的未授权变化仍保留为 fail-closed，避免模型漏报绕过门禁。
+ */
+async function excludeChangesOwnedByOtherWorkers(
+  client: BiaoClient,
+  agentId: string,
+  changes: ProjectFileChange[],
+  agentReportedPaths: ReadonlySet<string>,
+): Promise<ProjectFileChange[]> {
+  const decisions = await Promise.all(changes.map(async (change) => {
+    // Kimi/Codex 工具流已明确记录当前 Agent 触碰该文件时，不能再用
+    // “当前由他人 ownership 覆盖”把它排除。这正是 checkout/restore 覆盖
+    // 他人未提交变更的高风险场景，必须 fail closed。
+    if (agentReportedPaths.has(change.path)) return true;
+    try {
+      const ownership = await client.checkOwnership(change.path);
+      const ownerId = ownership?.data?.owner?.agent_id;
+      return !(ownership?.data?.occupied && ownerId && ownerId !== agentId);
+    } catch {
+      // 无法证明属于他人时继续归入本 Worker 的安全审计边界。
+      return true;
+    }
+  }));
+  return changes.filter((_, index) => decisions[index]);
+}
+
 /** 执行前检查 lease 是否仍有效（crash recovery 核心判断）
  *  worker 走 HTTP 拿不到 lease key 本身，用 task 状态做代理：
  *  claim 后 task 应是 running 且 claimed_by=自己；若回 pending / 易主 / 查不到 → lease 已失效 */
@@ -1324,6 +1502,10 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
 
       advanceWorkerProgress(progress, 'running');
 
+      // Worker 执行窗口的真实文件基线。它在 claim/ownership/lease 都确认后、Agent
+      // 启动前建立，因此领取前已有的 dirty diff 不会自动算给当前 Worker。
+      const projectFilesBefore = snapshotProjectFiles(projectPath);
+
       // lease 续租：execute 前启动定时器，每 timeout/3 秒续一次，避免长任务 lease 过期被回收
       const leaseTimeout = task.timeout_seconds ?? 1800;
       const renewIntervalMs = (leaseTimeout * 1000) / 3;
@@ -1356,8 +1538,43 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
 
       // 执行
       const execution = await cfg.execute(task, projectPath, cfg.signal);
-      const { run, changedFiles, backend, model } = execution;
+      const { run, changedFiles: reportedChangedFiles, backend, model } = execution;
       console.log(`[worker:${cfg.agentId}]   执行完成 exit=${run.exitCode}${run.timedOut ? '（超时）' : ''}`);
+
+      const projectFilesAfter = projectFilesBefore ? snapshotProjectFiles(projectPath) : undefined;
+      let projectFileChanges = projectFilesBefore && projectFilesAfter
+        ? diffProjectFiles(projectFilesBefore, projectFilesAfter)
+        : undefined;
+      if (projectFileChanges) {
+        // plans/*.md 允许 PM 在 Worker 运行期间并发维护。保留既有职责分离归因规则：
+        // 只有 Agent 自报也指向同一 plan MD 时才归给 Worker；普通项目文件完全以
+        // 内容快照为事实源，不再相信模型自报。
+        const reportedPlans = new Set(
+          reportedChangedFiles
+            .map((path) => reportedPlanMdPath(projectPath, path))
+            .filter((path): path is string => path !== undefined)
+            .map((path) => `plans/${path}`),
+        );
+        projectFileChanges = projectFileChanges.filter((change) =>
+          !change.path.startsWith('plans/') || !change.path.toLowerCase().endsWith('.md') || reportedPlans.has(change.path),
+        );
+        const normalizedReportedPaths = new Set(reportedChangedFiles.map((path) => {
+          const absolute = isAbsolute(path) ? path : resolve(projectPath, path);
+          return relative(resolve(projectPath), absolute).split('\\').join('/');
+        }).filter((path) => path && path !== '..' && !path.startsWith('../')));
+        projectFileChanges = await excludeChangesOwnedByOtherWorkers(
+          client,
+          cfg.agentId,
+          projectFileChanges,
+          normalizedReportedPaths,
+        );
+      }
+      const actualChangedFiles = projectFileChanges
+        ? projectFileChanges.map((change) => change.path)
+        : [...new Set(reportedChangedFiles)].sort();
+      const ownershipBoundaryViolations = projectFileChanges
+        ? ownershipViolations(task, projectFileChanges)
+        : [];
 
       // 续租定时器已在 execute 前启动，这里清除（execute 完成，不再需要续租）
       clearInterval(renewTimer);
@@ -1371,7 +1588,15 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       }
       const question = execution.question ?? extractQuestionMarker(run.stdout);
       if (question) {
-        const asked = await client.createQuestion(task.task_id, task.claim_token, question.body, question.checkpoint);
+        const asked = question.requestedOwnership
+          ? await client.createQuestion(
+              task.task_id,
+              task.claim_token,
+              question.body,
+              question.checkpoint,
+              question.requestedOwnership,
+            )
+          : await client.createQuestion(task.task_id, task.claim_token, question.body, question.checkpoint);
         if (!asked?.ok) {
           throw new Error(`Question 创建失败：${asked?.error?.code ?? 'UNKNOWN'} ${asked?.error?.message ?? ''}`.trim());
         }
@@ -1387,14 +1612,34 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
 
       // 写 result
       const { resultMdPath, resultJsonPath } = writeResult(
-        workDir, task, run, verifyResults, cfg.agentId, backend, model, changedFiles,
+        workDir, task, run, verifyResults, cfg.agentId, backend, model, actualChangedFiles,
       );
+
+      if (ownershipBoundaryViolations.length > 0) {
+        console.log(`[worker:${cfg.agentId}]   ⚠ 检测到未授权文件变更，禁止 done：`);
+        for (const violation of ownershipBoundaryViolations) {
+          console.log(`[worker:${cfg.agentId}]     ${violation.path} (${violation.changeType})`);
+        }
+        const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, task.project_path);
+        const resultJson = JSON.parse(readWorkerArtifact(artifactContext, 'result.json'));
+        resultJson.status = 'failed';
+        resultJson.ownership_violations = ownershipBoundaryViolations;
+        atomicWriteWorkerArtifact(artifactContext, 'result.json', JSON.stringify(resultJson, null, 2));
+        const resultMd = readWorkerArtifact(artifactContext, 'result.md');
+        atomicWriteWorkerArtifact(
+          artifactContext,
+          'result.md',
+          `${resultMd}\n## Ownership 门禁失败\n${ownershipBoundaryViolations
+            .map((violation) => `- ${violation.path} (${violation.changeType})`)
+            .join('\n')}\n\n未获得 ownership_files 授权，平台禁止以 done 交付；需要 PM 显式扩权后由 fresh claim 修复。\n`,
+        );
+      }
 
       // plan MD 违规检测：快照证明文件实际变更，changedFiles 证明变更可归因给当前 Agent。
       // 不能把 PM/另一 Worker 的并发修改仅因为发生在 execute 时间窗内就判给当前 Agent。
       const planMdAfter = snapshotPlanMd(projectPath);
       const planMdViolations = attributablePlanMdViolations(
-        projectPath, planMdBefore, planMdAfter, changedFiles,
+        projectPath, planMdBefore, planMdAfter, actualChangedFiles,
       );
       if (planMdViolations.length > 0) {
         console.log(`[worker:${cfg.agentId}]   ⚠ 检测到 worker 改动了 plan MD 文件（违反 MD 职责分离）：`);
@@ -1418,6 +1663,9 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       let status: 'done' | 'failed';
       if (run.exitCode !== 0) {
         status = 'failed';
+      } else if (ownershipBoundaryViolations.length > 0) {
+        status = 'failed';
+        console.log(`[worker:${cfg.agentId}]   ⚠ ownership 门禁未通过，强制 status=failed`);
       } else if (verifyFailed && (task.verify ?? []).length > 0) {
         status = 'failed'; // verify 有 fail 强制 failed（bpi-01）
         console.log(`[worker:${cfg.agentId}]   ⚠ verify 未全过，强制 status=failed`);
