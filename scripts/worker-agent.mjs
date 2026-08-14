@@ -284,6 +284,10 @@ export async function runWorkerAgent(options) {
     throw error;
   }
   closeSync(lockFd);
+  // Linux 上 flock 的无等待竞争会在 adapter 启动前立即退出。此时向其 stdin
+  // 写入门铃可能异步报 EPIPE；竞争结果应由 child close 统一映射为可重试的 4，
+  // 不能让未监听的 stream error 把唤醒器异常终止为 1。
+  child.stdin.once('error', () => undefined);
   child.stdin.end(payload);
   const result = await new Promise((resolve) => {
     child.once('error', (error) => resolve({ error, code: null, signal: null }));

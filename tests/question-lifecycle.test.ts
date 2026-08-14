@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHttpServer } from '../src/server/http.js';
 import { SqliteStore, type PlanRow, type TaskRow } from '../src/db/sqlite-store.js';
-import { setSqliteStore, dbRestore, agentRegister, claim, taskBlock, taskResume, pmIntake, createQuestion, answerQuestion, getQuestion } from '../src/server/service.js';
+import { activeLocalMutationCount, setSqliteStore, dbRestore, agentRegister, claim, taskBlock, taskResume, pmIntake, createQuestion, answerQuestion, getQuestion } from '../src/server/service.js';
 import { keys, pendingScore } from '../src/redis/keys.js';
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import type { BiaoConfig } from '../src/types/index.js';
@@ -74,6 +74,14 @@ async function http(method: string, url: string, payload?: unknown) {
 
 function body(response: Awaited<ReturnType<typeof http>>): any {
   return response.json();
+}
+
+async function waitForLocalMutationsToDrain(timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (activeLocalMutationCount() > 0) {
+    if (Date.now() >= deadline) throw new Error('HTTP mutation permit 未在限定时间内释放');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function eventFields(type: string): Promise<Record<string, string>[]> {
@@ -381,6 +389,9 @@ describe('Question HTTP 生命周期', () => {
     }));
     const questionId = asked.data.question_id as string;
 
+    // Fastify inject 收到响应时，HTTP hook 的 permit finally 仍可能正在执行。
+    // dbRestore 必须拒绝真实并发写入；这里先等待同进程请求完全收尾，再验证重启恢复。
+    await waitForLocalMutationsToDrain();
     await redis.flushdb();
     await dbRestore(redis, store);
     const restored = body(await http('GET', '/question/' + questionId + '?consumer=pm-a'));

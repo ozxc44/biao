@@ -316,8 +316,10 @@ async function acquireKernelLock(options) {
     acknowledged = true;
     settleAcquisition(undefined);
   });
-  child.stdio[3].once('error', (error) => {
-    if (error?.code !== 'EPIPE' && !acknowledged) rejectAcquisition(error);
+  child.stdio[3].once('error', () => {
+    // Linux flock 在无等待竞争时会先关闭交接 pipe，随后才以 contentionCode
+    // close。不能让这一瞬态 ECONNRESET/EPIPE 抢先把“安静退出”误判成唤醒失败；
+    // 未确认 holder 的其他启动错误由 close 分支给出确定结论。
   });
   child.stdin.once('error', () => {
     // release 时 holder 已退出可能产生 EPIPE，最终状态由 closed 结果判定。

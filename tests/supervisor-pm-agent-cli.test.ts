@@ -239,7 +239,15 @@ async function waitForFile(path: string, timeoutMs = 3_000): Promise<void> {
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
+  } catch {
+    return false;
+  }
+  // Linux 已被 SIGKILL 的孤儿进程可能短暂显示为 zombie，直到 init 回收。
+  // 它不能执行、写入或继续占用 Agent 生命周期，应视为已停止。
+  if (process.platform !== 'linux') return true;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return !stat.slice(stat.lastIndexOf(')') + 1).trimStart().startsWith('Z');
   } catch {
     return false;
   }
