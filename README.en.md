@@ -1,15 +1,21 @@
 # Biao
 
+[![CI](https://github.com/ozxc44/biao/actions/workflows/ci.yml/badge.svg)](https://github.com/ozxc44/biao/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![Node](https://img.shields.io/badge/Node.js-20.19%2B%20%7C%2022.12--26.x-green)
+
 [English](README.en.md) | [简体中文](README.md)
+
+> Note: the English README is a condensed translation and may lag behind the [Chinese original](README.md), which is the authoritative document.
 
 > **Bring your own harness. Squad up. / 带上你的原配（harness），一起开团。**
 
-Every coding Agent arrives with its own harness. Codex, Claude Code, ZCode, Kimi, and internal tools each have their own CLI, runtime, context, and way of working—but they do not know one another. Put several of them on the same repository and a human still has to babysit the queue, prevent overlapping edits, relay questions, rerun tests, and decide whether “done” is actually done.
+Every coding Agent arrives with its own harness. Codex, Claude Code, ZCode, Kimi, DeepSeek, and internal tools each have their own CLI, runtime, context, and way of working—but they do not know one another. Put several of them on the same repository and a human still has to babysit the queue, prevent overlapping edits, relay questions, rerun tests, and decide whether “done” is actually done.
 
 Biao is not another Agent harness. It is the **collaboration layer above the harnesses you already use**. It replaces none of them. Biao gives them a shared plan, file ownership, leases, durable questions, verification evidence, independent acceptance, and a PM review gate.
 
 ```text
-   Codex · Claude Code · ZCode · Kimi · any CLI or HTTP Agent
+   Codex · Claude Code · ZCode · Kimi · DeepSeek · any CLI or HTTP Agent
        └── keep every harness you already trust; Biao replaces none ──┘
                                   ↓
        ┌────────────────────────────────────────────────────┐
@@ -42,12 +48,22 @@ Only a task with an `accepted` PM Review counts as complete. A heartbeat, a zero
 
 ## Product highlights
 
-Biao does not compete with any harness. It fills the space between them: when Agents with different runtimes must share a real repository, Biao defines who owns what, what evidence proves delivery, who accepts it independently, and how failures reach a bounded PM decision.
+The problem Biao solves first: **how multiple Agents with different harnesses safely co-develop one real project.** Each harness is already the best executor for its own model; what is missing is the collaboration layer between them—who owns what, who accepts what, and who closes failures. Biao does not compete with any harness; it is that layer.
+
+### Bring Your Own Harness (core)
+
+Biao is vendor- and model-neutral. It includes Codex and Kimi Workers, a generic CLI Worker, and an HTTP lifecycle for any language or platform. Claude Code, ZCode, DeepSeek, an internal executor, or a remote service can all join the same plan. Codex can implement, Claude Code can accept, Kimi can run regression work, DeepSeek can research, and an internal Agent can script—the PM itself can be any harness. Biao schedules, constrains, and verifies them. It does not become them.
+
+Single-harness multi-Agent setups can only orchestrate one vendor's Agents. Biao lets you pick the best model per task, then keeps implementer, acceptor, and PM in naturally different harnesses so they check one another.
+
+### File ownership and concurrency safety
+
+Tasks declare writable file globs. Claiming a task acquires that ownership, and a Worker checks every actual path again before writing. Conflicting Agents receive an explicit `wait` or conflict record instead of silently overwriting one another. This is the precondition for heterogeneous Agents to truly run in parallel.
 
 ### Verifiable completion
 
 - Every declared Verify command runs in order and reports its command, exit code, pass/fail result, and useful output. One failure prevents a successful report.
-- An `acceptance` task cannot be claimed by an Agent that implemented the work under review.
+- An `acceptance` task cannot be claimed by an Agent that implemented the work under review—in a heterogeneous squad this means a different harness does the falsifying.
 - Only PM Review `accepted`, or an accepted repair with `resolution_status=resolved`, contributes to plan completion.
 
 A single coding Agent can say it is finished. Biao adds the independent layer that can prove it wrong.
@@ -55,16 +71,6 @@ A single coding Agent can say it is finished. Biao adds the independent layer th
 ### Autonomous, auditable failure closure
 
 Worker failures, Verify failures, and PM rejections do not fall into a bucket that somebody must watch manually. Biao preserves the original failure or rejection and schedules a bounded repair with inherited ownership and Verify requirements. A repair still needs a fresh delivery and PM Review. A failed independent acceptance repairs the original implementation instead of depending on the failed acceptance, avoiding a dependency deadlock. Retry exhaustion ends at `needs_pm_decision`; it never loops forever.
-
-### File ownership and concurrency safety
-
-Tasks declare writable file globs. Claiming a task acquires that ownership, and a Worker checks every actual path again before writing. Conflicting Agents receive an explicit `wait` or conflict record instead of silently overwriting one another.
-
-### Bring Your Own Harness
-
-Biao is vendor- and model-neutral. It includes Codex and Kimi Workers, a generic CLI Worker, and an HTTP lifecycle for any language or platform. Claude Code, ZCode, an internal executor, or a remote service can all join the same plan. Codex can implement, Claude Code can accept, Kimi can run regression work, and an internal Agent can research—all without changing their native harnesses.
-
-Biao schedules, constrains, and verifies them. It does not become them.
 
 ### Redis + SQLite recovery
 
@@ -87,7 +93,7 @@ Biao runs with Node.js, Redis, and SQLite. Bootstrap detects dependencies, insta
 - Node.js 20.19+, or 22.12 through 26.x (the declared compatibility range of the native SQLite driver)
 - Redis
 - Built-in Workers: authenticated `codex` for Codex; authenticated `kimi` for Kimi
-- Other Agents, including Claude Code, ZCode, and internal CLIs: connect through the generic CLI Worker or HTTP API
+- Other Agents, including Claude Code, ZCode, DeepSeek, and internal CLIs: connect through the generic CLI Worker or HTTP API
 
 `bootstrap.sh` detects Node.js, npm, the Redis command, and Redis connectivity before changing anything. Without `--yes`, missing dependencies stop bootstrap with exit code `2`. With `--yes`, bootstrap may install them through Homebrew on macOS or apt, dnf, or yum on Linux. It only attempts to start a local Redis service; a remote `--redis-url` is connectivity-checked and is never installed or started remotely. If a Linux package source installs an unsupported Node version, or Redis remains unreachable, bootstrap fails closed and explains what to correct.
 
@@ -97,7 +103,7 @@ Biao supports a **source layout** from Git and a **prebuilt layout** installed f
 
 ### Source clone
 
-This repository is currently distributed privately. Obtain repository access and authenticate GitHub (or configure Git credentials with access) before running the clone command.
+The source is open under [Apache-2.0](LICENSE); clone it directly. For mirrored distribution inside a private network, configure Git credentials with access to that mirror first.
 
 ```bash
 git clone https://github.com/ozxc44/biao.git

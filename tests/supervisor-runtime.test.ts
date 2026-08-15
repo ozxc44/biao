@@ -862,7 +862,10 @@ describe('BiaoSupervisorRuntime production transport', () => {
 
     // 第一轮：并发闸 = 1，只允许一个 slot 领取；第二个任务不被领取。
     expect(await runtime.runOnce()).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const startDeadline = Date.now() + 20_000;
+    while (startedTasks.length < 1 && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     expect(startedTasks).toEqual(['task-a']);
     expect(claimed).toEqual(['task-a']);
 
@@ -1103,7 +1106,8 @@ describe('BiaoSupervisorRuntime production transport', () => {
     });
 
     await runtime.runOnce();
-    const deadline = Date.now() + 1_000;
+    // CI runner 被整套测试并行加载时，执行与上报可能远慢于 1 秒；只设宽松上限。
+    const deadline = Date.now() + 20_000;
     while (!requests.some((request) => request.path === '/report') && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }

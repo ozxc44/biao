@@ -1,15 +1,19 @@
 # Biao
 
+[![CI](https://github.com/ozxc44/biao/actions/workflows/ci.yml/badge.svg)](https://github.com/ozxc44/biao/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![Node](https://img.shields.io/badge/Node.js-20.19%2B%20%7C%2022.12--26.x-green)
+
 [简体中文](README.md) | [English](README.en.md)
 
 > **带上你的原配（harness），一起开团。 / Bring your own harness. Squad up.**
 
-**问题本质**：今天的每个模型都自带自己的 harness——Codex、Claude Code、ZCode、Kimi 各有各的 CLI 和运行时，但它们彼此并不认识。让两个不同 harness 的 Agent 安全地改同一个仓库、不互相覆盖、能互相验收，今天只能靠人肉盯。Biao 不是又一个 harness，而是**架在这些 harness 之上的协作平台**：你不换掉手里任何一个 Agent，把它们编进同一支队伍，由 Biao 统一管计划、管文件所有权、管验证证据、管 PM 验收。
+**问题本质**：今天的每个模型都自带自己的 harness——Codex、Claude Code、ZCode、Kimi、DeepSeek 各有各的 CLI 和运行时，但它们彼此并不认识。让两个不同 harness 的 Agent 安全地改同一个仓库、不互相覆盖、能互相验收，今天只能靠人肉盯。Biao 不是又一个 harness，而是**架在这些 harness 之上的协作平台**：你不换掉手里任何一个 Agent，把它们编进同一支队伍，由 Biao 统一管计划、管文件所有权、管验证证据、管 PM 验收。
 
 Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证据证明它真的完成了。
 
 ```text
-   Codex · Claude Code · ZCode · Kimi · 任意 CLI / HTTP Agent
+   Codex · Claude Code · ZCode · Kimi · DeepSeek · 任意 CLI / HTTP Agent
         └── 它们就是你的原配 harness，Biao 一个都不替换 ──┘
                               ↓
         ┌─────────────────────────────────────────────┐
@@ -19,6 +23,36 @@ Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证�
                               ↓
         真实项目代码 · 可复核的测试证据 · 完整审计轨迹
 ```
+
+**控制台一览**
+
+主界面 —— 当前待处理（`attention`）与历史审计分层可见，Agent 在线状态、任务状态、门铃待办一屏掌握：
+
+![Biao 控制台主界面](docs/images/console-home.jpg)
+
+项目页 —— 计划、任务看板、Verify 证据与 PM 验收进度按项目展开：
+
+![Biao 控制台项目页](docs/images/console-project.jpg)
+
+## 目录
+
+- [为什么使用 Biao](#为什么使用-biao)
+- [产品亮点](#产品亮点)
+- [架构与技术栈](#架构与技术栈)
+- [系统要求](#系统要求)
+- [开箱即用](#开箱即用)
+- [快速开始](#快速开始)
+- [如何编写计划](#如何编写计划)
+- [Agent 如何接入](#agent-如何接入)
+- [Worker 与 PM 的平台通讯](#worker-与-pm-的平台通讯)
+- [失败、拒绝与验收失败如何自动闭环](#失败拒绝与验收失败如何自动闭环)
+- [PM 常用操作](#pm-常用操作)
+- [服务配置](#服务配置)
+- [安全与部署](#安全与部署)
+- [状态语义](#状态语义)
+- [验证项目本身](#验证项目本身)
+- [当前边界](#当前边界)
+- [文档索引](#文档索引)
 
 ## 为什么使用 Biao
 
@@ -41,12 +75,24 @@ Biao 将完成链路固化为：
 
 ## 产品亮点
 
-Biao 不和任何 harness 竞争，它补的是 harness 之间的空白：**当不同模型的 Agent 必须在同一个真实项目里分工时，谁来定边界、谁来验收、失败谁来收口。** 下面是 Biao 把这层协作平台做实的几个支柱。
+Biao 解决的核心问题是：**不同 harness 的多个 Agent，怎么安全地协作开发同一个项目。** 每个 harness 自己就是最好的执行者，缺的是它们之间的协作层——谁来定边界、谁来验收、失败谁来收口。Biao 不和任何 harness 竞争，只把这层协作平台做实。
+
+### 异构 Agent 编队 · Bring Your Own Harness（核心）
+
+不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、DeepSeek、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、DeepSeek 做调研、自定义 Agent 跑脚本；PM 同样可以是任意 harness。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
+
+> 对比单 harness 的多 Agent 方案：它们只能编排同一个厂商的 Agent。Biao 让你为每个任务选最合适的模型，再让异构 Agent 互相制衡——实现者、验收者、PM 天然来自不同 harness。
+
+### 文件级 Ownership 与并发安全 · Ownership Isolation
+
+任务以文件 glob 声明可改范围；`claim` 时取得 ownership，写文件前对每个路径再校验一次 `proceed / wait`。两个 Agent 同时改同一个文件会被显式阻塞或冲突记录，而不是默默互相覆盖。
+
+> 这是异构 Agent 真正能并行的前提：没有 ownership 边界，并发就是竞态。
 
 ### 可信完成链路 · Verifiable Completion
 
 - **Verify 必跑、逐项上报**：任务声明的验证命令必须按序执行并回传每条命令的退出码与输出；任一失败不能进入成功状态。
-- **执行者 ≠ 验收者**：`acceptance` 任务禁止由原实现 Agent 领取，必须由独立 Agent 复核，再经 PM Review。
+- **执行者 ≠ 验收者**：`acceptance` 任务禁止由原实现 Agent 领取，必须由独立 Agent 复核，再经 PM Review——异构编队下这天然意味着“另一个 harness 来证伪”。
 - **`done` 不等于完成**：只有 PM Review 为 `accepted`（或失败经 repair `resolved`）才计入项目完成进度。Worker 心跳、退出码 0、生成了文件、上报了 `done`，都不能单独代表验收完成。
 
 > 对比单个 Coding Agent：它会"说完成了"，但没有独立验收层帮你证伪。
@@ -56,16 +102,6 @@ Biao 不和任何 harness 竞争，它补的是 harness 之间的空白：**当�
 Worker 失败、Verify 失败或 PM 拒绝不会被丢进一个需要人盯的故障桶。Biao **保留原始失败/拒绝审计**，再生成一条受限的 repair 链：repair 继承原 ownership 与 Verify，交付后仍须经 PM Review；独立 `acceptance` 失败时 repair 指向**被验收的原实现**，避免"修复任务依赖失败验收"的死锁；达到 `max_retries` 才升级为 `needs_pm_decision`，不会无限盲目重跑。
 
 > 对比通用编排框架：多数只到"重试 N 次"为止，Biao 给出的是**可审计、可终止、可由 PM 收口**的闭环。
-
-### 文件级 Ownership 与并发安全 · Ownership Isolation
-
-任务以文件 glob 声明可改范围；`claim` 时取得 ownership，写文件前对每个路径再校验一次 `proceed / wait`。两个 Agent 同时改同一个文件会被显式阻塞或冲突记录，而不是默默互相覆盖。
-
-> 这是多 Agent 真正能并行的前提：没有 ownership 边界，并发就是竞态。
-
-### 异构 Agent 中立 · Bring Your Own Harness
-
-不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、自定义 Agent 做调研。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
 
 ### 双层可恢复性 · Redis + SQLite
 
@@ -85,12 +121,40 @@ Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网�
 
 一句话定位：**harness 解决的是"一个 Agent 怎么把代码写好"，Biao 解决的是"多个不同 harness 的 Agent 怎么一起安全地把项目交付完"。**
 
+## 架构与技术栈
+
+```text
+                    ┌────────────────────────────────────────────┐
+   Web 控制台 ──────►│              Biao 服务（Fastify）           │
+   PM / CLI ────────►│  计划 · 调度 · Ownership · Question · 审计  │
+   Worker / Supervisor└───────┬─────────────────────┬────────────┘
+                            │ Redis                │ SQLite
+                            │ lease/队列/ownership  │ 审计与灾难恢复投影
+                            ▼                      ▼
+                    Codex / Kimi / 任意 CLI 或 HTTP Agent（你的 harness）
+```
+
+- **服务端**：Node.js + Fastify + Redis（实时调度：lease、ownership、队列、事件）+ SQLite（任务/结果/验收元数据与恢复投影，原生 `node:sqlite` 驱动）。
+- **客户端**：一个共享 Supervisor 进程承载 PM 门铃、按需 PM Agent 唤醒和全部 Worker slot；Worker 通过 CLI 启动器或标准 HTTP API 接入。
+- **Web 控制台**：`web/` 下的 Vue 前端，构建产物由服务端托管，本机 loopback 自动登录。
+
+主要目录：
+
+```text
+src/           服务端与 CLI 源码（server / redis / db / worker / cli / plan）
+scripts/       supervisor、pm-agent、bootstrap 等可执行入口
+bin/           codex-worker / kimi-worker / biao 等启动脚本
+docs/          产品与接入文档
+tests/         vitest 测试（服务端契约 + 真实子进程端到端）
+web/           Web 控制台前端
+```
+
 ## 系统要求
 
 - Node.js 20.19+，或 22.12 至 26.x（当前原生 SQLite 驱动的明确兼容范围）
 - Redis
 - 内置 Worker：Codex Worker 需已安装并登录 `codex`；Kimi Worker 需已安装并登录 `kimi`
-- 其他 Agent（Claude Code、ZCode、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
+- 其他 Agent（Claude Code、ZCode、DeepSeek、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
 
 `bootstrap.sh` 会先检测 Node.js、npm、Redis 命令和 Redis 连通性。默认只检测，不修改系统；缺少依赖时会以退出码 `2` 停止。只有显式加 `--yes`，它才会调用 macOS Homebrew 或 Linux 的 apt、dnf、yum 安装缺失依赖；其中 Linux 可能要求管理员权限。本机 Redis 不可用时才会尝试启动本机服务，远程 Redis 只做连通性检查，绝不尝试远程安装或启动。若包管理器不可用、安装后的 Node.js 不在 20.19+ 或 22.12-26.x 范围内，或 Redis 仍无法连接，脚本会停止并说明原因。
 
@@ -102,7 +166,7 @@ Biao 支持两种明确布局：从 Git clone 的**源码布局**，以及通过
 
 ### 源码 clone
 
-当前仓库为私有分发；执行以下命令前，需要先获得仓库权限，并在本机完成 GitHub 登录或配置有权访问该仓库的 Git 凭据。
+仓库以 [Apache-2.0](LICENSE) 开源，直接 clone 即可；私有环境内镜像分发时，先在本机配置可访问该仓库的 Git 凭据。
 
 Agent 或开发者从 Git 获取仓库后，只需要执行一次 bootstrap：
 
@@ -134,7 +198,7 @@ bootstrap 同时检查本地 `.biao/pm-heartbeat`：缺失时从包内共用模�
 
 ### 已安装 npm tarball
 
-tarball 只用于本地或受控私有分发。下面的命令在一个专用运行目录中安装包，并通过稳定的公共命令 `biao-bootstrap` 配置预构建运行时；请把路径替换成实际的受信任制品和工作区：
+tarball 只用于本地或受控私有分发。下面的命令在一个专用运行目录中安装包，并通过稳定的公共命令 `biao-bootstrap` 配置预构建运行时；请把路径替换为实际的受信任制品和工作区：
 
 ```bash
 mkdir -p /path/to/biao-runtime
@@ -151,20 +215,7 @@ npm install /absolute/path/to/vtp-biao-0.1.0.tgz
 ./.biao/start
 ```
 
-预构建布局把两类内容明确分开：`node_modules/@vtp/biao` 只保存可替换的只读代码与网页静态资源；调用命令的当前目录下 `.biao/` 保存 `config.env`、Agent Token、SQLite/数据以及启动器。启动器从外置 `.biao/config.env` 读取配置，再通过写死并安全引用的 packageRoot 绝对路径执行已安装代码，不会把 `node_modules` 当作可变数据目录。因此重新安装或升级 npm 包不会顺带删除运行状态。bootstrap 会校验服务、CLI、Worker、SQLite schema 与网页静态资源，并跳过开发依赖安装和重复构建。
-
-需要把状态放在其它位置时使用显式 `--runtime-dir /absolute/biao-state`。预构建布局会拒绝 packageRoot 内或任意 `node_modules` 内的 runtime-dir，避免包升级时丢失数据。升级时先在同一个消费目录安装新版 tarball，再从该目录刷新启动器；已有配置、Token 和数据会原样保留，启动器改为指向新版 packageRoot：
-
-```bash
-cd /path/to/biao-runtime
-npm install /absolute/path/to/vtp-biao-new.tgz
-./node_modules/.bin/biao-bootstrap \
-  --workspace /path/to/workspace \
-  --project /path/to/workspace/my-project \
-  --upgrade
-```
-
-不要裸解压 tarball，因为它不包含生产依赖；任一必需入口缺失时 bootstrap 会立即停止，不会生成表面成功、实际不可启动的配置。
+预构建布局把可替换代码（`node_modules/@vtp/biao`）与本机可变状态（当前目录的 `.biao/`：配置、Token、SQLite 数据、启动器）明确分开，升级包不会丢数据。不要裸解压 tarball，它不包含生产依赖。状态目录定制（`--runtime-dir`）与升级流程见 [预构建安装与升级](docs/prebuilt-install.md)。
 
 生成的 `.biao/` 已被 Git 忽略，不会把本机路径或 Token 提交到仓库。
 
@@ -1063,29 +1114,7 @@ BIAO_PM_AGENT_CMD='your-pm-agent-command' .biao/supervisor --consumer pm --inter
 .biao/supervisor --plans plan-a,plan-b
 ```
 
-Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤起时，可自行配置：
-
-```bash
-# cron 示例：每 5 分钟一次性共享检查
-*/5 * * * * cd /path/to/biao && ./.biao/supervisor --consumer pm --once >> /tmp/biao-sup.log 2>&1
-```
-
-```xml
-<!-- launchd 示例：~/Library/LaunchAgents/com.biao.supervisor.plist，每 5 分钟一次 -->
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.biao.supervisor</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/node</string>
-    <string>/path/to/biao/scripts/supervisor.mjs</string>
-    <string>--consumer</string><string>pm</string>
-    <string>--once</string>
-  </array>
-  <key>StartInterval</key><integer>300</integer>
-</dict></plist>
-```
+Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤起时可自行配置；cron / launchd 示例见 [Supervisor 定时唤起](docs/supervisor-scheduling.md)。生产推荐直接用 `.biao/start` 托管的常驻 Supervisor，不需要额外定时器。
 
 ### 平台保持被动的边界
 
@@ -1200,6 +1229,20 @@ Biao 当前定位是本地优先的多 Agent 研发控制台，而不是完整�
 - 跨节点自动部署和弹性扩缩容。
 
 这些能力可以后续接入，但不影响当前本地多 Agent 调度、验证和验收闭环。
+
+## 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [5 分钟快速上手](docs/quickstart.md) | 从 bootstrap 到第一次 PM 验收的最短路径 |
+| [Worker 接入契约](docs/worker-integration.md) | 领取、ownership、Question、上报的完整契约 |
+| [规划 CLI](docs/planning-cli.md) | `plan` / `task add` / `task edit` 的 Agent 机器合同 |
+| [无人盯盘的闭环](docs/autonomous-closure.md) | 失败、拒绝与 resolution 的自动闭环边界 |
+| [陌生 Agent 接入包](docs/agent-adapter-kit.md) | `contract → scaffold → check` 三步生成适配器 |
+| [预构建安装与升级](docs/prebuilt-install.md) | npm tarball 布局、runtime-dir 与升级流程 |
+| [Supervisor 定时唤起](docs/supervisor-scheduling.md) | cron / launchd 定时器示例 |
+| [真实 Harness 端到端验收剧本](docs/e2e-real-harness-runbook.md) | 用真实 `codex` 走完产品级闭环 |
+| [docs/README.md](docs/README.md) | 文档目录总览 |
 
 ### 源码开放与软件包发布
 

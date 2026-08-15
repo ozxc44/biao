@@ -685,8 +685,12 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       pids = JSON.parse(readFileSync(started, 'utf8')) as { agentPid: number; grandchildPid: number };
       child.kill(signal);
       const result = await closed;
-      const agentStopped = await waitForProcessExit(pids.agentPid);
-      const grandchildStopped = await waitForProcessExit(pids.grandchildPid);
+      // 两个进程应该由同一次 Supervisor 清理一并退出；并行等待既贴合真实
+      // 生命周期，也避免慢速 CI 在两个独立 20 秒探针之间耗尽测试总预算。
+      const [agentStopped, grandchildStopped] = await Promise.all([
+        waitForProcessExit(pids.agentPid),
+        waitForProcessExit(pids.grandchildPid),
+      ]);
 
       expect.soft(result).toEqual({ code: exitCode, signal: null });
       expect.soft(stdout).not.toContain('所有受管项目已完成并验收');
@@ -699,7 +703,9 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
         try { process.kill(pid, 'SIGKILL'); } catch { /* 已退出 */ }
       }
     }
-  }, 10_000);
+  // 启动门铃和进程退出探针各允许 20 秒，外层必须覆盖两者，避免超时后
+  // 延迟断言被 Vitest 归属到后续不相关的测试。
+  }, 45_000);
 
   it('显式 plan 过滤未命中时不得把空集合误报为全部完成', async () => {
     const { url } = await startServer();
