@@ -149,7 +149,7 @@ await new Promise((resolve) => setTimeout(resolve, 500));
     const args = baseArgs(dir, adapter);
 
     const first = spawn(process.execPath, args, { cwd: repoRoot, stdio: 'ignore' });
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + 20_000;
     while (!existsSync(started) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }

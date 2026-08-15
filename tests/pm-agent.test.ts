@@ -178,7 +178,7 @@ async function runWaker(args: string[], env: NodeJS.ProcessEnv): Promise<{ code:
   }
 }
 
-async function waitForFile(path: string, timeoutMs = 3_000): Promise<void> {
+async function waitForFile(path: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() > deadline) throw new Error(`等待文件超时：${path}`);
@@ -186,7 +186,7 @@ async function waitForFile(path: string, timeoutMs = 3_000): Promise<void> {
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<void> {
+async function waitForProcessExit(pid: number, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     try {

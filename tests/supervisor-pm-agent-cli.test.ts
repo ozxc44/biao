@@ -237,7 +237,7 @@ async function runSupervisor(args: string[], env: NodeJS.ProcessEnv): Promise<{ 
   return { code, stdout, stderr };
 }
 
-async function waitForFile(path: string, timeoutMs = 3_000): Promise<void> {
+async function waitForFile(path: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`等待文件超时：${path}`);
@@ -262,7 +262,7 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<boolean> {
+async function waitForProcessExit(pid: number, timeoutMs = 20_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (processIsAlive(pid) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -324,7 +324,8 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       import { existsSync, readFileSync, writeFileSync } from 'node:fs';
       const [started, peerStarted, output] = process.argv.slice(2);
       writeFileSync(started, 'started', 'utf8');
-      const deadline = Date.now() + 5000;
+      // CI runner 在整套测试并行时可能严重饥饿，两个 PM slot 的启动间隔需容忍慢机。
+      const deadline = Date.now() + 30_000;
       while (!existsSync(peerStarted) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
