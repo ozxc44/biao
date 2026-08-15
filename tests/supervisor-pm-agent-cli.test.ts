@@ -358,7 +358,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       ]),
     });
 
-    expect(result.code).toBe(0);
+    expect(result.code, `Supervisor stdout:\n${result.stdout}\nSupervisor stderr:\n${result.stderr}\nRequests:\n${paths.join('\n')}`).toBe(0);
     expect(result.stderr).toBe('');
     expect(JSON.parse(readFileSync(reviewOutput, 'utf8'))).toEqual({
       target: 'review-session',
