@@ -1,5 +1,9 @@
 # Biao
 
+[![CI](https://github.com/ozxc44/biao/actions/workflows/ci.yml/badge.svg)](https://github.com/ozxc44/biao/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![Node](https://img.shields.io/badge/Node.js-20.19%2B%20%7C%2022.12--26.x-green)
+
 [简体中文](README.md) | [English](README.en.md)
 
 > **带上你的原配（harness），一起开团。 / Bring your own harness. Squad up.**
@@ -19,6 +23,26 @@ Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证�
                               ↓
         真实项目代码 · 可复核的测试证据 · 完整审计轨迹
 ```
+
+## 目录
+
+- [为什么使用 Biao](#为什么使用-biao)
+- [产品亮点](#产品亮点)
+- [架构与技术栈](#架构与技术栈)
+- [系统要求](#系统要求)
+- [开箱即用](#开箱即用)
+- [快速开始](#快速开始)
+- [如何编写计划](#如何编写计划)
+- [Agent 如何接入](#agent-如何接入)
+- [Worker 与 PM 的平台通讯](#worker-与-pm-的平台通讯)
+- [失败、拒绝与验收失败如何自动闭环](#失败拒绝与验收失败如何自动闭环)
+- [PM 常用操作](#pm-常用操作)
+- [服务配置](#服务配置)
+- [安全与部署](#安全与部署)
+- [状态语义](#状态语义)
+- [验证项目本身](#验证项目本身)
+- [当前边界](#当前边界)
+- [文档索引](#文档索引)
 
 ## 为什么使用 Biao
 
@@ -85,6 +109,34 @@ Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网�
 
 一句话定位：**harness 解决的是"一个 Agent 怎么把代码写好"，Biao 解决的是"多个不同 harness 的 Agent 怎么一起安全地把项目交付完"。**
 
+## 架构与技术栈
+
+```text
+                    ┌────────────────────────────────────────────┐
+   Web 控制台 ──────►│              Biao 服务（Fastify）           │
+   PM / CLI ────────►│  计划 · 调度 · Ownership · Question · 审计  │
+   Worker / Supervisor└───────┬─────────────────────┬────────────┘
+                            │ Redis                │ SQLite
+                            │ lease/队列/ownership  │ 审计与灾难恢复投影
+                            ▼                      ▼
+                    Codex / Kimi / 任意 CLI 或 HTTP Agent（你的 harness）
+```
+
+- **服务端**：Node.js + Fastify + Redis（实时调度：lease、ownership、队列、事件）+ SQLite（任务/结果/验收元数据与恢复投影，原生 `node:sqlite` 驱动）。
+- **客户端**：一个共享 Supervisor 进程承载 PM 门铃、按需 PM Agent 唤醒和全部 Worker slot；Worker 通过 CLI 启动器或标准 HTTP API 接入。
+- **Web 控制台**：`web/` 下的 Vue 前端，构建产物由服务端托管，本机 loopback 自动登录。
+
+主要目录：
+
+```text
+src/           服务端与 CLI 源码（server / redis / db / worker / cli / plan）
+scripts/       supervisor、pm-agent、bootstrap 等可执行入口
+bin/           codex-worker / kimi-worker / biao 等启动脚本
+docs/          产品与接入文档
+tests/         vitest 测试（服务端契约 + 真实子进程端到端）
+web/           Web 控制台前端
+```
+
 ## 系统要求
 
 - Node.js 20.19+，或 22.12 至 26.x（当前原生 SQLite 驱动的明确兼容范围）
@@ -102,7 +154,7 @@ Biao 支持两种明确布局：从 Git clone 的**源码布局**，以及通过
 
 ### 源码 clone
 
-当前仓库为私有分发；执行以下命令前，需要先获得仓库权限，并在本机完成 GitHub 登录或配置有权访问该仓库的 Git 凭据。
+仓库以 [Apache-2.0](LICENSE) 开源，直接 clone 即可；私有环境内镜像分发时，先在本机配置可访问该仓库的 Git 凭据。
 
 Agent 或开发者从 Git 获取仓库后，只需要执行一次 bootstrap：
 
@@ -134,7 +186,7 @@ bootstrap 同时检查本地 `.biao/pm-heartbeat`：缺失时从包内共用模�
 
 ### 已安装 npm tarball
 
-tarball 只用于本地或受控私有分发。下面的命令在一个专用运行目录中安装包，并通过稳定的公共命令 `biao-bootstrap` 配置预构建运行时；请把路径替换成实际的受信任制品和工作区：
+tarball 只用于本地或受控私有分发。下面的命令在一个专用运行目录中安装包，并通过稳定的公共命令 `biao-bootstrap` 配置预构建运行时；请把路径替换为实际的受信任制品和工作区：
 
 ```bash
 mkdir -p /path/to/biao-runtime
@@ -151,20 +203,7 @@ npm install /absolute/path/to/vtp-biao-0.1.0.tgz
 ./.biao/start
 ```
 
-预构建布局把两类内容明确分开：`node_modules/@vtp/biao` 只保存可替换的只读代码与网页静态资源；调用命令的当前目录下 `.biao/` 保存 `config.env`、Agent Token、SQLite/数据以及启动器。启动器从外置 `.biao/config.env` 读取配置，再通过写死并安全引用的 packageRoot 绝对路径执行已安装代码，不会把 `node_modules` 当作可变数据目录。因此重新安装或升级 npm 包不会顺带删除运行状态。bootstrap 会校验服务、CLI、Worker、SQLite schema 与网页静态资源，并跳过开发依赖安装和重复构建。
-
-需要把状态放在其它位置时使用显式 `--runtime-dir /absolute/biao-state`。预构建布局会拒绝 packageRoot 内或任意 `node_modules` 内的 runtime-dir，避免包升级时丢失数据。升级时先在同一个消费目录安装新版 tarball，再从该目录刷新启动器；已有配置、Token 和数据会原样保留，启动器改为指向新版 packageRoot：
-
-```bash
-cd /path/to/biao-runtime
-npm install /absolute/path/to/vtp-biao-new.tgz
-./node_modules/.bin/biao-bootstrap \
-  --workspace /path/to/workspace \
-  --project /path/to/workspace/my-project \
-  --upgrade
-```
-
-不要裸解压 tarball，因为它不包含生产依赖；任一必需入口缺失时 bootstrap 会立即停止，不会生成表面成功、实际不可启动的配置。
+预构建布局把可替换代码（`node_modules/@vtp/biao`）与本机可变状态（当前目录的 `.biao/`：配置、Token、SQLite 数据、启动器）明确分开，升级包不会丢数据。不要裸解压 tarball，它不包含生产依赖。状态目录定制（`--runtime-dir`）与升级流程见 [预构建安装与升级](docs/prebuilt-install.md)。
 
 生成的 `.biao/` 已被 Git 忽略，不会把本机路径或 Token 提交到仓库。
 
@@ -1063,29 +1102,7 @@ BIAO_PM_AGENT_CMD='your-pm-agent-command' .biao/supervisor --consumer pm --inter
 .biao/supervisor --plans plan-a,plan-b
 ```
 
-Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤起时，可自行配置：
-
-```bash
-# cron 示例：每 5 分钟一次性共享检查
-*/5 * * * * cd /path/to/biao && ./.biao/supervisor --consumer pm --once >> /tmp/biao-sup.log 2>&1
-```
-
-```xml
-<!-- launchd 示例：~/Library/LaunchAgents/com.biao.supervisor.plist，每 5 分钟一次 -->
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.biao.supervisor</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/node</string>
-    <string>/path/to/biao/scripts/supervisor.mjs</string>
-    <string>--consumer</string><string>pm</string>
-    <string>--once</string>
-  </array>
-  <key>StartInterval</key><integer>300</integer>
-</dict></plist>
-```
+Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤起时可自行配置；cron / launchd 示例见 [Supervisor 定时唤起](docs/supervisor-scheduling.md)。生产推荐直接用 `.biao/start` 托管的常驻 Supervisor，不需要额外定时器。
 
 ### 平台保持被动的边界
 
@@ -1200,6 +1217,20 @@ Biao 当前定位是本地优先的多 Agent 研发控制台，而不是完整�
 - 跨节点自动部署和弹性扩缩容。
 
 这些能力可以后续接入，但不影响当前本地多 Agent 调度、验证和验收闭环。
+
+## 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [5 分钟快速上手](docs/quickstart.md) | 从 bootstrap 到第一次 PM 验收的最短路径 |
+| [Worker 接入契约](docs/worker-integration.md) | 领取、ownership、Question、上报的完整契约 |
+| [规划 CLI](docs/planning-cli.md) | `plan` / `task add` / `task edit` 的 Agent 机器合同 |
+| [无人盯盘的闭环](docs/autonomous-closure.md) | 失败、拒绝与 resolution 的自动闭环边界 |
+| [陌生 Agent 接入包](docs/agent-adapter-kit.md) | `contract → scaffold → check` 三步生成适配器 |
+| [预构建安装与升级](docs/prebuilt-install.md) | npm tarball 布局、runtime-dir 与升级流程 |
+| [Supervisor 定时唤起](docs/supervisor-scheduling.md) | cron / launchd 定时器示例 |
+| [真实 Harness 端到端验收剧本](docs/e2e-real-harness-runbook.md) | 用真实 `codex` 走完产品级闭环 |
+| [docs/README.md](docs/README.md) | 文档目录总览 |
 
 ### 源码开放与软件包发布
 

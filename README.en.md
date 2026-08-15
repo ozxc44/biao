@@ -1,6 +1,12 @@
 # Biao
 
+[![CI](https://github.com/ozxc44/biao/actions/workflows/ci.yml/badge.svg)](https://github.com/ozxc44/biao/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![Node](https://img.shields.io/badge/Node.js-20.19%2B%20%7C%2022.12--26.x-green)
+
 [English](README.en.md) | [简体中文](README.md)
+
+> Note: the English README is a condensed translation and may lag behind the [Chinese original](README.md), which is the authoritative document.
 
 > **Bring your own harness. Squad up. / 带上你的原配（harness），一起开团。**
 
@@ -97,7 +103,7 @@ Biao supports a **source layout** from Git and a **prebuilt layout** installed f
 
 ### Source clone
 
-This repository is currently distributed privately. Obtain repository access and authenticate GitHub (or configure Git credentials with access) before running the clone command.
+The source is open under [Apache-2.0](LICENSE); clone it directly. For mirrored distribution inside a private network, configure Git credentials with access to that mirror first.
 
 ```bash
 git clone https://github.com/ozxc44/biao.git
