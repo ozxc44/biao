@@ -24,6 +24,16 @@ Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证�
         真实项目代码 · 可复核的测试证据 · 完整审计轨迹
 ```
 
+**控制台一览**
+
+主界面 —— 当前待处理（`attention`）与历史审计分层可见，Agent 在线状态、任务状态、门铃待办一屏掌握：
+
+![Biao 控制台主界面](docs/images/console-home.jpg)
+
+项目页 —— 计划、任务看板、Verify 证据与 PM 验收进度按项目展开：
+
+![Biao 控制台项目页](docs/images/console-project.jpg)
+
 ## 目录
 
 - [为什么使用 Biao](#为什么使用-biao)
