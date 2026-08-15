@@ -8,12 +8,12 @@
 
 > **带上你的原配（harness），一起开团。 / Bring your own harness. Squad up.**
 
-**问题本质**：今天的每个模型都自带自己的 harness——Codex、Claude Code、ZCode、Kimi 各有各的 CLI 和运行时，但它们彼此并不认识。让两个不同 harness 的 Agent 安全地改同一个仓库、不互相覆盖、能互相验收，今天只能靠人肉盯。Biao 不是又一个 harness，而是**架在这些 harness 之上的协作平台**：你不换掉手里任何一个 Agent，把它们编进同一支队伍，由 Biao 统一管计划、管文件所有权、管验证证据、管 PM 验收。
+**问题本质**：今天的每个模型都自带自己的 harness——Codex、Claude Code、ZCode、Kimi、DeepSeek 各有各的 CLI 和运行时，但它们彼此并不认识。让两个不同 harness 的 Agent 安全地改同一个仓库、不互相覆盖、能互相验收，今天只能靠人肉盯。Biao 不是又一个 harness，而是**架在这些 harness 之上的协作平台**：你不换掉手里任何一个 Agent，把它们编进同一支队伍，由 Biao 统一管计划、管文件所有权、管验证证据、管 PM 验收。
 
 Biao 让多个开发 Agent 安全地改同一个项目，并用可复核的证据证明它真的完成了。
 
 ```text
-   Codex · Claude Code · ZCode · Kimi · 任意 CLI / HTTP Agent
+   Codex · Claude Code · ZCode · Kimi · DeepSeek · 任意 CLI / HTTP Agent
         └── 它们就是你的原配 harness，Biao 一个都不替换 ──┘
                               ↓
         ┌─────────────────────────────────────────────┐
@@ -79,7 +79,7 @@ Biao 解决的核心问题是：**不同 harness 的多个 Agent，怎么安全�
 
 ### 异构 Agent 编队 · Bring Your Own Harness（核心）
 
-不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、自定义 Agent 做调研；PM 同样可以是任意 harness。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
+不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、DeepSeek、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、DeepSeek 做调研、自定义 Agent 跑脚本；PM 同样可以是任意 harness。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
 
 > 对比单 harness 的多 Agent 方案：它们只能编排同一个厂商的 Agent。Biao 让你为每个任务选最合适的模型，再让异构 Agent 互相制衡——实现者、验收者、PM 天然来自不同 harness。
 
@@ -154,7 +154,7 @@ web/           Web 控制台前端
 - Node.js 20.19+，或 22.12 至 26.x（当前原生 SQLite 驱动的明确兼容范围）
 - Redis
 - 内置 Worker：Codex Worker 需已安装并登录 `codex`；Kimi Worker 需已安装并登录 `kimi`
-- 其他 Agent（Claude Code、ZCode、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
+- 其他 Agent（Claude Code、ZCode、DeepSeek、自研 CLI 等）：无需内置适配，通过通用 CLI Worker 或 HTTP API 接入即可
 
 `bootstrap.sh` 会先检测 Node.js、npm、Redis 命令和 Redis 连通性。默认只检测，不修改系统；缺少依赖时会以退出码 `2` 停止。只有显式加 `--yes`，它才会调用 macOS Homebrew 或 Linux 的 apt、dnf、yum 安装缺失依赖；其中 Linux 可能要求管理员权限。本机 Redis 不可用时才会尝试启动本机服务，远程 Redis 只做连通性检查，绝不尝试远程安装或启动。若包管理器不可用、安装后的 Node.js 不在 20.19+ 或 22.12-26.x 范围内，或 Redis 仍无法连接，脚本会停止并说明原因。
 

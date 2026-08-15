@@ -10,12 +10,12 @@
 
 > **Bring your own harness. Squad up. / 带上你的原配（harness），一起开团。**
 
-Every coding Agent arrives with its own harness. Codex, Claude Code, ZCode, Kimi, and internal tools each have their own CLI, runtime, context, and way of working—but they do not know one another. Put several of them on the same repository and a human still has to babysit the queue, prevent overlapping edits, relay questions, rerun tests, and decide whether “done” is actually done.
+Every coding Agent arrives with its own harness. Codex, Claude Code, ZCode, Kimi, DeepSeek, and internal tools each have their own CLI, runtime, context, and way of working—but they do not know one another. Put several of them on the same repository and a human still has to babysit the queue, prevent overlapping edits, relay questions, rerun tests, and decide whether “done” is actually done.
 
 Biao is not another Agent harness. It is the **collaboration layer above the harnesses you already use**. It replaces none of them. Biao gives them a shared plan, file ownership, leases, durable questions, verification evidence, independent acceptance, and a PM review gate.
 
 ```text
-   Codex · Claude Code · ZCode · Kimi · any CLI or HTTP Agent
+   Codex · Claude Code · ZCode · Kimi · DeepSeek · any CLI or HTTP Agent
        └── keep every harness you already trust; Biao replaces none ──┘
                                   ↓
        ┌────────────────────────────────────────────────────┐
@@ -52,7 +52,7 @@ The problem Biao solves first: **how multiple Agents with different harnesses sa
 
 ### Bring Your Own Harness (core)
 
-Biao is vendor- and model-neutral. It includes Codex and Kimi Workers, a generic CLI Worker, and an HTTP lifecycle for any language or platform. Claude Code, ZCode, an internal executor, or a remote service can all join the same plan. Codex can implement, Claude Code can accept, Kimi can run regression work, and an internal Agent can research—the PM itself can be any harness. Biao schedules, constrains, and verifies them. It does not become them.
+Biao is vendor- and model-neutral. It includes Codex and Kimi Workers, a generic CLI Worker, and an HTTP lifecycle for any language or platform. Claude Code, ZCode, DeepSeek, an internal executor, or a remote service can all join the same plan. Codex can implement, Claude Code can accept, Kimi can run regression work, DeepSeek can research, and an internal Agent can script—the PM itself can be any harness. Biao schedules, constrains, and verifies them. It does not become them.
 
 Single-harness multi-Agent setups can only orchestrate one vendor's Agents. Biao lets you pick the best model per task, then keeps implementer, acceptor, and PM in naturally different harnesses so they check one another.
 
@@ -93,7 +93,7 @@ Biao runs with Node.js, Redis, and SQLite. Bootstrap detects dependencies, insta
 - Node.js 20.19+, or 22.12 through 26.x (the declared compatibility range of the native SQLite driver)
 - Redis
 - Built-in Workers: authenticated `codex` for Codex; authenticated `kimi` for Kimi
-- Other Agents, including Claude Code, ZCode, and internal CLIs: connect through the generic CLI Worker or HTTP API
+- Other Agents, including Claude Code, ZCode, DeepSeek, and internal CLIs: connect through the generic CLI Worker or HTTP API
 
 `bootstrap.sh` detects Node.js, npm, the Redis command, and Redis connectivity before changing anything. Without `--yes`, missing dependencies stop bootstrap with exit code `2`. With `--yes`, bootstrap may install them through Homebrew on macOS or apt, dnf, or yum on Linux. It only attempts to start a local Redis service; a remote `--redis-url` is connectivity-checked and is never installed or started remotely. If a Linux package source installs an unsupported Node version, or Redis remains unreachable, bootstrap fails closed and explains what to correct.
 
