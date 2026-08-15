@@ -182,7 +182,8 @@ function isExecutable(path) {
 
 /**
  * 先用 O_NOFOLLOW 打开稳定 inode，再把这个 FD 交给内核锁 helper。
- * helper 不再按路径二次打开，因此符号链接和检查后替换都不能改变锁目标。
+ * helper 只通过继承的稳定 FD 访问锁，不会重新解析调用方提供的路径，因此符号链接
+ * 和检查后替换都不能改变锁目标。
  */
 function openStableLockFile(biaoUrl, consumer, lockDir) {
   const requestedDir = resolve(lockDir);
@@ -228,10 +229,11 @@ function kernelLockCommand(nonce) {
     if (!executable) fail('Linux 缺少 flock，无法安全启动 PM Agent 本机锁；请先安装 util-linux');
     return {
       executable,
-      // flock 默认也用 1 表示冲突，会与 Node holder 自身的普通失败退出码混淆。
-      // 固定成与 macOS lockf 一致的 75，才能把“已有同 consumer waker”与真实
-      // holder 启动失败严格区分，避免 Supervisor 把后者静默当作已处理。
-      args: ['-n', '-E', '75', String(INTERNAL_LOCK_FILE_FD), process.execPath, ...childArgs],
+      // flock 的“数字 FD”模式不能同时执行子命令；把 `5` 放在 command 形式会被
+      // 当成当前目录下同一个名为 5 的文件，令不同 consumer 错误互相竞争。通过
+      // /proc/self/fd 重新引用已经 O_NOFOLLOW 打开的继承 FD，锁目标仍是稳定 inode。
+      // 同时固定冲突码为 75，避免与 Node holder 自身的普通失败退出码混淆。
+      args: ['-n', '-E', '75', `/proc/self/fd/${INTERNAL_LOCK_FILE_FD}`, process.execPath, ...childArgs],
       contentionCode: 75,
     };
   }
@@ -331,15 +333,9 @@ async function acquireKernelLock(options) {
 
   const acquired = await acquisition;
   if (acquired === LOCK_CONTENTION) {
-    if (process.env.BIAO_PM_AGENT_TRACE_LOCK === '1') {
-      console.error(`[pm-agent] lock contention consumer=${options.consumer} path=${lockFile.path}`);
-    }
     child.stdin.end();
     await closed;
     return undefined;
-  }
-  if (process.env.BIAO_PM_AGENT_TRACE_LOCK === '1') {
-    console.error(`[pm-agent] lock acquired consumer=${options.consumer} path=${lockFile.path}`);
   }
   return {
     async release() {

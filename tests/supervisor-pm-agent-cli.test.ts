@@ -347,7 +347,6 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       BIAO_WORKER_SLOTS: '',
       BIAO_PM_AGENT_CMD: '',
       BIAO_PM_AGENT_ROUTES: '',
-      BIAO_PM_AGENT_TRACE_LOCK: '1',
       BIAO_PM_SLOTS: JSON.stringify([
         {
           id: 'review-pm', consumer: 'pm-review', plans: ['open-plan'], kinds: ['review_requested'],
@@ -361,8 +360,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
     });
 
     expect(result.code, `Supervisor stdout:\n${result.stdout}\nSupervisor stderr:\n${result.stderr}\nRequests:\n${paths.join('\n')}`).toBe(0);
-    expect(result.stderr).toContain('[pm-agent] lock acquired consumer=pm-review');
-    expect(result.stderr).toContain('[pm-agent] lock acquired consumer=pm-question');
+    expect(result.stderr).toBe('');
     expect(JSON.parse(readFileSync(reviewOutput, 'utf8'))).toEqual({
       target: 'review-session',
       payload: {
