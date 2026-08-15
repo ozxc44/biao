@@ -121,6 +121,10 @@ const defaultPmAgentCommand = flag('pm-agent-command') ?? process.env.BIAO_PM_AG
 let pmWakeFailed = false;
 let receivedSignal;
 const activePmAgents = new Map();
+// SIGTERM 后给 PM Agent 留出的自行回收窗口：pm-agent 收到信号后要自行杀掉
+// adapter 进程组（含 Codex/Kimi 等后代）。窗口过短时，加载中的机器来不及执行
+// pm-agent 的信号处理器，SIGKILL 会把整棵 adapter 树打成永久孤儿。
+const PM_FORCE_KILL_GRACE_MS = 10_000;
 // `--once` 需要等待本轮已发出的门铃给出真实退出码，但不能在第一个 slot 上
 // 阻塞 runtime 的其余 consumer；否则不同 PM 永远无法并行启动。
 const oncePmWakeCompletions = [];
@@ -296,7 +300,7 @@ function stopActivePmAgent(slotId, signal = 'SIGTERM') {
     if (activePmAgents.get(slotId) === child && child.exitCode === null && child.signalCode === null) {
       signalPmAgentTree(slotId, child, 'SIGKILL');
     }
-  }, 1_000);
+  }, PM_FORCE_KILL_GRACE_MS);
   timer.unref();
   forceKillTimers.set(slotId, timer);
 }
@@ -324,7 +328,7 @@ async function stopAndDrainActivePmAgents() {
   };
 
   stopActivePmAgents('SIGTERM');
-  await waitForActivePmAgents(1_200);
+  await waitForActivePmAgents(PM_FORCE_KILL_GRACE_MS + 500);
   if (activePmAgents.size === 0) return;
   stopActivePmAgents('SIGKILL');
   await waitForActivePmAgents(300);
