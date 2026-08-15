@@ -121,6 +121,9 @@ const defaultPmAgentCommand = flag('pm-agent-command') ?? process.env.BIAO_PM_AG
 let pmWakeFailed = false;
 let receivedSignal;
 const activePmAgents = new Map();
+// `--once` 需要等待本轮已发出的门铃给出真实退出码，但不能在第一个 slot 上
+// 阻塞 runtime 的其余 consumer；否则不同 PM 永远无法并行启动。
+const oncePmWakeCompletions = [];
 const forceKillTimers = new Map();
 const pmDoorbellAttempts = new Map();
 const pmRetryCooldownMs = Math.max(
@@ -431,10 +434,15 @@ async function wakePmAgent(slot, planId, fingerprint) {
       }
     });
   });
-  // `--once` 是诊断/cron 合同，必须等 Agent 给出真实退出码。常驻 Supervisor 不等
-  // PM 退出，以便 Worker 并行；同时返回 false 保留事项的本机可重试性，active 与
-  // cooldown 会在后续共享轮次阻止重复消耗模型 token。
-  return once ? completion : false;
+  // `--once` 要在整轮 intake 都分发后再汇总真实退出码。此处若 await 第一个 slot，
+  // runtime 就不会发现另一个 consumer 的门铃，多个 PM 反而被错误串行化。
+  if (once) {
+    oncePmWakeCompletions.push(completion);
+    return true;
+  }
+  // 常驻 Supervisor 不等 PM 退出，以便 Worker 并行；返回 false 保留事项的本机
+  // 可重试性，active 与 cooldown 会在后续共享轮次阻止重复消耗模型 token。
+  return false;
 }
 
 function doorbellFingerprint(items) {
@@ -610,6 +618,8 @@ try {
   });
   if (once) {
     const active = await runtime.runOnce();
+    const pmWakeResults = await Promise.all(oncePmWakeCompletions);
+    if (pmWakeResults.some((result) => result !== true)) pmWakeFailed = true;
     process.exitCode = receivedSignal ? signalExitCode(receivedSignal) : pmWakeFailed ? 4 : active ? 0 : 2;
   } else {
     console.log(`[supervisor] 运行：consumer=${consumer}，pmSlots=${pmSlots.length || 1}，workerSlots=${slots.length}，间隔上限=${Math.round(intervalMs / 1000)}s（PM 事件不会自动 ack）`);

@@ -168,25 +168,34 @@ async function startPmPoolServer(): Promise<{ url: string; paths: string[] }> {
     paths.push(`${req.method ?? 'GET'} ${url.pathname}${url.search}`);
     res.setHeader('content-type', 'application/json');
     if (url.pathname === '/plans') {
-      res.end(JSON.stringify({ ok: true, data: { total: 1, plans: [{
+      res.end(JSON.stringify({ ok: true, data: { total: 2, plans: [{
         plan_id: 'open-plan', status: 'active', project_path: '/tmp/project',
         tasks: { pending: 0, running: 0, blocked: 1, done: 1, failed: 0, cancelled: 0 },
         reviews: { pending: 1, accepted: 0, rejected: 0 },
+      }, {
+        plan_id: 'question-plan', status: 'active', project_path: '/tmp/question-project',
+        tasks: { pending: 0, running: 0, blocked: 1, done: 1, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
       }] } }));
       return;
     }
     if (url.pathname === '/intake') {
       const consumer = url.searchParams.get('consumer') ?? '';
-      const reads = (intakeReads.get(consumer) ?? 0) + 1;
-      intakeReads.set(consumer, reads);
+      const requestedPlan = url.searchParams.get('plan_id');
+      const reads = (intakeReads.get(`${consumer}\u0000${requestedPlan ?? '*'}`) ?? 0) + 1;
+      intakeReads.set(`${consumer}\u0000${requestedPlan ?? '*'}`, reads);
       const item = consumer === 'pm-review'
         ? { kind: 'review_requested', plan_id: 'open-plan', task_id: 'task-review', event_id: 'event-review' }
         : consumer === 'pm-question'
-          ? { kind: 'question_asked', plan_id: 'open-plan', task_id: 'task-question', event_id: 'event-question', question_id: 'question-1' }
+          ? { kind: 'question_asked', plan_id: 'question-plan', task_id: 'task-question', event_id: 'event-question', question_id: 'question-1' }
           : undefined;
+      const matchesRequestedPlan = !requestedPlan || requestedPlan === item?.plan_id;
+      // Supervisor 的共享快照会按 plan 带 plan_id 读取；PM Agent 自己则读取对应
+      // consumer 的完整 intake 三次（初读、二次确认、require-drained 复核）。
+      const visible = item && matchesRequestedPlan && (requestedPlan ? true : reads <= 2) ? [item] : [];
       res.end(JSON.stringify({
         ok: true,
-        data: { consumer, cursor: `${reads}-0`, items: item && reads <= 3 ? [item] : [] },
+        data: { consumer, cursor: `${reads}-0`, items: visible },
       }));
       return;
     }
@@ -303,7 +312,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
     });
   });
 
-  it('一个 Supervisor 并行唤醒两个独立 consumer 的 PM slot，并按 plan/kind 精确筛选', async () => {
+  it('一个 Supervisor 并行唤醒两个独立 plan/consumer 的 PM slot，并按 plan/kind 精确筛选', async () => {
     const { url, paths } = await startPmPoolServer();
     const dir = tempDir();
     const adapter = join(dir, 'pool-adapter.mjs');
@@ -329,7 +338,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
     const questionCommand = [process.execPath, adapter, questionStarted, reviewStarted, questionOutput].map(shellQuote).join(' ');
 
     const result = await runSupervisor([
-      '--once', '--biao-url', url, '--plans', 'open-plan',
+      '--once', '--biao-url', url, '--plans', 'open-plan,question-plan',
     ], {
       BIAO_LOCK_DIR: dir,
       BIAO_PM_AGENT_LOCK_DIR: dir,
@@ -343,7 +352,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
           command: reviewCommand, target: 'review-session',
         },
         {
-          id: 'question-pm', consumer: 'pm-question', plans: ['open-plan'], kinds: ['question_asked'],
+          id: 'question-pm', consumer: 'pm-question', plans: ['question-plan'], kinds: ['question_asked'],
           command: questionCommand, target: 'question-session',
         },
       ]),
@@ -366,13 +375,13 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
       payload: {
         biaoUrl: url,
         consumer: 'pm-question',
-        planIds: ['open-plan'],
+        planIds: ['question-plan'],
         kinds: { question_asked: 1 },
         count: 1,
       },
     });
-    expect(paths.filter((path) => path.includes('/intake?consumer=pm-review'))).toHaveLength(4);
-    expect(paths.filter((path) => path.includes('/intake?consumer=pm-question'))).toHaveLength(4);
+    expect(paths.filter((path) => path.includes('/intake?consumer=pm-review'))).toHaveLength(5);
+    expect(paths.filter((path) => path.includes('/intake?consumer=pm-question'))).toHaveLength(5);
     expect(paths.some((path) => /\/intake\/ack|\/review(?:\/|\?|$)|\/answer(?:\/|\?|$)/.test(path))).toBe(false);
   }, 10_000);
 
