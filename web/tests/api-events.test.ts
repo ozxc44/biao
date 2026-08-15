@@ -60,7 +60,7 @@ describe('subscribeToEvents', () => {
     vi.useRealTimers();
   });
 
-  it('uses an authenticated fetch SSE stream and parses events split across chunks', async () => {
+  it('uses a same-origin local Owner fetch SSE stream and parses events split across chunks', async () => {
     const visibility = installBrowserGlobals('top-secret');
     const encoder = new TextEncoder();
     let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -85,8 +85,9 @@ describe('subscribeToEvents', () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/events/stream');
     expect(String(url)).not.toContain('top-secret');
-    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer top-secret');
+    expect(new Headers(init?.headers).get('Authorization')).toBeNull();
     expect(new Headers(init?.headers).get('Accept')).toBe('text/event-stream');
+    expect(init?.credentials).toBe('same-origin');
     expect(eventSource).not.toHaveBeenCalled();
 
     streamController?.enqueue(encoder.encode(': keep-alive\r\ndata: {"type":"task_'));
@@ -107,7 +108,7 @@ describe('subscribeToEvents', () => {
     expect(visibility.listenerCount()).toBe(0);
   });
 
-  it('reconnects failed authenticated streams with bounded exponential backoff', async () => {
+  it('reconnects failed local Owner streams with bounded exponential backoff', async () => {
     vi.useFakeTimers();
     installBrowserGlobals('top-secret');
     const fetchMock = vi.fn(async () => {
@@ -137,7 +138,7 @@ describe('subscribeToEvents', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it('aborts the authenticated stream while hidden and resumes once visible', async () => {
+  it('aborts the local Owner stream while hidden and resumes once visible', async () => {
     vi.useFakeTimers();
     const visibility = installBrowserGlobals('top-secret');
     const signals: AbortSignal[] = [];
@@ -167,7 +168,7 @@ describe('subscribeToEvents', () => {
     expect(visibility.listenerCount()).toBe(0);
   });
 
-  it('keeps the unauthenticated path on EventSource and closes it on cleanup', () => {
+  it('falls back to EventSource when fetch is unavailable and closes it on cleanup', () => {
     const visibility = installBrowserGlobals('');
     const instances: Array<{ close: ReturnType<typeof vi.fn>; onmessage: ((event: MessageEvent) => void) | null }> = [];
     class FakeEventSource {
@@ -180,15 +181,12 @@ describe('subscribeToEvents', () => {
       }
     }
     vi.stubGlobal('EventSource', FakeEventSource);
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', undefined);
     const onUpdate = vi.fn<(event: BiaoEvent) => void>();
 
     const unsubscribe = subscribeToEvents(onUpdate);
     expect(instances).toHaveLength(1);
     expect(instances[0].url).toBe('/events/stream');
-    expect(fetchMock).not.toHaveBeenCalled();
-
     instances[0].onmessage?.(new MessageEvent('message', {
       data: '{"type":"task_claimed","task_id":"t2","agent_id":"a2","ts":7}',
     }));

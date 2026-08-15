@@ -29,12 +29,13 @@ interface RequestLog {
   method: string;
   path: string;
   body: string;
+  authorization?: string;
 }
 
 interface BiaoLikeServerOptions {
   plans?: () => Array<Record<string, unknown>>;
   events?: () => unknown;
-  intake?: () => Record<string, unknown>;
+  intake?: (scope: { consumer: string; planId?: string }) => Record<string, unknown>;
   claim?: (body: Record<string, unknown>) => unknown;
   heartbeat?: (body: Record<string, unknown>) => unknown;
   report?: (body: Record<string, unknown>) => unknown;
@@ -128,7 +129,12 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
     const chunks: Buffer[] = [];
     req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     req.on('end', async () => {
-      requests.push({ method: req.method ?? 'GET', path: `${url.pathname}${url.search}`, body: Buffer.concat(chunks).toString('utf8') });
+      requests.push({
+        method: req.method ?? 'GET',
+        path: `${url.pathname}${url.search}`,
+        body: Buffer.concat(chunks).toString('utf8'),
+        authorization: req.headers.authorization,
+      });
       res.setHeader('Content-Type', 'application/json');
       if (url.pathname === '/plans') {
         if (options.failPlans?.()) {
@@ -150,9 +156,11 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
         return;
       }
       if (url.pathname === '/intake') {
+        const consumer = url.searchParams.get('consumer') ?? '';
+        const planId = url.searchParams.get('plan_id') ?? undefined;
         res.end(JSON.stringify({
           ok: true,
-          data: options.intake?.() ?? {
+          data: options.intake?.({ consumer, planId }) ?? {
             consumer: 'pm-a',
             cursor: '100-0',
             counts: { review_requested: 1 },
@@ -241,6 +249,31 @@ function sampleTask(): ClaimedTask {
 }
 
 describe('BiaoSupervisorRuntime production transport', () => {
+  it('keeps Owner auth on Supervisor transport while in-process Workers use only scoped auth', async () => {
+    const { url, requests } = await startBiaoLikeServer({ events: () => [] });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      apiToken: 'owner-secret',
+      workerApiToken: 'worker-secret',
+      workers: [{
+        agentId: 'code-a', agentType: 'test', preferredProject: '/tmp/a', capabilities: ['code'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+      pollIntervalMs: 1_000,
+    });
+
+    await runtime.runOnce();
+
+    expect(requests.find((request) => request.path === '/plans')?.authorization).toBe('Bearer owner-secret');
+    for (const path of ['/register', '/heartbeat', '/claim']) {
+      expect(requests.find((request) => request.path === path)?.authorization).toBe('Bearer worker-secret');
+    }
+  });
+
   it('all plans share one passive polling round and PM doorbell never auto-acks', async () => {
     const { url, requests } = await startBiaoLikeServer();
     const bell: Array<{ planId: string; kinds: string[] }> = [];
@@ -265,6 +298,45 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(eventRequests).toHaveLength(2);
     expect(eventRequests[0].path).toContain('after=0-0');
     expect(eventRequests[1].path).toContain('since=101');
+  });
+
+  it('一个共享 transport 轮次读取多个 PM consumer 队列并保留队列归属', async () => {
+    const { url, requests } = await startBiaoLikeServer({
+      intake: ({ consumer }) => ({
+        consumer,
+        cursor: consumer === 'pm-a' ? '100-1' : '100-2',
+        counts: consumer === 'pm-a' ? { review_requested: 1 } : { question_asked: 1 },
+        items: consumer === 'pm-a'
+          ? [{ kind: 'review_requested', event_id: 'evt-review-a', task_id: 'task-a', plan_id: 'open-a', timestamp: 100 }]
+          : [{ kind: 'question_asked', event_id: 'evt-question-b', task_id: 'task-b', plan_id: 'open-b', timestamp: 101 }],
+      }),
+      events: () => ({ events: [], next_cursor: '0-0' }),
+    });
+    const bells: Array<{ planId: string; consumer: string | undefined; kinds: string[] }> = [];
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      pmConsumers: ['pm-a', 'pm-b'],
+      onPmDoorbell: async (planId, items) => {
+        bells.push({ planId, consumer: items[0]?.consumer, kinds: items.map((item) => item.kind) });
+      },
+      pollIntervalMs: 1_000,
+    });
+
+    await runtime.runOnce();
+
+    expect(requests.filter((request) => request.path === '/plans')).toHaveLength(1);
+    expect(requests.filter((request) => request.path.startsWith('/events'))).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/reconcile')).toHaveLength(1);
+    expect(requests.filter((request) => request.path.startsWith('/intake')).map((request) => request.path).sort()).toEqual([
+      '/intake?consumer=pm-a',
+      '/intake?consumer=pm-b',
+    ]);
+    expect(requests.some((request) => request.path.startsWith('/intake/ack'))).toBe(false);
+    expect(bells).toEqual([
+      { planId: 'open-a', consumer: 'pm-a', kinds: ['review_requested'] },
+      { planId: 'open-b', consumer: 'pm-b', kinds: ['question_asked'] },
+    ]);
   });
 
   it('新服务返回 next_cursor 时持续使用 stream after，不退回时间戳轮询', async () => {
@@ -391,7 +463,37 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(sampleTask().question_answer).toBeUndefined();
   });
 
-  it('two idle slots share one claim attempt and each emit one presence heartbeat per shared refresh', async () => {
+  it('acceptance_ready immediately wakes the shared Worker scheduler', async () => {
+    const { url } = await startBiaoLikeServer({
+      events: () => ({
+        events: [{
+          event_id: 'evt-acceptance-ready', type: 'acceptance_ready', task_id: 'fresh-reverify',
+          plan_id: 'open-a', consumer: 'pm-a', timestamp: 202,
+        }],
+        next_cursor: '202-0',
+      }),
+      intake: () => ({ consumer: 'pm-a', cursor: '202-0', counts: {}, items: [] }),
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      workers: [{
+        agentId: 'acceptance-a', agentType: 'test', preferredProject: '/tmp/a',
+        capabilities: ['acceptance'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+      pollIntervalMs: 1_000,
+    });
+
+    await runtime.runOnce();
+
+    expect(runtime.workerWakeCount()).toBe(1);
+  });
+
+  it('two identity-scoped idle slots each claim once and emit one presence heartbeat per shared refresh', async () => {
     const { url, requests } = await startBiaoLikeServer();
     const execute = async () => ({
       run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
@@ -410,10 +512,10 @@ describe('BiaoSupervisorRuntime production transport', () => {
     await runtime.runOnce();
 
     const claims = requests.filter((request) => request.path === '/claim');
-    expect(claims).toHaveLength(1);
-    expect(JSON.parse(claims[0].body)).toMatchObject({
-      agent_id: 'review-a', preferred_project: '/tmp/a', preferred_types: ['review'],
-    });
+    expect(claims.map((request) => JSON.parse(request.body))).toEqual([
+      expect.objectContaining({ agent_id: 'review-a', preferred_project: '/tmp/a', preferred_types: ['review'] }),
+      expect.objectContaining({ agent_id: 'review-b', preferred_project: '/tmp/a', preferred_types: ['review'] }),
+    ]);
     const heartbeats = requests.filter((request) => request.path === '/heartbeat').map((request) => JSON.parse(request.body));
     expect(heartbeats).toEqual([
       { agent_id: 'review-a', registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/) },
@@ -423,7 +525,7 @@ describe('BiaoSupervisorRuntime production transport', () => {
     await runtime.runOnce();
 
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(2);
-    expect(requests.filter((request) => request.path === '/claim')).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/claim')).toHaveLength(2);
     expect(requests.filter((request) => request.path === '/heartbeat')).toHaveLength(4);
   });
 
@@ -605,13 +707,173 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/heartbeat')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
-    const offline = requests.filter((request) => request.path === '/agent/offline');
-    expect(offline).toHaveLength(1);
-    expect(JSON.parse(offline[0].body)).toEqual({
-      agent_id: 'code-a',
-      registration_id: expect.stringMatching(/^reg_[a-f0-9]{32}$/),
-      reason: 'plans_terminal',
+    // 本轮从未注册过 slot，就不能拿随机的新 epoch 去 offline 服务端可能仍保留的
+    // 历史 epoch；否则每次空转巡检都会产生 AGENT_REGISTRATION_CHANGED 噪声。
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
+  });
+
+  it('plans_terminal 软停机后新活跃计划出现时，以全新 epoch 复活 slot 并继续领取（留守/重入）', async () => {
+    // 真实存在的项目目录：result.md/result.json 需要写入成功，任务才能 done 而不是降级 failed。
+    const project = createTempDir('stay-resident-revive');
+    // 阶段推进：active（有任务）→ terminal（全部闭环软停机）→ revived（留守轮发现新计划）。
+    let phase: 'active' | 'terminal' | 'revived' = 'active';
+    const delivered = new Set<string>();
+    const reportedTasks: string[] = [];
+    const reportedStatuses = new Map<string, string>();
+    const reportWaiters = new Map<string, () => void>();
+    const reportReceived = (taskId: string) => new Promise<void>((resolve) => reportWaiters.set(taskId, resolve));
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => {
+        const closed = {
+          plan_id: 'p-first', status: 'completed', project_path: project,
+          tasks: { pending: 0, running: 0, blocked: 0, done: 1, failed: 0, cancelled: 0 },
+          reviews: { pending: 0, accepted: 1, rejected: 0 },
+        };
+        if (phase === 'active') {
+          return [{
+            plan_id: 'p-first', status: 'active', project_path: project,
+            tasks: { pending: 1, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+            reviews: { pending: 0, accepted: 0, rejected: 0 },
+          }];
+        }
+        if (phase === 'terminal') return [closed];
+        return [
+          closed,
+          {
+            plan_id: 'p-second', status: 'active', project_path: project,
+            tasks: { pending: 1, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+            reviews: { pending: 0, accepted: 0, rejected: 0 },
+          },
+        ];
+      },
+      claim: () => {
+        const taskId = phase === 'active' ? 'task-first' : phase === 'revived' ? 'task-second' : '';
+        if (!taskId || delivered.has(taskId)) return null;
+        delivered.add(taskId);
+        return {
+          task_id: taskId, title: taskId, type: 'code', phase: 'impl', priority: 5,
+          ownership_files: [], goal_md: '', timeout_seconds: 60, claim_token: `token-${taskId}`,
+          verify: [], project_path: project, plan_id: taskId === 'task-first' ? 'p-first' : 'p-second',
+        };
+      },
+      report: (body) => {
+        const taskId = String(body.task_id);
+        reportedTasks.push(taskId);
+        reportedStatuses.set(taskId, String(body.status));
+        reportWaiters.get(taskId)?.();
+        return { ok: true, data: {} };
+      },
     });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      workers: [{
+        agentId: 'stay-worker', agentType: 'test', preferredProject: project, capabilities: ['code'],
+        execute: async () => ({
+          run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+          changedFiles: [], backend: 'test', model: 'test',
+        }),
+      }],
+      pollIntervalMs: 1_000,
+    });
+
+    // 第一阶段：正常领取并完成 task-first。
+    expect(await runtime.runOnce()).toBe(true);
+    await reportReceived('task-first');
+
+    // 第二阶段：全部受管计划闭环 → plans_terminal 软停机（显式 offline 一次）。
+    phase = 'terminal';
+    expect(await runtime.runOnce()).toBe(false);
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+
+    // 第三阶段：留守轮发现新活跃计划 → slot 以全新 registration epoch 复活并继续领取。
+    phase = 'revived';
+    expect(await runtime.runOnce()).toBe(true);
+    await reportReceived('task-second');
+
+    const registrations = requests
+      .filter((request) => request.path === '/register')
+      .map((request) => (JSON.parse(request.body) as Record<string, unknown>).registration_id as string);
+    // 两次注册必须使用不同 epoch：旧 epoch 已显式 offline，服务端不复活它。
+    expect(registrations).toHaveLength(2);
+    expect(registrations[0]).not.toEqual(registrations[1]);
+    expect(reportedTasks).toEqual(['task-first', 'task-second']);
+    // 复活前后都走真实交付路径（done），不是降级 failed report。
+    expect(reportedStatuses.get('task-first')).toBe('done');
+    expect(reportedStatuses.get('task-second')).toBe('done');
+    // 软停机只发生一次；复活后未再次 offline。
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+  });
+
+  it('maxConcurrentTasks 限制同一轮实际启动的任务数，任务 settle 后下一轮补位', async () => {
+    const project = createTempDir('max-concurrent');
+    const taskQueue = ['task-a', 'task-b'];
+    const claimed: string[] = [];
+    const reportedTasks: string[] = [];
+    const reportWaiters = new Map<string, () => void>();
+    const reportReceived = (taskId: string) => new Promise<void>((resolve) => reportWaiters.set(taskId, resolve));
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const startedTasks: string[] = [];
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => [{
+        plan_id: 'p-cap', status: 'active', project_path: project,
+        tasks: { pending: taskQueue.length, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+      claim: () => {
+        const taskId = taskQueue.shift();
+        if (!taskId || claimed.includes(taskId)) return null;
+        claimed.push(taskId);
+        return {
+          task_id: taskId, title: taskId, type: 'code', phase: 'impl', priority: 5,
+          ownership_files: [], goal_md: '', timeout_seconds: 60, claim_token: `token-${taskId}`,
+          verify: [], project_path: project, plan_id: 'p-cap',
+        };
+      },
+      report: (body) => {
+        const taskId = String(body.task_id);
+        reportedTasks.push(taskId);
+        reportWaiters.get(taskId)?.();
+        return { ok: true, data: {} };
+      },
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      maxConcurrentTasks: 1,
+      workers: ['slot-a', 'slot-b'].map((slotId) => ({
+        agentId: slotId, agentType: 'test', preferredProject: project, capabilities: ['code'],
+        execute: async (task: ClaimedTask) => {
+          startedTasks.push(task.task_id);
+          if (task.task_id === 'task-a') await firstMayFinish;
+          return {
+            run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+            changedFiles: [], backend: 'test', model: 'test',
+          };
+        },
+      })),
+      pollIntervalMs: 1_000,
+    });
+
+    // 第一轮：并发闸 = 1，只允许一个 slot 领取；第二个任务不被领取。
+    expect(await runtime.runOnce()).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(startedTasks).toEqual(['task-a']);
+    expect(claimed).toEqual(['task-a']);
+
+    // 放行第一个任务；settle 触发 wake，下一轮补位领取第二个任务。
+    releaseFirst();
+    await reportReceived('task-a');
+    expect(await runtime.runOnce()).toBe(true);
+    await reportReceived('task-b');
+
+    expect(startedTasks.sort()).toEqual(['task-a', 'task-b']);
+    expect(reportedTasks.sort()).toEqual(['task-a', 'task-b']);
   });
 
   it('signal abort explicitly takes every configured shared Worker offline', async () => {
@@ -814,6 +1076,45 @@ describe('BiaoSupervisorRuntime production transport', () => {
     ]));
   });
 
+  it('同项目同类型的 Kimi slot 不会被前一个 Codex 定向空 claim 饿死', async () => {
+    const projectPath = createTempDir('biao-supervisor-kimi-affinity-');
+    const kimiTask = { ...sampleTask(), task_id: 'kimi-only-task', project_path: projectPath, assignee: 'kimi' };
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => ({ events: [], next_cursor: '0-0' }),
+      plans: () => [{
+        plan_id: 'open-a', status: 'active', project_path: projectPath,
+        tasks: { pending: 1, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+      claim: (body) => body.agent_id === 'kimi-a' ? kimiTask : null,
+    });
+    const execute = async () => ({
+      run: { exitCode: 0, stdout: '', stderr: '', durationMs: 0, timedOut: false },
+      changedFiles: [], backend: 'test', model: 'test',
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      workers: [
+        { agentId: 'codex-a', agentType: 'codex', preferredProject: projectPath, capabilities: ['code'], execute },
+        { agentId: 'kimi-a', agentType: 'kimi', preferredProject: projectPath, capabilities: ['code'], execute },
+      ],
+      pollIntervalMs: 1_000,
+    });
+
+    await runtime.runOnce();
+    const deadline = Date.now() + 1_000;
+    while (!requests.some((request) => request.path === '/report') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const claims = requests.filter((request) => request.path === '/claim').map((request) => JSON.parse(request.body));
+    expect(claims.map((claim) => claim.agent_id)).toEqual(['codex-a', 'kimi-a']);
+    expect(requests.filter((request) => request.path === '/report').map((request) => JSON.parse(request.body))).toEqual([
+      expect.objectContaining({ agent_id: 'kimi-a', task_id: 'kimi-only-task', status: 'done' }),
+    ]);
+  });
+
   it('新计划或新增 pending 任务在下一次共享快照中只唤醒一次 retry claim', async () => {
     let pending = 0;
     const { url, requests } = await startBiaoLikeServer({
@@ -972,11 +1273,13 @@ describe('SharedWorkerCoordinator shutdown serialization', () => {
       }],
     });
 
+    await coordinator.refreshIdlePresence();
     await Promise.all([
       coordinator.offlineAll('supervisor_signal'),
       coordinator.offlineAll('supervisor_exit'),
     ]);
 
+    expect(requests.filter((request) => request.path === '/register')).toHaveLength(1);
     const offline = requests.filter((request) => request.path === '/agent/offline');
     expect(offline).toHaveLength(1);
     expect(JSON.parse(offline[0].body)).toEqual({
@@ -1006,7 +1309,7 @@ describe('SharedWorkerCoordinator shutdown serialization', () => {
     await coordinator.scheduleIfRequested();
 
     expect(wakeSignals).toEqual([]);
-    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(1);
+    expect(requests.filter((request) => request.path === '/agent/offline')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/register')).toHaveLength(0);
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(0);
   });
@@ -1064,5 +1367,67 @@ describe('Supervisor CLI slot validation', () => {
 
     expect(result.status).toBe(1);
     expect(`${result.stdout}\n${result.stderr}`).toMatch(/重复.*agentId|agentId.*重复/);
+  });
+
+  it('拒绝重复 PM consumer，避免两个槽位并发争抢同一待办身份', () => {
+    const lockDir = createTempDir('biao-supervisor-pm-slot-lock-');
+    const script = join(import.meta.dirname, '..', 'scripts', 'supervisor.mjs');
+    const result = spawnSync(process.execPath, [script, '--once', '--biao-url', 'http://127.0.0.1:1'], {
+      cwd: join(import.meta.dirname, '..'),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        BIAO_LOCK_DIR: lockDir,
+        BIAO_WORKER_SLOTS: '',
+        BIAO_PM_SLOTS: JSON.stringify([
+          { id: 'pm-a', consumer: 'shared-consumer', command: process.execPath },
+          { id: 'pm-b', consumer: 'shared-consumer', command: process.execPath },
+        ]),
+      },
+    });
+
+    expect(result.status).toBe(2);
+    expect(`${result.stdout}\n${result.stderr}`).toMatch(/consumer.*重复/);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain('ECONNREFUSED');
+  });
+
+  it('custom slot 默认以 custom agent_type 注册，并允许显式安全 agentType', async () => {
+    const { url, requests } = await startBiaoLikeServer({
+      intake: ({ consumer }) => ({ consumer, cursor: '0-0', counts: {}, items: [] }),
+      events: () => ({ events: [], next_cursor: '0-0' }),
+    });
+    const lockDir = createTempDir('biao-supervisor-custom-slot-');
+    const script = join(import.meta.dirname, '..', 'scripts', 'supervisor.mjs');
+    const child = spawn(process.execPath, [script, '--once', '--biao-url', url], {
+      cwd: join(import.meta.dirname, '..'),
+      env: {
+        ...process.env,
+        BIAO_LOCK_DIR: lockDir,
+        BIAO_PM_SLOTS: '',
+        BIAO_PM_AGENT_ROUTES: '',
+        BIAO_PM_AGENT_CMD: '',
+        BIAO_WORKER_SLOTS: JSON.stringify([
+          { kind: 'custom', agentId: 'unknown-agent', project: '/tmp/a', command: process.execPath },
+          { kind: 'cli', agentId: 'named-agent', agentType: 'external-hht', project: '/tmp/b', command: process.execPath },
+        ]),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', resolve);
+    });
+
+    expect(code).toBe(0);
+    expect(stderr).toBe('');
+    expect(requests.filter((request) => request.path === '/register').map((request) => {
+      const body = JSON.parse(request.body) as { agent_id: string; agent_type: string };
+      return { agentId: body.agent_id, agentType: body.agent_type };
+    })).toEqual([
+      { agentId: 'unknown-agent', agentType: 'custom' },
+      { agentId: 'named-agent', agentType: 'external-hht' },
+    ]);
   });
 });

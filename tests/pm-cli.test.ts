@@ -166,9 +166,10 @@ describe('biao pm unacked / ack', () => {
 });
 
 describe('CLI 帮助列出 pm 子命令', () => {
-  it('总帮助包含统一 pm start 与保留的 intake / unacked / ack', async () => {
+  it('总帮助包含统一 pm start、轻量 heartbeat 与保留的 intake / unacked / ack', async () => {
     const { stdout } = await runCli(['--help']);
     expect(stdout).toContain('biao pm start');
+    expect(stdout).toContain('biao pm heartbeat');
     expect(stdout).toContain('biao pm intake');
     expect(stdout).toContain('biao pm unacked');
     expect(stdout).toContain('biao pm ack');
@@ -182,6 +183,44 @@ describe('CLI 帮助列出 pm 子命令', () => {
     expect(stdout).toContain('question answer');
     expect(stdout).toContain('question_asked');
     expect(stdout).toContain('--plan <id>');
+    expect(stdout).toContain('无待办时静默退出');
+    expect(stdout).toContain('不启动 PM Agent');
+  });
+});
+
+describe('biao pm heartbeat', () => {
+  it('帮助明确先扫状态，空状态不唤醒 PM、不消耗模型 token', async () => {
+    const { stdout } = await runCli(['pm', 'heartbeat', '--help'], { BIAO_URL: 'http://127.0.0.1:1' });
+    expect(stdout).toContain('先读取最小 intake');
+    expect(stdout).toContain('无待办时静默退出');
+    expect(stdout).toContain('不启动 PM Agent');
+    expect(stdout).toContain('共用 Supervisor');
+  });
+
+  it('无 actionable 状态时只扫描一次 intake，绝不执行配置的 PM 命令', async () => {
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, data: { consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] } }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('mock service 未监听');
+    const lockDir = mkdtempSync(join(tmpdir(), 'biao-pm-heartbeat-lock-'));
+    tempRoots.push(lockDir);
+
+    const { stdout, stderr } = await runCli([
+      'pm', 'heartbeat', '--once', '--consumer', 'pm-a', '--lock-dir', lockDir,
+    ], {
+      BIAO_URL: `http://127.0.0.1:${address.port}`,
+      BIAO_PM_AGENT_CMD: '/usr/bin/false',
+    });
+
+    expect(stdout).toBe('');
+    expect(stderr).toBe('');
+    expect(requests).toEqual(['GET /intake?consumer=pm-a']);
   });
 });
 

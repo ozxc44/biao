@@ -8,6 +8,7 @@ import Redis from 'ioredis';
 import { planSubmit, claim, report, agentRegister, getPlan, getTask, getStatus, pmReview } from '../src/server/service.js';
 import { join } from 'node:path';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { keys } from '../src/redis/keys.js';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379/1'; // DB 1 测试隔离（bpi-03）
 let redis: Redis;
@@ -52,6 +53,8 @@ describe('getPlan', () => {
       task_count: 3,
     });
     expect(r.data.tasks.pending).toHaveLength(3);
+    expect(r.data.tasks.pending.every((task: { created_at?: number }) =>
+      typeof task.created_at === 'number' && task.created_at > 0)).toBe(true);
     expect(r.data.tasks.done).toHaveLength(0);
   });
 
@@ -119,17 +122,16 @@ describe('acceptance 失败自动生成修复任务', () => {
 
     expect(r.ok).toBe(true);
     expect(r.data?.fix_tasks_generated).toBeDefined();
-    expect(r.data?.fix_tasks_generated).toHaveLength(2); // T01-fix + T02-fix
+    expect(r.data?.fix_tasks_generated).toHaveLength(0);
 
-    // 修复任务应继承原任务 ownership，priority+1
-    const fixId = r.data!.fix_tasks_generated![0];
-    const fixTask = await getTask(redis, fixId);
-    expect(fixTask.data).not.toBeNull();
-    expect(fixTask.data?.type).toBe('code');
-    expect(fixTask.data?.priority).toBe(6); // 原 priority 5 + 1
-    expect(fixTask.data?.ownership?.files).toContain('apps/server/**');
-    expect(fixTask.data?.depends_on).toEqual([]);
-    expect(fixTask.data?.fix_for).toBe('test-m0-plan-01-be');
+    // 多来源验收失败不能猜测该修哪一个来源；进入最小 PM 决策，不扩散 repair。
+    expect(await redis.hgetall(keys.hash.task('test-m0-plan-03-qa'))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: '',
+    });
+    expect(await redis.exists(keys.hash.task('test-m0-plan-01-be-repair-1'))).toBe(0);
+    expect(await redis.exists(keys.hash.task('test-m0-plan-02-fe-repair-1'))).toBe(0);
   });
 
   it('acceptance 成功时不生成修复任务', async () => {

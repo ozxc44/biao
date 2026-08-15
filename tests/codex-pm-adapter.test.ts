@@ -66,6 +66,93 @@ function run(input: string, env: NodeJS.ProcessEnv = {}) {
 }
 
 describe('Codex PM Agent adapter', () => {
+  it('Supervisor 的通用 PM target 能恢复对应 Codex 会话', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const { bin, capture } = fakeCodex(dir);
+    const threadId = '019ffe19-fc41-7c53-bb7d-4746b1ae583f';
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-routed'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+      BIAO_PM_TARGET: threadId,
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[] };
+    expect(invoked.argv).toContain('resume');
+    expect(invoked.argv).toContain(threadId);
+    expect(invoked.argv).not.toContain('--ephemeral');
+  });
+
+  it('Plan 路由 target 优先于兼容的全局 PM thread，避免唤醒错会话', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const { bin, capture } = fakeCodex(dir);
+    const routedThreadId = '019ffe19-fc41-7c53-bb7d-4746b1ae583f';
+    const legacyThreadId = '019aaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-routed'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+      BIAO_PM_TARGET: routedThreadId,
+      BIAO_PM_THREAD_ID: legacyThreadId,
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[] };
+    expect(invoked.argv).toContain(routedThreadId);
+    expect(invoked.argv).not.toContain(legacyThreadId);
+  });
+
+  it('配置原 PM 会话时必须 resume 该会话，不能另起 ephemeral 会话', () => {
+    const dir = tempDir();
+    const runtimeDir = fakeRuntime(dir);
+    const { bin, capture } = fakeCodex(dir);
+    const threadId = '019ffe19-fc41-7c53-bb7d-4746b1ae583f';
+    const result = run(JSON.stringify({
+      biaoUrl: 'http://127.0.0.1:7331',
+      consumer: 'pm-a',
+      planIds: ['plan-one'],
+      kinds: { review_requested: 1 },
+      count: 1,
+    }), {
+      BIAO_CODEX_BIN: bin,
+      BIAO_RUNTIME_DIR: runtimeDir,
+      BIAO_PREFERRED_PROJECT: dir,
+      BIAO_WORKSPACE_ROOTS: dir,
+      BIAO_PM_THREAD_ID: threadId,
+    });
+
+    expect(result.status).toBe(0);
+    const invoked = JSON.parse(readFileSync(capture, 'utf8')) as { argv: string[]; stdin: string };
+    expect(invoked.argv).toContain('exec');
+    expect(invoked.argv).toContain('resume');
+    expect(invoked.argv).toContain(threadId);
+    expect(invoked.argv).toContain('-');
+    expect(invoked.argv).not.toContain('--ephemeral');
+    expect(invoked.argv).toContain('mcp_servers={}');
+    expect(invoked.argv).toContain('plugins={}');
+    expect(invoked.argv).toContain('apps._default.enabled=false');
+    expect(invoked.argv).toContain('features.apps=false');
+    expect(invoked.argv).toContain('features.plugins=false');
+    expect(invoked.stdin).toContain('plan-one');
+  });
+
   it('把最小门铃转换为可执行 PM 契约，并用临时 Codex 会话处理', () => {
     const dir = tempDir();
     const runtimeDir = fakeRuntime(dir);
@@ -110,11 +197,24 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain("question list --consumer 'pm-a' --status open --plan 'plan-one'");
     expect(invoked.stdin).toContain("question get <question_id> --consumer 'pm-a' --plan 'plan-one'");
     expect(invoked.stdin).toContain("question answer <question_id> --consumer 'pm-a' --plan 'plan-one'");
+    expect(invoked.stdin).toContain('--approve-ownership');
+    expect(invoked.stdin).toContain('--reject-ownership');
+    expect(invoked.stdin).toContain('requested_ownership');
+    expect(invoked.stdin).toContain('不得在缺少所有权决定时反复调用 answer');
     expect(invoked.stdin).toContain("pm unacked --consumer 'pm-a' --plan 'plan-one' --type question_asked --json");
     expect(invoked.stdin).toContain("pm ack --consumer 'pm-a' --plan 'plan-one' --event-id <asked_event_id>");
     expect(invoked.stdin).toContain('question answer');
     expect(invoked.stdin).toContain('review');
+    expect(invoked.stdin).toContain('`reverify-only` 只允许 type=acceptance');
+    expect(invoked.stdin).toContain('多来源 acceptance 若发现具体产品缺陷');
+    expect(invoked.stdin).toContain('正常 reject 会先冻结拒绝审计');
+    expect(invoked.stdin).toContain('普通 code/docs/research 任务');
     expect(invoked.stdin).toContain(`${pmLauncher} task resolution <task_id>`);
+    expect(invoked.stdin).toContain('task resolution 不接受 --plan');
+    expect(invoked.stdin).toContain('task resolution <task_id> --action inspect');
+    expect(invoked.stdin).toContain('--repair-source-task <inspect 返回的合法来源>');
+    expect(invoked.stdin).toContain('来源当前显示 accepted/resolved');
+    expect(invoked.stdin).toContain('不得因“缺少新证据”“来源已解决”或“以前是空交付”保留同一门铃空转');
     expect(invoked.stdin).toContain('--action continue');
     expect(invoked.stdin).toContain('--action cancel');
     expect(invoked.stdin).toContain('只有 continue/cancel 成功后才 ack');
@@ -131,6 +231,8 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain('禁止使用 Computer Use');
     expect(invoked.stdin).toContain('不要读取或调用任何 skill');
     expect(invoked.stdin).toContain('不得改用浏览器');
+    expect(invoked.stdin).toContain('pm intake 在“无待处理事项”时约定退出码为 2');
+    expect(invoked.stdin).toContain('exit 2 是 drained 成功');
     expect(invoked.apiToken).toBeNull();
     expect(invoked.redisUrl).toBeNull();
   });

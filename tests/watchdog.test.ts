@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import Redis from 'ioredis';
 import { join } from 'node:path';
-import { runWatchdog, planSubmit, claim, report, agentRegister, agentOffline, getTask } from '../src/server/service.js';
+import { runWatchdog, planSubmit, claim, report, agentRegister, agentOffline, getTask, reconcileRuntimeState } from '../src/server/service.js';
 import { keys } from '../src/redis/keys.js';
 import { writeTaskToRedis } from '../src/redis/ownership.js';
 
@@ -195,6 +195,34 @@ describe('runWatchdog 问题发现与分类', () => {
 
     // 修复计数正确
     expect(r.data!.summary.fixed).toBe(1);
+  });
+
+  it('同名 Worker 新注册后，即使旧 lease 未过期也回收不再被 Agent 指向的 running 任务', async () => {
+    const { staleTaskId } = await seedProblems();
+    // 先恢复 lease，模拟 Supervisor 停止时 Agent 已退出、但长租约仍在。
+    await redis.set(keys.string.lease(staleTaskId), 'orphan-token', 'PX', 60_000);
+    await agentRegister(
+      redis,
+      'wd-worker',
+      'mock',
+      ['code'],
+      undefined,
+      undefined,
+      'replacement-registration-0001',
+    );
+    expect(await redis.hget(keys.hash.agent('wd-worker'), 'current_task')).toBe('');
+    expect(await redis.get(keys.string.lease(staleTaskId))).toBe('orphan-token');
+
+    const readonly = await runWatchdog(redis);
+    expect(readonly.data?.problems).toContainEqual(expect.objectContaining({
+      type: 'stale_running', task_id: staleTaskId, auto_fixable: true,
+    }));
+
+    const reconciled = await reconcileRuntimeState(redis);
+
+    expect(reconciled.data?.reclaimed).toContain(staleTaskId);
+    expect((await getTask(redis, staleTaskId)).data?.status).toBe('pending');
+    expect(await redis.get(keys.string.lease(staleTaskId))).toBeNull();
   });
 
   it('纯历史 stale idle agent 不进 problems，不影响 healthy', async () => {

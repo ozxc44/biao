@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
   acceptedProgress,
+  BOARD_GROUP_KEYS,
+  buildRootTaskBoard,
+  summarizeRootTaskBoard,
+  getRootCardReviewTarget,
+  getRootAttemptTimeline,
+  getAcceptedClosureKind,
+  getAttemptAuditFacts,
+  projectionIssueToCard,
   countOnlineAgents,
   getPlanAttention,
+  getPlanSummaryProgress,
+  getVisibleRootTaskCards,
   getPlanResolutionSummary,
   getGlobalStatusSummary,
   getStatusHintMessage,
@@ -10,7 +20,7 @@ import {
   partitionAgents,
   validatePlanId,
 } from '../src/view-model';
-import type { AgentInfo, PlanData, TaskSummary } from '../src/api';
+import type { AgentInfo, PlanData, PlanSummary, TaskSummary } from '../src/api';
 
 function task(taskId: string, overrides: Partial<TaskSummary> = {}): TaskSummary {
   return {
@@ -57,6 +67,61 @@ describe('countOnlineAgents', () => {
     ];
 
     expect(countOnlineAgents(agents)).toBe(3);
+  });
+});
+
+describe('getPlanSummaryProgress', () => {
+  it('uses root lifecycle counts and never inflates progress with repair attempts', () => {
+    const plan: PlanSummary = {
+      plan_id: 'root-count-plan', title: 'root-count-plan', status: 'failed', project_path: '/tmp',
+      task_count: 21, runtime_task_count: 130,
+      root_tasks: {
+        total: 21, pending: 1, running: 2, blocked: 1, review_pending: 3,
+        accepted: 12, failed: 0, needs_pm_decision: 1, cancelled: 1,
+        declared_total: 21, consistent: true,
+      },
+    };
+    expect(getPlanSummaryProgress(plan, 0)).toEqual({
+      accepted: 12,
+      total: 20,
+      percent: 60,
+      reviewPending: 3,
+      pending: 1,
+      repairing: 3,
+      resolved: 0,
+      needsPmDecision: 1,
+      action: 'decision',
+    });
+  });
+});
+
+describe('getVisibleRootTaskCards', () => {
+  it('shows only the latest five cards by default and all cards when expanded', () => {
+    const cards = Array.from({ length: 7 }, (_, index) => {
+      const root = task(`root-${index + 1}`, {
+        status: 'done',
+        pm_review_status: 'accepted',
+        created_at: (index + 1) * 100,
+      });
+      return { root, actionTask: root, repairs: [], group: 'accepted' as const };
+    });
+
+    expect(getVisibleRootTaskCards(cards, false).map((card) => card.root.task_id))
+      .toEqual(['root-7', 'root-6', 'root-5', 'root-4', 'root-3']);
+    expect(getVisibleRootTaskCards(cards, true)).toHaveLength(7);
+  });
+
+  it('uses the current repair timestamp when ordering a root card', () => {
+    const olderRoot = task('older-root', { created_at: 100 });
+    const recentRepair = task('recent-repair', { created_at: 900, fix_for: olderRoot.task_id });
+    const newerRoot = task('newer-root', { created_at: 500 });
+    const cards = [
+      { root: olderRoot, actionTask: recentRepair, repairs: [recentRepair], group: 'running' as const },
+      { root: newerRoot, actionTask: newerRoot, repairs: [], group: 'running' as const },
+    ];
+
+    expect(getVisibleRootTaskCards(cards, false).map((card) => card.root.task_id))
+      .toEqual(['older-root', 'newer-root']);
   });
 });
 
@@ -155,6 +220,23 @@ describe('acceptedProgress', () => {
       pending: 0,
       action: 'complete',
     });
+  });
+
+  it('excludes roots cancelled through the resolution lifecycle from the effective total', () => {
+    const tasks = taskBuckets({
+      done: [
+        task('accepted', { status: 'done', pm_review_status: 'accepted' }),
+        task('rejected-cancelled', {
+          status: 'done', pm_review_status: 'rejected', resolution_status: 'cancelled',
+        }),
+      ],
+      failed: [task('failed-cancelled', { status: 'failed', resolution_status: 'cancelled' })],
+      cancelled: [task('direct-cancelled', { status: 'cancelled' })],
+    });
+
+    expect(buildRootTaskBoard(tasks).cancelled).toHaveLength(3);
+    expect(acceptedProgress(tasks, 4)).toEqual({ accepted: 1, total: 1, percent: 100 });
+    expect(getPlanAttention(tasks, 4, 0).action).toBe('complete');
   });
 });
 
@@ -299,6 +381,295 @@ describe('groupTasksForBoard', () => {
     expect(acceptedProgress(tasks, 1)).toEqual({ accepted: 1, total: 1, percent: 100 });
     expect(getPlanResolutionSummary(tasks)).toMatchObject({ resolved: 1, repairing: 0, needsPmDecision: 0 });
     expect(getPlanAttention(tasks, 1, 0)).toMatchObject({ accepted: 1, resolved: 1, action: 'complete' });
+  });
+});
+
+describe('buildRootTaskBoard', () => {
+  it('keeps every recorded failure, review, cancellation, and supersede fact on the selected attempt', () => {
+    const attempt = task('audited-attempt', {
+      failure_reason: 'worker failed',
+      pm_reject_reason: 'PM rejected',
+      blocked_reason: 'waiting for owner',
+      cancel_reason: 'cancelled by closure',
+      superseded_reason: 'replaced by canonical task',
+    });
+
+    expect(getAttemptAuditFacts(attempt)).toEqual([
+      { kind: 'failure', value: 'worker failed' },
+      { kind: 'rejected', value: 'PM rejected' },
+      { kind: 'blocked', value: 'waiting for owner' },
+      { kind: 'cancelled', value: 'cancelled by closure' },
+      { kind: 'superseded', value: 'replaced by canonical task' },
+    ]);
+  });
+
+  it('builds a selectable immutable timeline from the root and every repair or reverify attempt', () => {
+    const root = task('root', {
+      status: 'done', pm_review_status: 'rejected', resolution_status: 'resolved',
+      resolution_action: 'reverify', resolution_task_id: 'root-reverify-2',
+      resolution_task_ids: ['root-repair-1', 'root-reverify-2'],
+      resolved_by_task: 'root-reverify-2',
+    });
+    const repair = task('root-repair-1', {
+      status: 'done', pm_review_status: 'rejected', fix_for: 'root', repair_root_task_id: 'root',
+    });
+    const reverify = task('root-reverify-2', {
+      status: 'done', type: 'acceptance', pm_review_status: 'accepted',
+      fix_for: 'root-repair-1', repair_root_task_id: 'root',
+    });
+    const card = {
+      root, repairs: [repair, reverify], actionTask: reverify, group: 'accepted' as const,
+      auditOrigin: 'rejected' as const,
+    };
+
+    expect(getRootAttemptTimeline(card)).toEqual([
+      { task: root, role: 'root', isCurrent: false, isResolvedBy: false },
+      { task: repair, role: 'repair', isCurrent: false, isResolvedBy: false },
+      { task: reverify, role: 'reverify', isCurrent: true, isResolvedBy: true },
+    ]);
+  });
+
+  it('labels accepted roots by the actual closure path without treating attempts as new roots', () => {
+    const original = task('original', { status: 'done', pm_review_status: 'accepted' });
+    const repairedRoot = task('repaired', {
+      status: 'failed', resolution_status: 'resolved', resolution_action: 'repair',
+      resolution_task_id: 'repaired-repair-1', resolution_task_ids: ['repaired-repair-1'],
+      resolved_by_task: 'repaired-repair-1',
+    });
+    const repair = task('repaired-repair-1', {
+      status: 'done', pm_review_status: 'accepted', fix_for: 'repaired', repair_root_task_id: 'repaired',
+    });
+    const reverifiedRoot = task('reverified', {
+      status: 'failed', resolution_status: 'resolved', resolution_action: 'reverify',
+      resolution_task_id: 'reverified-reverify-1', resolution_task_ids: ['reverified-reverify-1'],
+      resolved_by_task: 'reverified-reverify-1',
+    });
+    const reverify = task('reverified-reverify-1', {
+      status: 'done', type: 'acceptance', pm_review_status: 'accepted',
+      fix_for: 'reverified', repair_root_task_id: 'reverified',
+    });
+
+    expect(getAcceptedClosureKind({ root: original, repairs: [], actionTask: original, group: 'accepted' })).toBe('original');
+    expect(getAcceptedClosureKind({ root: repairedRoot, repairs: [repair], actionTask: repair, group: 'accepted' })).toBe('repair');
+    expect(getAcceptedClosureKind({ root: reverifiedRoot, repairs: [reverify], actionTask: reverify, group: 'accepted' })).toBe('reverify');
+  });
+
+  it('shows an active current attempt ahead of a stale needs-PM-decision marker', () => {
+    const tasks = taskBuckets({
+      failed: [task('root', {
+        status: 'failed', resolution_status: 'needs_pm_decision',
+        resolution_task_id: 'root-reverify-3', resolution_task_ids: ['root-reverify-3'],
+      })],
+      running: [task('root-reverify-3', {
+        status: 'running', fix_for: 'root', repair_root_task_id: 'root',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(board.running.map((card) => card.root.task_id)).toEqual(['root']);
+    expect(board.failed).toHaveLength(0);
+  });
+
+  it('renders one logical card per declared root and folds repair attempts into its lineage', () => {
+    const tasks = taskBuckets({
+      done: [
+        task('root-a', {
+          status: 'done',
+          pm_review_status: 'rejected',
+          resolution_status: 'resolved',
+          resolution_task_id: 'root-a-repair-2',
+          resolution_task_ids: ['root-a-repair-1', 'root-a-repair-2'],
+          resolved_by_task: 'root-a-repair-2',
+        }),
+        task('root-a-repair-1', {
+          status: 'done', fix_for: 'root-a', repair_root_task_id: 'root-a', pm_review_status: 'rejected',
+        }),
+        task('root-a-repair-2', {
+          status: 'done', fix_for: 'root-a-repair-1', repair_root_task_id: 'root-a', pm_review_status: 'accepted',
+        }),
+        task('root-b', { status: 'done', pm_review_status: 'accepted' }),
+      ],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(BOARD_GROUP_KEYS.flatMap((group) => board[group])).toHaveLength(2);
+    expect(new Set(board.accepted.map((card) => card.root.task_id))).toEqual(new Set(['root-a', 'root-b']));
+    const rootA = board.accepted.find((card) => card.root.task_id === 'root-a');
+    expect(rootA?.repairs.map((item) => item.task_id)).toEqual(['root-a-repair-1', 'root-a-repair-2']);
+    expect(rootA?.auditOrigin).toBe('rejected');
+  });
+
+  it('uses the active repair as the action target without counting it as a second task', () => {
+    const tasks = taskBuckets({
+      done: [task('root', {
+        status: 'done',
+        pm_review_status: 'rejected',
+        resolution_status: 'required',
+        resolution_task_id: 'root-repair-1',
+        resolution_task_ids: ['root-repair-1'],
+      }), task('root-repair-1', {
+        status: 'done', fix_for: 'root', repair_root_task_id: 'root',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(board.review_pending).toHaveLength(1);
+    expect(board.review_pending[0].root.task_id).toBe('root');
+    expect(board.review_pending[0].actionTask.task_id).toBe('root-repair-1');
+    expect(getRootCardReviewTarget(board.review_pending[0])?.task_id).toBe('root-repair-1');
+  });
+
+  it('fails closed when an explicit current repair pointer is missing instead of reviewing another attempt', () => {
+    const tasks = taskBuckets({
+      done: [task('root', {
+        status: 'done', pm_review_status: 'rejected', resolution_status: 'required',
+        resolution_task_id: 'missing-repair', resolution_task_ids: ['root-repair-1'],
+      }), task('root-repair-1', {
+        status: 'done', fix_for: 'root', repair_root_task_id: 'root',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(board.review_pending).toHaveLength(0);
+    const auditCard = [...board.rejected, ...board.failed][0];
+    expect(auditCard).toBeTruthy();
+    expect(auditCard.actionTask.task_id).toBe('root');
+    expect(auditCard.dataIssue).toMatch(/current repair/i);
+    expect(getRootCardReviewTarget(auditCard)).toBeNull();
+  });
+
+  it('fails closed when the explicit current repair belongs to another root', () => {
+    const tasks = taskBuckets({
+      done: [
+        task('root-a', {
+          status: 'done', pm_review_status: 'rejected', resolution_status: 'required',
+          resolution_task_id: 'root-b-repair', resolution_task_ids: ['root-a-repair'],
+        }),
+        task('root-a-repair', {
+          status: 'done', fix_for: 'root-a', repair_root_task_id: 'root-a',
+        }),
+        task('root-b', {
+          status: 'done', pm_review_status: 'rejected', resolution_status: 'required',
+          resolution_task_id: 'root-b-repair', resolution_task_ids: ['root-b-repair'],
+        }),
+        task('root-b-repair', {
+          status: 'done', fix_for: 'root-b', repair_root_task_id: 'root-b',
+        }),
+      ],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    const rootA = BOARD_GROUP_KEYS.flatMap((group) => board[group])
+      .find((card) => card.root.task_id === 'root-a');
+    expect(rootA?.dataIssue).toMatch(/current repair/i);
+    expect(rootA && getRootCardReviewTarget(rootA)).toBeNull();
+    expect(getRootCardReviewTarget(board.review_pending[0])?.task_id).toBe('root-b-repair');
+  });
+
+  it('does not accept a resolved root unless resolved_by is its own done and accepted repair', () => {
+    const tasks = taskBuckets({
+      done: [task('root', {
+        status: 'done', pm_review_status: 'rejected', resolution_status: 'resolved',
+        resolution_task_id: 'root-repair-1', resolution_task_ids: ['root-repair-1'],
+        resolved_by_task: 'root-repair-1',
+      }), task('root-repair-1', {
+        status: 'done', fix_for: 'root', repair_root_task_id: 'root', pm_review_status: 'rejected',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(board.accepted).toHaveLength(0);
+    expect(board.rejected).toHaveLength(1);
+    expect(board.rejected[0].dataIssue).toMatch(/resolved/i);
+    expect(acceptedProgress(tasks, 1)).toEqual({ accepted: 0, total: 1, percent: 0 });
+    expect(getPlanAttention(tasks, 1, 0).action).not.toBe('complete');
+  });
+
+  it('keeps orphan repair records out of the declared root card count and exposes a projection issue', () => {
+    const tasks = taskBuckets({
+      done: [task('root', { status: 'done', pm_review_status: 'accepted' })],
+      failed: [task('orphan-repair', {
+        status: 'failed', fix_for: 'missing-parent', repair_root_task_id: 'missing-root',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(BOARD_GROUP_KEYS.flatMap((group) => board[group])).toHaveLength(1);
+    expect(board.projectionIssues.map((issue) => issue.task.task_id)).toEqual(['orphan-repair']);
+    const orphanCard = projectionIssueToCard(board.projectionIssues[0]);
+    expect(orphanCard.root.task_id).toBe('orphan-repair');
+    expect(orphanCard.group).toBe('failed');
+    expect(BOARD_GROUP_KEYS.flatMap((group) => board[group])).not.toContain(orphanCard);
+  });
+
+  it('folds a legacy attempt with repair_root_task_id but no fix_for into its root and reports the malformed lineage', () => {
+    const tasks = taskBuckets({
+      done: [
+        task('root', { status: 'done', pm_review_status: 'accepted' }),
+        task('legacy-attempt', {
+          status: 'done', pm_review_status: 'rejected', repair_root_task_id: 'root',
+        }),
+      ],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(BOARD_GROUP_KEYS.flatMap((group) => board[group])).toHaveLength(1);
+    expect(board.accepted[0].repairs.map((item) => item.task_id)).toContain('legacy-attempt');
+    expect(board.projectionIssues.map((issue) => issue.task.task_id)).toContain('legacy-attempt');
+  });
+
+  it('includes root card data issues in the projection issue summary', () => {
+    const tasks = taskBuckets({
+      done: [task('root', {
+        status: 'done', pm_review_status: 'rejected', resolution_status: 'repairing',
+        resolution_task_id: 'missing-repair', resolution_task_ids: ['missing-repair'],
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    const rootCard = BOARD_GROUP_KEYS.flatMap((group) => board[group])
+      .find((card) => card.root.task_id === 'root');
+    expect(rootCard?.dataIssue).toBeTruthy();
+    expect(board.projectionIssues.map((issue) => issue.task.task_id)).toEqual(['root']);
+  });
+
+  it('summarizes mutually exclusive root cards against the declared task count', () => {
+    const tasks = taskBuckets({
+      pending: [task('pending', { status: 'pending' })],
+      running: [task('running', { status: 'running' })],
+      done: [
+        task('review', { status: 'done' }),
+        task('accepted', { status: 'done', pm_review_status: 'accepted' }),
+        task('rejected', { status: 'done', pm_review_status: 'rejected' }),
+      ],
+      failed: [task('failed', { status: 'failed' })],
+      blocked: [task('blocked', { status: 'blocked' })],
+      cancelled: [task('cancelled', { status: 'cancelled' })],
+      superseded: [task('superseded', { status: 'superseded' })],
+    });
+
+    const summary = summarizeRootTaskBoard(buildRootTaskBoard(tasks), 9);
+    expect(summary.visibleTotal).toBe(9);
+    expect(summary.matchesDeclared).toBe(true);
+    expect(summary.active).toBe(2);
+    expect(summary.audit).toBe(2);
+    expect(summarizeRootTaskBoard(buildRootTaskBoard(tasks), 10).matchesDeclared).toBe(false);
+  });
+
+  it('keeps an accepted child with an unresolved root out of accepted', () => {
+    const tasks = taskBuckets({
+      done: [task('root', {
+        status: 'done', pm_review_status: 'rejected', resolution_status: 'repairing',
+        resolution_task_id: 'root-repair-1', resolution_task_ids: ['root-repair-1'],
+      }), task('root-repair-1', {
+        status: 'done', fix_for: 'root', repair_root_task_id: 'root', pm_review_status: 'accepted',
+      })],
+    });
+
+    const board = buildRootTaskBoard(tasks);
+    expect(board.accepted).toHaveLength(0);
+    expect(board.failed).toHaveLength(1);
+    expect(board.failed[0].dataIssue).toBeTruthy();
   });
 });
 

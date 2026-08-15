@@ -17,7 +17,9 @@ import {
   claim,
   getPlan,
   getPlans,
+  getTasks,
   getReviewInfo,
+  getResolutionDecision,
   getStatus,
   getTask,
   pmIntake,
@@ -28,8 +30,10 @@ import {
   cancelTask,
   reconcileResolutionBacklog,
   reconcileRuntimeState,
+  replayAcceptedRepairSideEffects,
   resolutionDecision,
   runWatchdog,
+  taskReset,
   unackedEvents,
 } from '../src/server/service.js';
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
@@ -93,6 +97,27 @@ async function claimAs(agentId: string) {
 }
 
 describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
+  it('task list 分页时 total 始终报告完整匹配数，不把当前页长度伪装成总数', async () => {
+    for (let index = 0; index < 105; index++) {
+      const taskId = `paged-task-${String(index).padStart(3, '0')}`;
+      await seedTask(taskId);
+      if (index >= 102) {
+        await redis.zrem(keys.zset.status.pending, taskId);
+        await redis.zadd(keys.zset.status.failed, index, taskId);
+        await redis.hset(keys.hash.task(taskId), { status: 'failed' });
+      }
+    }
+
+    const first = await getTasks(redis, { plan_id: 'autonomous-plan', limit: 100 });
+    expect(first.data).toMatchObject({ total: 105, offset: 0, limit: 100, has_more: true });
+    expect(first.data?.tasks).toHaveLength(100);
+
+    const second = await getTasks(redis, { plan_id: 'autonomous-plan', limit: 100, offset: 100 });
+    expect(second.data).toMatchObject({ total: 105, offset: 100, limit: 100, has_more: false });
+    expect(second.data?.tasks).toHaveLength(5);
+    expect(second.data?.tasks.filter((task) => task.status === 'failed')).toHaveLength(3);
+  });
+
   it('continue 在 BEGIN 后、创建 child 前中断时，reconcile 从持久 intent 恢复且不重复 child', async () => {
     const taskId = 'continue-before-child-breakpoint';
     await seedTask(taskId, { max_retries: 1 });
@@ -220,6 +245,114 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     });
     expect(recoveredAudits).toHaveLength(1);
     contender.disconnect();
+  });
+
+  it('acceptance continue 持锁创建新 reverify 期间，后台 reconcile 不得把根改回 PM 决策', async () => {
+    const sourceId = 'continue-race-source';
+    const rootId = 'continue-race-acceptance';
+    const oldReverifyId = `${rootId}-reverify-2`;
+    const owner = 'continue-owner-token';
+    await seedTask(sourceId);
+    await redis.zrem(keys.zset.status.pending, sourceId);
+    await redis.zadd(keys.zset.status.done, 60_000, sourceId);
+    await redis.hset(keys.hash.task(sourceId), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      resolution_status: 'resolved',
+    });
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: [sourceId],
+      depends_on: [sourceId],
+      max_retries: 2,
+    });
+    await seedTask(oldReverifyId, {
+      type: 'acceptance',
+      acceptance_for: [sourceId],
+      depends_on: [sourceId],
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: 2,
+    });
+    await redis.zrem(keys.zset.status.pending, rootId, oldReverifyId);
+    await redis.zadd(keys.zset.status.failed, 60_001, rootId, 60_002, oldReverifyId);
+    await redis.hset(keys.hash.task(oldReverifyId), { status: 'failed' });
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'repairing',
+      resolution_action: 'continue',
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      resolution_task_id: oldReverifyId,
+      resolution_task_ids: oldReverifyId,
+      resolution_decision_reason: 'reverify_retry_limit_reached',
+      resolution_continue_owner: owner,
+      resolution_continue_snapshot_generation: '2',
+      resolution_continue_snapshot_reason: 'reverify_retry_limit_reached',
+    });
+    await redis.set(keys.string.pmReviewLock(rootId), owner, 'PX', 60_000);
+
+    expect(await reconcileResolutionBacklog(redis)).toMatchObject({
+      needs_pm_decision_task_ids: [],
+    });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_action: 'continue',
+      resolution_continue_owner: owner,
+      resolution_task_id: oldReverifyId,
+    });
+  });
+
+  it('旧 failed reverify 比根任务先被扫描时，不得撤销根当前的 pending reverify', async () => {
+    const sourceId = 'reverify-order-source';
+    const rootId = 'reverify-order-root';
+    const oldId = `${rootId}-reverify-1`;
+    const currentId = `${rootId}-reverify-2`;
+    await seedTask(sourceId);
+    await redis.zrem(keys.zset.status.pending, sourceId);
+    await redis.zadd(keys.zset.status.done, 70_000, sourceId);
+    await redis.hset(keys.hash.task(sourceId), { status: 'done', pm_review_status: 'accepted' });
+    await seedTask(rootId, {
+      type: 'acceptance', acceptance_for: [sourceId], depends_on: [sourceId], max_retries: 2,
+    });
+    for (const [id, generation] of [[oldId, 1], [currentId, 2]] as const) {
+      await seedTask(id, {
+        type: 'acceptance', acceptance_for: [sourceId], depends_on: [sourceId],
+        fix_for: rootId, repair_root_task_id: rootId, resolution_generation: generation,
+      });
+    }
+    await redis.zrem(keys.zset.status.pending, rootId, oldId);
+    await redis.zadd(keys.zset.status.failed, 1, oldId, 2, rootId);
+    await redis.hset(keys.hash.task(oldId), {
+      status: 'failed',
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: '1',
+    });
+    await redis.hset(keys.hash.task(currentId), {
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+      resolution_generation: '2',
+    });
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      resolution_task_id: currentId,
+      resolution_task_ids: `${oldId},${currentId}`,
+      resolution_decision_reason: '',
+    });
+
+    expect(await reconcileResolutionBacklog(redis)).toMatchObject({ needs_pm_decision_task_ids: [] });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+      resolution_task_id: currentId,
+    });
+    expect(await redis.hget(keys.hash.task(currentId), 'status')).toBe('pending');
+    expect(await redis.exists(keys.hash.task(`${sourceId}-repair-1`))).toBe(0);
   });
 
   it('legacy 空 generation/attempts 的首次 continue 只创建一个 child 与一条审计', async () => {
@@ -429,6 +562,73 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect(await redis.hget(keys.hash.task('failed-code'), 'status')).toBe('failed');
   });
 
+  it('repair 进入普通 pending 队列并继承来源的 Worker 类型与模型亲和', async () => {
+    await seedTask('kimi-affinity-source', {
+      assignee: 'kimi',
+      model_override: 'kimi-code/k3-affinity',
+      verify: [{ cmd: 'npm test', expect_exit: 0 }],
+    });
+    await agentRegister(redis, 'kimi-source-worker', 'kimi', ['code']);
+    const claimed = await claim(redis, {
+      agent_id: 'kimi-source-worker', blocking: false, timeout_ms: 1,
+    });
+    expect(claimed.data?.task_id).toBe('kimi-affinity-source');
+    expect(claimed.data?.model_override).toBe('kimi-code/k3-affinity');
+
+    expect((await report(redis, {
+      task_id: 'kimi-affinity-source',
+      agent_id: 'kimi-source-worker',
+      claim_token: claimed.data!.claim_token,
+      status: 'failed',
+      verify_results: [{ cmd: 'npm test', exit_code: 1, passed: false }],
+    })).ok).toBe(true);
+
+    expect(await redis.hgetall(keys.hash.task('kimi-affinity-source-repair-1'))).toMatchObject({
+      status: 'pending',
+      assignee: 'kimi',
+      model_override: 'kimi-code/k3-affinity',
+    });
+    expect(await redis.zrange(keys.zset.status.pending, 0, -1)).toContain('kimi-affinity-source-repair-1');
+
+    await agentRegister(redis, 'codex-affinity-worker', 'codex', ['code']);
+    expect((await claim(redis, {
+      agent_id: 'codex-affinity-worker', blocking: false, timeout_ms: 1,
+    })).data).toBeNull();
+    await agentRegister(redis, 'kimi-repair-worker', 'kimi', ['code']);
+    expect((await claim(redis, {
+      agent_id: 'kimi-repair-worker', blocking: false, timeout_ms: 1,
+    })).data).toMatchObject({
+      task_id: 'kimi-affinity-source-repair-1',
+      model_override: 'kimi-code/k3-affinity',
+    });
+  });
+
+  it('异常 child 把旧的精确 agentId 归一为 agent_type，避免同一 Agent 自验收或离线后堆积', async () => {
+    await seedTask('exact-agent-source', {
+      assignee: 'kimi-exact-1',
+      model_override: 'kimi-code/k3',
+      verify: [{ cmd: 'npm test', expect_exit: 0 }],
+    });
+    await agentRegister(redis, 'kimi-exact-1', 'kimi', ['code']);
+    const claimed = await claim(redis, {
+      agent_id: 'kimi-exact-1', blocking: false, timeout_ms: 1,
+    });
+    expect(claimed.data?.task_id).toBe('exact-agent-source');
+    expect((await report(redis, {
+      task_id: 'exact-agent-source',
+      agent_id: 'kimi-exact-1',
+      claim_token: claimed.data!.claim_token,
+      status: 'failed',
+      verify_results: [{ cmd: 'npm test', exit_code: 1, passed: false }],
+    })).ok).toBe(true);
+
+    expect(await redis.hgetall(keys.hash.task('exact-agent-source-repair-1'))).toMatchObject({
+      status: 'pending',
+      assignee: 'kimi',
+      model_override: 'kimi-code/k3',
+    });
+  });
+
   it.each(['failed', 'partial'] as const)(
     '实时 acceptance report %s 遇到空 acceptance_for 时 fail-closed，只提醒一次 PM 且不生成 repair',
     async (status) => {
@@ -525,6 +725,1244 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect(generated).toBeTruthy();
     const repair = await claimAs('acceptance-repair-worker');
     expect(repair.data?.task_id).toBe(generated);
+  });
+
+  it('多来源 acceptance 失败时 fail-closed，不重开已 accepted 来源也不在 reconcile 中膨胀 lineage', async () => {
+    for (const sourceId of ['multi-source-a', 'multi-source-b']) {
+      await seedTask(sourceId);
+      const claimed = await claimAs(`${sourceId}-worker`);
+      await report(redis, {
+        task_id: sourceId,
+        agent_id: `${sourceId}-worker`,
+        claim_token: claimed.data!.claim_token,
+        status: 'done',
+      });
+      expect((await pmReview(redis, sourceId, {
+        verdict: 'accept', reviewed_by: 'pm-autonomous',
+      })).ok).toBe(true);
+    }
+    await seedTask('multi-source-acceptance', {
+      type: 'acceptance',
+      depends_on: ['multi-source-a', 'multi-source-b'],
+      acceptance_for: ['multi-source-a', 'multi-source-b'],
+    });
+    const acceptance = await claimAs('multi-source-reviewer');
+    const failed = await report(redis, {
+      task_id: 'multi-source-acceptance',
+      agent_id: 'multi-source-reviewer',
+      claim_token: acceptance.data!.claim_token,
+      status: 'failed',
+      verify_results: [{ cmd: 'multi-source acceptance', exit_code: 1, passed: false }],
+    });
+
+    expect(failed.data?.fix_tasks_generated ?? []).toEqual([]);
+    expect(await redis.hgetall(keys.hash.task('multi-source-acceptance'))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_attempts: '0',
+      resolution_task_ids: '',
+    });
+    for (const sourceId of ['multi-source-a', 'multi-source-b']) {
+      expect(await redis.hgetall(keys.hash.task(sourceId))).toMatchObject({
+        status: 'done',
+        pm_review_status: 'accepted',
+        resolution_status: '',
+      });
+      expect(await redis.exists(keys.hash.task(`${sourceId}-repair-1`))).toBe(0);
+    }
+
+    const before = await redis.hmget(
+      keys.hash.task('multi-source-acceptance'),
+      'resolution_attempts',
+      'resolution_task_ids',
+      'resolution_task_id',
+    );
+    await reconcileRuntimeState(redis);
+    await reconcileRuntimeState(redis);
+    expect(await redis.hmget(
+      keys.hash.task('multi-source-acceptance'),
+      'resolution_attempts',
+      'resolution_task_ids',
+      'resolution_task_id',
+    )).toEqual(before);
+  });
+
+  it('多来源 acceptance 的 retry-limit 原因点名来源时，continue 只续派该来源而不 fan-out', async () => {
+    for (const sourceId of ['targeted-source-a', 'targeted-source-b']) {
+      await seedTask(sourceId, { assignee: sourceId.endsWith('-b') ? 'kimi' : 'codex' });
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done',
+        pm_review_status: 'accepted',
+        pm_reviewed_by: `pm-${sourceId}`,
+        done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'targeted-multi-acceptance';
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      acceptance_for: ['targeted-source-a', 'targeted-source-b'],
+      depends_on: ['targeted-source-a', 'targeted-source-b'],
+      max_retries: 2,
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: 'repair_retry_limit_reached:targeted-source-b',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+    });
+
+    const continued = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-targeted-repair',
+    });
+
+    expect(continued).toMatchObject({
+      ok: true,
+      data: {
+        root_task_id: acceptanceId,
+        state: 'repairing',
+        action: 'reverify',
+        created_task_ids: ['targeted-source-b-repair-1'],
+      },
+    });
+    expect(await redis.exists(keys.hash.task('targeted-source-a-repair-1'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task('targeted-source-b-repair-1'))).toMatchObject({
+      status: 'pending',
+      type: 'code',
+      assignee: 'kimi',
+      fix_for: 'targeted-source-b',
+      repair_root_task_id: 'targeted-source-b',
+    });
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+    });
+  });
+
+  it('历史多来源验收拒绝必须由 PM 点名返修来源，continue 只续派该来源', async () => {
+    for (const sourceId of ['selected-source-a', 'selected-source-b']) {
+      await seedTask(sourceId, { assignee: sourceId.endsWith('-b') ? 'kimi' : 'codex' });
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'selected-multi-acceptance';
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      acceptance_for: ['selected-source-a', 'selected-source-b'],
+      depends_on: ['selected-source-a', 'selected-source-b'],
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.done, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${acceptanceId}`,
+    });
+
+    expect(await getResolutionDecision(redis, acceptanceId)).toMatchObject({
+      ok: true,
+      data: {
+        repair_source_candidates: ['selected-source-a', 'selected-source-b'],
+      },
+    });
+
+    expect((await resolutionDecision(redis, acceptanceId, {
+      action: 'continue', decided_by: 'pm-selector',
+    })).error?.code).toBe('REPAIR_SOURCE_TASK_REQUIRED');
+    expect((await resolutionDecision(redis, acceptanceId, {
+      action: 'continue', decided_by: 'pm-selector', repair_source_task_id: 'not-a-source',
+    })).error?.code).toBe('INVALID_REPAIR_SOURCE_TASK');
+
+    const continued = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue', decided_by: 'pm-selector', repair_source_task_id: 'selected-source-b',
+    });
+    expect(continued).toMatchObject({
+      ok: true,
+      data: { created_task_ids: ['selected-source-b-repair-1'] },
+    });
+    expect(await redis.exists(keys.hash.task('selected-source-a-repair-1'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task('selected-source-b-repair-1'))).toMatchObject({
+      fix_for: 'selected-source-b',
+      assignee: 'kimi',
+      trigger_review_task_id: acceptanceId,
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+      resolution_decision_reason: '',
+      acceptance_repair_task_ids: 'selected-source-b-repair-1',
+    });
+  });
+
+  it('显式选源 repair 被拒绝后只重新打开 acceptance，不短暂再生来源根门铃', async () => {
+    // fixture 需要让旧 acceptance review 的审计时间晚于本轮真实 reject，才能模拟
+    // 生产中的单调时间序。余量必须远大于整测套件负载下的时钟漂移（曾用 +100ms
+    // 导致全量运行时偶发“最新不可变拒绝记录”选序翻转），固定 10s/20s 消除竞态。
+    const seededReviewAt = Date.now() + 10_000;
+    const laterReviewAt = seededReviewAt + 10_000;
+    for (const sourceId of ['reselect-source-a', 'reselect-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'reselect-acceptance';
+    const reviewId = `${acceptanceId}-reverify-1`;
+    const latestReviewId = `${acceptanceId}-reverify-2`;
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      acceptance_for: ['reselect-source-a', 'reselect-source-b'],
+      depends_on: ['reselect-source-a', 'reselect-source-b'],
+    });
+    await seedTask(reviewId, {
+      type: 'acceptance',
+      acceptance_for: ['reselect-source-a', 'reselect-source-b'],
+      depends_on: ['reselect-source-a', 'reselect-source-b'],
+      fix_for: acceptanceId,
+      repair_root_task_id: acceptanceId,
+    });
+    await seedTask(latestReviewId, {
+      type: 'acceptance',
+      acceptance_for: ['reselect-source-a', 'reselect-source-b'],
+      depends_on: ['reselect-source-a', 'reselect-source-b'],
+      fix_for: acceptanceId,
+      repair_root_task_id: acceptanceId,
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId, reviewId, latestReviewId);
+    await redis.zadd(
+      keys.zset.status.done,
+      Date.now(), acceptanceId,
+      Date.now() + 1, reviewId,
+      Date.now() + 2, latestReviewId,
+    );
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'done', pm_review_status: 'rejected',
+      resolution_status: 'needs_pm_decision', resolution_action: 'inspect',
+      resolution_task_id: latestReviewId, resolution_task_ids: `${reviewId},${latestReviewId}`,
+      resolution_generation: '2', resolution_attempts: '2',
+      resolution_decision_reason: `repair_sources_required:${reviewId}`,
+    });
+    await redis.hset(keys.hash.task(reviewId), {
+      status: 'done', pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      pm_reject_reason: '实时 applying 状态不可观察',
+      pm_review_comment: '真实 E2E 未看到 applying 过渡态',
+      pm_fix_instructions: '保持 applying 可观察，并补段落和表格时序断言',
+      fix_for: acceptanceId, repair_root_task_id: acceptanceId,
+    });
+    await redis.hset(keys.hash.task(latestReviewId), {
+      status: 'done', pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      pm_reject_reason: '最新拒绝：快速同步仍缺少可观察状态',
+      pm_review_comment: '最新真实 E2E 仍未看到 applying',
+      pm_fix_instructions: '以最新拒绝为准补齐时序状态机',
+      pm_reviewed_at: String(seededReviewAt),
+      fix_for: acceptanceId, repair_root_task_id: acceptanceId,
+    });
+
+    expect(await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-reselect',
+      repair_source_task_id: 'reselect-source-b',
+    })).toMatchObject({
+      ok: true,
+      data: { created_task_ids: ['reselect-source-b-repair-1'] },
+    });
+
+    const repairId = 'reselect-source-b-repair-1';
+    expect(await redis.hget(keys.hash.task(repairId), 'goal_md')).toContain(
+      `触发本轮返修的不可变验收记录：\`${latestReviewId}\``,
+    );
+    expect(await redis.hget(keys.hash.task(repairId), 'goal_md')).toContain(
+      '最新真实 E2E 仍未看到 applying',
+    );
+    expect(await redis.hget(keys.hash.task(repairId), 'goal_md')).toContain(
+      '以最新拒绝为准补齐时序状态机',
+    );
+    await redis.zrem(keys.zset.status.pending, repairId);
+    await redis.zadd(keys.zset.status.done, Date.now(), repairId);
+    await redis.hset(keys.hash.task(repairId), {
+      status: 'done', done_at: String(Date.now()), claimed_by: 'worker-reselect',
+    });
+    const rejected = await pmReview(redis, repairId, {
+      verdict: 'reject',
+      reviewed_by: 'pm-reselect-reviewer',
+      reject_reason: '修复仍不完整',
+      fix_instructions: '重新选择来源并补齐闭环',
+    });
+
+    expect(rejected).toMatchObject({
+      ok: true,
+      data: { task_id: repairId, review_status: 'rejected', fix_task_ids: [] },
+    });
+    expect(await redis.hgetall(keys.hash.task('reselect-source-b'))).toMatchObject({
+      status: 'done', pm_review_status: 'accepted', resolution_status: '', resolution_task_id: '',
+    });
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${repairId}`,
+    });
+    const intake = await pmIntake(redis, { consumer: 'pm-autonomous' });
+    expect(intake.data?.items.filter((item) => item.kind === 'resolution_required').map((item) => item.task_id))
+      .toEqual([acceptanceId]);
+    expect(await redis.exists(keys.hash.task('reselect-source-b-repair-2'))).toBe(0);
+
+    // fixture 的旧 acceptance review 使用了未来时间；把本轮真实后继 reject 调整为
+    // 单调更晚，模拟生产中不可变审计的正常时间顺序。
+    await redis.hset(keys.hash.task(repairId), 'pm_reviewed_at', String(laterReviewAt));
+    await reconcileResolutionBacklog(redis);
+    expect(await redis.hget(keys.hash.task(acceptanceId), 'resolution_decision_reason'))
+      .toBe(`repair_sources_required:${repairId}`);
+    expect(await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-reselect-next',
+      repair_source_task_id: 'reselect-source-b',
+    })).toMatchObject({
+      ok: true,
+      data: { created_task_ids: ['reselect-source-b-repair-2'] },
+    });
+    const nextGoal = await redis.hget(keys.hash.task('reselect-source-b-repair-2'), 'goal_md');
+    expect(nextGoal).toContain(`触发本轮返修的不可变验收记录：\`${repairId}\``);
+    expect(nextGoal).toContain('修复仍不完整');
+    expect(nextGoal).toContain('重新选择来源并补齐闭环');
+  });
+
+  it('已闭合来源的迟到 sibling reject 只保留审计，不重开验收选源', async () => {
+    const now = Date.now();
+    for (const sourceId of ['stale-audit-source-a', 'stale-audit-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, now, sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(now),
+      });
+    }
+    const rootId = 'stale-audit-acceptance';
+    const winnerId = 'stale-audit-source-a-repair-1';
+    const siblingId = 'stale-audit-source-a-repair-2';
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: ['stale-audit-source-a', 'stale-audit-source-b'],
+      depends_on: ['stale-audit-source-a', 'stale-audit-source-b'],
+      max_retries: 2,
+    });
+    await seedTask(winnerId);
+    await seedTask(siblingId);
+    await redis.zrem(keys.zset.status.pending, rootId, winnerId, siblingId);
+    await redis.zadd(keys.zset.status.failed, now, rootId);
+    await redis.zadd(keys.zset.status.done, now + 1, winnerId, now + 2, siblingId);
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      pm_reviewed_at: String(now),
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${siblingId}`,
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      acceptance_repair_task_ids: `${winnerId},${siblingId}`,
+    });
+    await redis.hset(keys.hash.task('stale-audit-source-a'), {
+      resolution_status: 'resolved',
+      resolution_action: 'repair',
+      resolution_task_id: winnerId,
+      resolution_task_ids: `${winnerId},${siblingId}`,
+      resolved_by_task: winnerId,
+    });
+    await redis.hset(keys.hash.task(winnerId), {
+      status: 'done', pm_review_status: 'accepted',
+      // 未来时间戳只用于固化“winner 早于迟到 sibling reject”的审计顺序；余量放大到
+      // 10s/20s，避免整测套件负载下真实时钟越过 ±1s 窗口翻转选序（同上例竞态）。
+      pm_reviewed_at: String(now + 10_000),
+      fix_for: 'stale-audit-source-a', repair_root_task_id: 'stale-audit-source-a',
+    });
+    await redis.hset(keys.hash.task(siblingId), {
+      status: 'done', pm_review_status: 'rejected',
+      pm_reviewed_at: String(now + 20_000),
+      fix_for: 'stale-audit-source-a', repair_root_task_id: 'stale-audit-source-a',
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: 'reverify_retry_limit_reached',
+      resolution_task_id: '',
+    });
+    expect(await redis.exists(keys.hash.task('stale-audit-source-a-repair-3'))).toBe(0);
+  });
+
+  it('一条验收拒绝要求多个来源时，PM 可一次选定最小返修子集', async () => {
+    const sourceIds = ['batch-source-a', 'batch-source-b', 'batch-source-c'];
+    for (const sourceId of sourceIds) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'batch-source-acceptance';
+    await seedTask(acceptanceId, {
+      type: 'acceptance', acceptance_for: sourceIds, depends_on: sourceIds,
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.done, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'done', pm_review_status: 'rejected',
+      resolution_status: 'needs_pm_decision', resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${acceptanceId}`,
+    });
+
+    const continued = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-batch-selector',
+      repair_source_task_ids: ['batch-source-a', 'batch-source-c'],
+    });
+
+    expect(continued).toMatchObject({
+      ok: true,
+      data: { created_task_ids: ['batch-source-a-repair-1', 'batch-source-c-repair-1'] },
+    });
+    expect(await redis.exists(keys.hash.task('batch-source-b-repair-1'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task('batch-source-a-repair-1'))).toMatchObject({
+      trigger_review_task_id: acceptanceId,
+    });
+    expect(await redis.hgetall(keys.hash.task('batch-source-c-repair-1'))).toMatchObject({
+      trigger_review_task_id: acceptanceId,
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+      resolution_decision_reason: '',
+      acceptance_repair_task_ids: 'batch-source-a-repair-1,batch-source-c-repair-1',
+    });
+  });
+
+  it('已在 needs_pm_decision 的多来源验收会以最新不可变 reject 更正旧的错误来源归因', async () => {
+    for (const sourceId of ['migrated-source-a', 'migrated-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    const rootId = 'migrated-multi-acceptance';
+    const reviewId = `${rootId}-reverify-6`;
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: ['migrated-source-a', 'migrated-source-b'],
+      depends_on: ['migrated-source-a', 'migrated-source-b'],
+    });
+    await seedTask(reviewId, {
+      type: 'acceptance',
+      acceptance_for: ['migrated-source-a', 'migrated-source-b'],
+      depends_on: ['migrated-source-a', 'migrated-source-b'],
+    });
+    await redis.zrem(keys.zset.status.pending, rootId, reviewId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), rootId);
+    await redis.zadd(keys.zset.status.done, Date.now(), reviewId);
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: reviewId,
+      resolution_task_ids: reviewId,
+      resolution_decision_reason: 'repair_retry_limit_reached:migrated-source-b',
+    });
+    await redis.hset(keys.hash.task(reviewId), {
+      status: 'done',
+      done_at: String(Date.now()),
+      pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      fix_for: rootId,
+      repair_root_task_id: rootId,
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${reviewId}`,
+    });
+  });
+
+  it('启动补偿会撤销越过最新 repair reject 的未领取复验，并改为 PM 选源决策', async () => {
+    for (const sourceId of ['gated-source-a', 'gated-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    const rootId = 'gated-multi-acceptance';
+    const rejectedId = `${rootId}-reverify-2`;
+    const failedId = `${rootId}-reverify-3`;
+    const pendingId = `${rootId}-reverify-4`;
+    await seedTask(rootId, {
+      type: 'acceptance',
+      acceptance_for: ['gated-source-a', 'gated-source-b'],
+      depends_on: ['gated-source-a', 'gated-source-b'],
+    });
+    for (const id of [rejectedId, failedId, pendingId]) {
+      await seedTask(id, {
+        type: 'acceptance',
+        acceptance_for: ['gated-source-a', 'gated-source-b'],
+        depends_on: ['gated-source-a', 'gated-source-b'],
+      });
+      await redis.hset(keys.hash.task(id), { fix_for: rootId, repair_root_task_id: rootId });
+    }
+    await redis.zrem(keys.zset.status.pending, rootId, rejectedId, failedId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), rootId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), failedId);
+    await redis.zadd(keys.zset.status.done, Date.now(), rejectedId);
+    await redis.hset(keys.hash.task(rootId), {
+      status: 'failed',
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+      resolution_task_id: pendingId,
+      resolution_task_ids: `${rejectedId},${failedId},${pendingId}`,
+    });
+    await redis.hset(keys.hash.task(rejectedId), {
+      status: 'done', done_at: String(Date.now() - 1_000),
+      pm_review_status: 'rejected', pm_rejection_resolution_mode: 'repair',
+      pm_reviewed_at: String(Date.now()),
+    });
+    await redis.hset(keys.hash.task(failedId), {
+      status: 'failed', done_at: String(Date.now() + 1_000),
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task(pendingId))).toMatchObject({
+      status: 'cancelled',
+      resolution_decision_reason: 'acceptance_repair_required',
+    });
+    expect(await redis.hgetall(keys.hash.task(rootId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `repair_sources_required:${rejectedId}`,
+    });
+  });
+
+  it('多来源 acceptance 的 reverify Worker 自身失败后，显式 continue 只重排独立复验、不误修来源', async () => {
+    for (const sourceId of ['child-reverify-source-a', 'child-reverify-source-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done',
+        pm_review_status: 'accepted',
+        done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'child-reverify-multi-acceptance';
+    const failedReverifyId = `${acceptanceId}-reverify-1`;
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      acceptance_for: ['child-reverify-source-a', 'child-reverify-source-b'],
+      depends_on: ['child-reverify-source-a', 'child-reverify-source-b'],
+      max_retries: 2,
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_decision_reason: `multi_source_acceptance_failure:${failedReverifyId}`,
+      resolution_task_id: failedReverifyId,
+      resolution_task_ids: failedReverifyId,
+      resolution_generation: '1',
+      resolution_attempts: '1',
+    });
+    await seedTask(failedReverifyId, {
+      type: 'acceptance',
+      acceptance_for: ['child-reverify-source-a', 'child-reverify-source-b'],
+      depends_on: ['child-reverify-source-a', 'child-reverify-source-b'],
+      fix_for: acceptanceId,
+      repair_root_task_id: acceptanceId,
+    });
+    await redis.zrem(keys.zset.status.pending, failedReverifyId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), failedReverifyId);
+    await redis.hset(keys.hash.task(failedReverifyId), { status: 'failed' });
+
+    const continued = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-child-reverify',
+    });
+
+    expect(continued).toMatchObject({
+      ok: true,
+      data: {
+        root_task_id: acceptanceId,
+        created_task_ids: [`${acceptanceId}-reverify-2`],
+      },
+    });
+    expect(await redis.hgetall(keys.hash.task(`${acceptanceId}-reverify-2`))).toMatchObject({
+      status: 'pending',
+      type: 'acceptance',
+      fix_for: acceptanceId,
+      repair_root_task_id: acceptanceId,
+      trigger_review_task_id: failedReverifyId,
+    });
+    expect(await redis.exists(keys.hash.task('child-reverify-source-a-repair-1'))).toBe(0);
+    expect(await redis.exists(keys.hash.task('child-reverify-source-b-repair-1'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+    });
+  });
+
+  it('错误排队的 reverify 即使交付也不能越过未闭合的 repair 决定直接 accept', async () => {
+    await seedTask('guard-source');
+    await redis.zrem(keys.zset.status.pending, 'guard-source');
+    await redis.zadd(keys.zset.status.done, 10, 'guard-source');
+    await redis.hset(keys.hash.task('guard-source'), {
+      status: 'done', pm_review_status: 'accepted', pm_reviewed_at: '10', done_at: '9',
+    });
+    await seedTask('guard-acceptance', {
+      type: 'acceptance', acceptance_for: ['guard-source'], depends_on: ['guard-source'],
+    });
+    await redis.zrem(keys.zset.status.pending, 'guard-acceptance');
+    await redis.zadd(keys.zset.status.done, 20, 'guard-acceptance');
+    await redis.hset(keys.hash.task('guard-acceptance'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      pm_rejection_resolution_mode: 'repair',
+      pm_reviewed_at: '20',
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+      resolution_task_id: 'guard-acceptance-reverify-1',
+      resolution_task_ids: 'guard-acceptance-reverify-1',
+      resolution_generation: '1',
+    });
+    await seedTask('guard-acceptance-reverify-1', {
+      type: 'acceptance',
+      acceptance_for: ['guard-source'],
+      depends_on: ['guard-source'],
+      fix_for: 'guard-acceptance',
+      repair_root_task_id: 'guard-acceptance',
+    });
+    await redis.zrem(keys.zset.status.pending, 'guard-acceptance-reverify-1');
+    await redis.zadd(keys.zset.status.done, 30, 'guard-acceptance-reverify-1');
+    await redis.hset(keys.hash.task('guard-acceptance-reverify-1'), {
+      status: 'done',
+      claimed_by: 'review-worker',
+      done_at: '30',
+      fix_for: 'guard-acceptance',
+      repair_root_task_id: 'guard-acceptance',
+    });
+
+    expect(await pmReview(redis, 'guard-acceptance-reverify-1', {
+      verdict: 'accept', reviewed_by: 'pm',
+    })).toMatchObject({
+      ok: false,
+      error: { code: 'ACCEPTANCE_REPAIR_REQUIRED' },
+    });
+    expect(await redis.hget(keys.hash.task('guard-acceptance-reverify-1'), 'pm_review_status')).toBeFalsy();
+  });
+
+  it('升级 reconcile 会清理多来源 acceptance 的跨根 lineage 与虚高 attempts', async () => {
+    for (const sourceId of ['legacy-multi-a', 'legacy-multi-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+      await seedTask(`${sourceId}-repair-1`, {
+        fix_for: sourceId,
+        repair_root_task_id: sourceId,
+      });
+      await redis.zrem(keys.zset.status.pending, `${sourceId}-repair-1`);
+      await redis.zadd(keys.zset.status.done, Date.now(), `${sourceId}-repair-1`);
+      await redis.hset(keys.hash.task(`${sourceId}-repair-1`), {
+        status: 'done', pm_review_status: 'accepted', done_at: String(Date.now()),
+      });
+    }
+    await seedTask('legacy-multi-acceptance', {
+      type: 'acceptance',
+      depends_on: ['legacy-multi-a', 'legacy-multi-b'],
+      acceptance_for: ['legacy-multi-a', 'legacy-multi-b'],
+    });
+    await redis.zrem(keys.zset.status.pending, 'legacy-multi-acceptance');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'legacy-multi-acceptance');
+    await redis.hset(keys.hash.task('legacy-multi-acceptance'), {
+      status: 'failed',
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+      resolution_task_id: 'legacy-multi-b-repair-1',
+      resolution_task_ids: 'legacy-multi-a-repair-1,legacy-multi-b-repair-1',
+      resolution_generation: '0',
+      resolution_attempts: '157',
+    });
+
+    await reconcileResolutionBacklog(redis);
+    expect(await redis.hgetall(keys.hash.task('legacy-multi-acceptance'))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: '',
+      resolution_task_ids: '',
+      resolution_generation: '0',
+      resolution_attempts: '0',
+      resolution_decision_reason: 'multi_source_acceptance_failure:legacy-multi-acceptance',
+    });
+    expect(await redis.hgetall(keys.hash.task('legacy-multi-a'))).toMatchObject({
+      status: 'done', pm_review_status: 'accepted', resolution_status: '',
+    });
+  });
+
+  it('已取消的多来源 acceptance Worker failure 由显式 continue 重开独立复验、不 fan-out 来源', async () => {
+    for (const sourceId of ['cancelled-multi-a', 'cancelled-multi-b']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done',
+        pm_review_status: 'accepted',
+        pm_reviewed_by: `implementer-${sourceId}`,
+        done_at: String(Date.now()),
+      });
+    }
+    const acceptanceId = 'cancelled-multi-acceptance';
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      depends_on: ['cancelled-multi-a', 'cancelled-multi-b'],
+      acceptance_for: ['cancelled-multi-a', 'cancelled-multi-b'],
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'failed',
+      resolution_status: 'cancelled',
+      resolution_action: 'cancel',
+      resolution_decision_reason: `cancelled:multi_source_acceptance_failure:${acceptanceId}`,
+    });
+
+    expect((await resolutionDecision(redis, acceptanceId, {
+      action: 'inspect',
+      decided_by: 'pm-reverify',
+    })).data).toMatchObject({
+      state: 'cancelled',
+      available_actions: ['inspect', 'continue'],
+    });
+    const continued = await resolutionDecision(redis, acceptanceId, {
+      action: 'continue',
+      decided_by: 'pm-reverify',
+    });
+    expect(continued).toMatchObject({
+      ok: true,
+      data: { created_task_ids: [`${acceptanceId}-reverify-1`] },
+    });
+    expect(await redis.hgetall(keys.hash.task(`${acceptanceId}-reverify-1`))).toMatchObject({
+      status: 'pending', type: 'acceptance', repair_root_task_id: acceptanceId,
+    });
+    expect(await redis.exists(keys.hash.task('cancelled-multi-a-repair-1'))).toBe(0);
+    expect(await redis.exists(keys.hash.task('cancelled-multi-b-repair-1'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      status: 'failed',
+      resolution_status: 'required',
+      resolution_action: 'reverify',
+    });
+  });
+
+  it('升级 reconcile 只撤销多来源 acceptance 错误扩散的 pending repair，保留已开始现场', async () => {
+    const acceptanceId = 'legacy-fanout-acceptance';
+    for (const sourceId of ['legacy-fanout-pending', 'legacy-fanout-running']) {
+      await seedTask(sourceId);
+      await redis.zrem(keys.zset.status.pending, sourceId);
+      await redis.zadd(keys.zset.status.done, Date.now(), sourceId);
+      await redis.hset(keys.hash.task(sourceId), {
+        status: 'done',
+        pm_review_status: 'accepted',
+        done_at: String(Date.now()),
+        resolution_status: 'repairing',
+        resolution_action: 'repair',
+        resolution_task_id: `${sourceId}-repair-1`,
+        resolution_task_ids: `${sourceId}-repair-1`,
+        resolution_generation: '1',
+        resolution_attempts: '1',
+      });
+      await seedTask(`${sourceId}-repair-1`, {
+        fix_for: sourceId,
+        repair_root_task_id: sourceId,
+      });
+      await redis.hset(keys.hash.task(`${sourceId}-repair-1`), {
+        fix_for: sourceId,
+        repair_root_task_id: sourceId,
+        goal_md: `# 修复\n\n原任务 ${sourceId} 因独立验收失败进入修复闭环。\n\n原因：独立验收任务 ${acceptanceId} 失败。`,
+      });
+    }
+    await redis.zrem(keys.zset.status.pending, 'legacy-fanout-running-repair-1');
+    await redis.zadd(keys.zset.status.running, Date.now(), 'legacy-fanout-running-repair-1');
+    await redis.hset(keys.hash.task('legacy-fanout-running-repair-1'), {
+      status: 'running',
+      claimed_by: 'existing-kimi',
+      claim_token: 'existing-claim',
+    });
+
+    await seedTask(acceptanceId, {
+      type: 'acceptance',
+      depends_on: ['legacy-fanout-pending', 'legacy-fanout-running'],
+      acceptance_for: ['legacy-fanout-pending', 'legacy-fanout-running'],
+    });
+    await redis.zrem(keys.zset.status.pending, acceptanceId);
+    await redis.zadd(keys.zset.status.failed, Date.now(), acceptanceId);
+    await redis.hset(keys.hash.task(acceptanceId), {
+      status: 'failed',
+      acceptance_repair_task_ids: [
+        'legacy-fanout-pending-repair-1',
+        'legacy-fanout-running-repair-1',
+      ].join(','),
+      resolution_status: 'repairing',
+      resolution_action: 'reverify',
+      resolution_task_id: 'legacy-fanout-pending-repair-1',
+      resolution_task_ids: 'legacy-fanout-pending-repair-1,legacy-fanout-running-repair-1',
+      resolution_attempts: '9',
+    });
+
+    expect(await redis.hmget(
+      keys.hash.task('legacy-fanout-pending-repair-1'),
+      'repair_root_task_id',
+      'goal_md',
+      'status',
+    )).toEqual([
+      'legacy-fanout-pending',
+      `# 修复\n\n原任务 legacy-fanout-pending 因独立验收失败进入修复闭环。\n\n原因：独立验收任务 ${acceptanceId} 失败。`,
+      'pending',
+    ]);
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task('legacy-fanout-pending-repair-1'))).toMatchObject({
+      status: 'cancelled',
+      cancel_reason: `旧版多来源验收 ${acceptanceId} 错误扩散的未领取修复，平台升级后自动撤销`,
+      resolution_decision_reason: `legacy_multi_source_acceptance_fanout_cancelled:${acceptanceId}`,
+    });
+    expect(await redis.zscore(keys.zset.status.pending, 'legacy-fanout-pending-repair-1')).toBeNull();
+    expect(await redis.zscore(keys.zset.status.cancelled, 'legacy-fanout-pending-repair-1')).not.toBeNull();
+    expect(await redis.hgetall(keys.hash.task('legacy-fanout-pending'))).toMatchObject({
+      status: 'done',
+      pm_review_status: 'accepted',
+      resolution_status: '',
+      resolution_task_id: '',
+      resolution_task_ids: '',
+    });
+
+    expect(await redis.hgetall(keys.hash.task('legacy-fanout-running-repair-1'))).toMatchObject({
+      status: 'running',
+      claimed_by: 'existing-kimi',
+      claim_token: 'existing-claim',
+    });
+    expect(await redis.hgetall(keys.hash.task('legacy-fanout-running'))).toMatchObject({
+      resolution_status: 'repairing',
+      resolution_task_id: 'legacy-fanout-running-repair-1',
+      resolution_task_ids: 'legacy-fanout-running-repair-1',
+    });
+    expect(await redis.hgetall(keys.hash.task(acceptanceId))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: '',
+      resolution_task_ids: '',
+      resolution_attempts: '0',
+      acceptance_repair_task_ids: 'legacy-fanout-running-repair-1',
+    });
+  });
+
+  it('升级 reconcile 会撤销 accepted 根被旧验收错误生成的未领取 repair', async () => {
+    await seedTask('accepted-reopened-root');
+    const source = await claimAs('accepted-reopened-worker');
+    await report(redis, {
+      task_id: 'accepted-reopened-root',
+      agent_id: 'accepted-reopened-worker',
+      claim_token: source.data!.claim_token,
+      status: 'done',
+    });
+    await pmReview(redis, 'accepted-reopened-root', { verdict: 'accept', reviewed_by: 'pm-autonomous' });
+    await seedTask('accepted-reopened-root-repair-1', {
+      fix_for: 'accepted-reopened-root',
+      repair_root_task_id: 'accepted-reopened-root',
+    });
+    await redis.hset(keys.hash.task('accepted-reopened-root-repair-1'), {
+      fix_for: 'accepted-reopened-root',
+      repair_root_task_id: 'accepted-reopened-root',
+      goal_md: '# 修复\n\n原任务因独立验收失败进入修复闭环。',
+    });
+    await redis.hset(keys.hash.task('accepted-reopened-root'), {
+      resolution_status: 'repairing',
+      resolution_action: 'repair',
+      resolution_task_id: 'accepted-reopened-root-repair-1',
+      resolution_task_ids: 'accepted-reopened-root-repair-1',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+    });
+
+    await reconcileResolutionBacklog(redis);
+    expect(await redis.hgetall(keys.hash.task('accepted-reopened-root'))).toMatchObject({
+      status: 'done',
+      pm_review_status: 'accepted',
+      resolution_status: '',
+      resolution_action: '',
+      resolution_task_id: '',
+    });
+    expect(await redis.hgetall(keys.hash.task('accepted-reopened-root-repair-1'))).toMatchObject({
+      status: 'cancelled',
+      fix_for: 'accepted-reopened-root',
+      repair_root_task_id: 'accepted-reopened-root',
+      resolution_decision_reason: 'accepted_root_legacy_repair_cancelled',
+    });
+    expect(await redis.zscore(keys.zset.status.pending, 'accepted-reopened-root-repair-1')).toBeNull();
+  });
+
+  it('clean accepted 来源被单来源独立验收推翻时进入可审计 repair', async () => {
+    await seedTask('accepted-terminal-source');
+    const source = await claimAs('accepted-terminal-worker');
+    await report(redis, {
+      task_id: 'accepted-terminal-source',
+      agent_id: 'accepted-terminal-worker',
+      claim_token: source.data!.claim_token,
+      status: 'done',
+    });
+    await pmReview(redis, 'accepted-terminal-source', { verdict: 'accept', reviewed_by: 'pm-autonomous' });
+    await seedTask('accepted-terminal-check', {
+      type: 'acceptance',
+      depends_on: ['accepted-terminal-source'],
+      acceptance_for: ['accepted-terminal-source'],
+    });
+    const acceptance = await claimAs('accepted-terminal-reviewer');
+    await report(redis, {
+      task_id: 'accepted-terminal-check',
+      agent_id: 'accepted-terminal-reviewer',
+      claim_token: acceptance.data!.claim_token,
+      status: 'failed',
+    });
+
+    expect(await redis.hgetall(keys.hash.task('accepted-terminal-source'))).toMatchObject({
+      status: 'done', pm_review_status: 'accepted', resolution_status: 'repairing',
+    });
+    expect(await redis.hgetall(keys.hash.task('accepted-terminal-source-repair-1'))).toMatchObject({
+      status: 'pending', fix_for: 'accepted-terminal-source',
+    });
+    expect(await redis.hget(keys.hash.task('accepted-terminal-check'), 'resolution_status')).toBe('repairing');
+
+    await redis.zrem(keys.zset.status.pending, 'accepted-terminal-source-repair-1');
+    await reconcileResolutionBacklog(redis);
+    expect(await redis.zscore(keys.zset.status.pending, 'accepted-terminal-source-repair-1')).not.toBeNull();
+  });
+
+  it('reconcile terminalizes a pending child while its root is waiting for PM decision', async () => {
+    await seedTask('decision-paused-root');
+    await redis.zrem(keys.zset.status.pending, 'decision-paused-root');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'decision-paused-root');
+    await redis.hset(keys.hash.task('decision-paused-root'), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: 'decision-paused-root-repair-1',
+      resolution_task_ids: 'decision-paused-root-repair-1',
+      resolution_decision_reason: 'repair_ownership_intent_marker_invalid:test',
+    });
+    await seedTask('decision-paused-root-repair-1', {
+      fix_for: 'decision-paused-root', repair_root_task_id: 'decision-paused-root',
+    });
+    await redis.hset(keys.hash.task('decision-paused-root-repair-1'), {
+      fix_for: 'decision-paused-root', repair_root_task_id: 'decision-paused-root',
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task('decision-paused-root-repair-1'))).toMatchObject({
+      status: 'cancelled',
+      resolution_decision_reason: 'resolution_waiting_for_pm_decision',
+    });
+    expect(await redis.zscore(keys.zset.status.pending, 'decision-paused-root-repair-1')).toBeNull();
+    expect(await redis.hgetall(keys.hash.task('decision-paused-root'))).toMatchObject({
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_task_id: 'decision-paused-root-repair-1',
+    });
+  });
+
+  it('reconcile restores the latest accepted lineage winner instead of keeping a stale continue child active', async () => {
+    await seedTask('accepted-winner-root');
+    await redis.zrem(keys.zset.status.pending, 'accepted-winner-root');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'accepted-winner-root');
+    await redis.hset(keys.hash.task('accepted-winner-root'), {
+      status: 'done', pm_review_status: 'rejected',
+      resolution_status: 'needs_pm_decision', resolution_action: 'inspect',
+      resolution_task_id: 'accepted-winner-root-repair-2',
+      resolution_task_ids: 'accepted-winner-root-repair-1,accepted-winner-root-repair-2',
+      resolution_decision_reason: 'repair_ownership_intent_marker_invalid:test',
+    });
+    for (const [taskId, status, review] of [
+      ['accepted-winner-root-repair-1', 'done', 'accepted'],
+      ['accepted-winner-root-repair-2', 'pending', ''],
+    ] as const) {
+      await seedTask(taskId);
+      await redis.zrem(keys.zset.status.pending, taskId);
+      await redis.zadd((keys.zset.status as Record<string, string>)[status], Date.now(), taskId);
+      await redis.hset(keys.hash.task(taskId), {
+        status, pm_review_status: review, fix_for: 'accepted-winner-root',
+        repair_root_task_id: 'accepted-winner-root',
+        ...(review === 'accepted' ? { pm_accept_effects_applied: 'true' } : {}),
+      });
+    }
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task('accepted-winner-root'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolution_task_id: 'accepted-winner-root-repair-1',
+      resolved_by_task: 'accepted-winner-root-repair-1',
+    });
+    expect(await redis.hgetall(keys.hash.task('accepted-winner-root-repair-2'))).toMatchObject({
+      status: 'cancelled',
+    });
+  });
+
+  it('explicit continue refuses to create a new generation when the lineage already has an accepted winner', async () => {
+    await seedTask('continue-after-accepted-root');
+    await redis.zrem(keys.zset.status.pending, 'continue-after-accepted-root');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'continue-after-accepted-root');
+    await redis.hset(keys.hash.task('continue-after-accepted-root'), {
+      status: 'failed', resolution_status: 'needs_pm_decision', resolution_action: 'inspect',
+      resolution_task_id: 'continue-after-accepted-root-repair-1',
+      resolution_task_ids: 'continue-after-accepted-root-repair-1',
+      resolution_decision_reason: 'repair_retry_limit_reached',
+      resolution_attempts: '1', resolution_generation: '1', max_retries: '1',
+    });
+    await seedTask('continue-after-accepted-root-repair-1');
+    await redis.zrem(keys.zset.status.pending, 'continue-after-accepted-root-repair-1');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'continue-after-accepted-root-repair-1');
+    await redis.hset(keys.hash.task('continue-after-accepted-root-repair-1'), {
+      status: 'done', pm_review_status: 'accepted', pm_accept_effects_applied: 'true',
+      fix_for: 'continue-after-accepted-root', repair_root_task_id: 'continue-after-accepted-root',
+    });
+
+    const continued = await resolutionDecision(redis, 'continue-after-accepted-root', {
+      action: 'continue', decided_by: 'pm-stale',
+    });
+
+    expect(continued).toMatchObject({ ok: false, error: { code: 'RESOLUTION_ALREADY_RESOLVED' } });
+    expect(await redis.exists(keys.hash.task('continue-after-accepted-root-repair-2'))).toBe(0);
+    expect(await redis.hgetall(keys.hash.task('continue-after-accepted-root'))).toMatchObject({
+      resolution_status: 'resolved', resolved_by_task: 'continue-after-accepted-root-repair-1',
+    });
+  });
+
+  it('cancel of a redundant rejected generation retains an earlier accepted winner and repairs legacy cancelled state', async () => {
+    await seedTask('cancel-after-accepted-root');
+    await redis.zrem(keys.zset.status.pending, 'cancel-after-accepted-root');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'cancel-after-accepted-root');
+    await redis.hset(keys.hash.task('cancel-after-accepted-root'), {
+      status: 'done', pm_review_status: 'accepted',
+      resolution_status: 'cancelled', resolution_action: 'cancel',
+      resolution_task_id: 'cancel-after-accepted-root-repair-2',
+      resolution_task_ids: 'cancel-after-accepted-root-repair-1,cancel-after-accepted-root-repair-2',
+      resolution_decision_reason: 'cancelled:repair_retry_limit_reached',
+      resolution_attempts: '2', resolution_generation: '2', max_retries: '2',
+    });
+    await seedTask('cancel-after-accepted-root-repair-1', {
+      fix_for: 'cancel-after-accepted-root',
+      repair_root_task_id: 'cancel-after-accepted-root',
+    });
+    await redis.zrem(keys.zset.status.pending, 'cancel-after-accepted-root-repair-1');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'cancel-after-accepted-root-repair-1');
+    await redis.hset(keys.hash.task('cancel-after-accepted-root-repair-1'), {
+      status: 'done', pm_review_status: 'accepted', pm_accept_effects_applied: 'true',
+      fix_for: 'cancel-after-accepted-root', repair_root_task_id: 'cancel-after-accepted-root',
+    });
+    await seedTask('cancel-after-accepted-root-repair-2', {
+      fix_for: 'cancel-after-accepted-root',
+      repair_root_task_id: 'cancel-after-accepted-root',
+    });
+    await redis.zrem(keys.zset.status.pending, 'cancel-after-accepted-root-repair-2');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'cancel-after-accepted-root-repair-2');
+    await redis.hset(keys.hash.task('cancel-after-accepted-root-repair-2'), {
+      status: 'done', pm_review_status: 'rejected',
+      fix_for: 'cancel-after-accepted-root', repair_root_task_id: 'cancel-after-accepted-root',
+    });
+
+    const cancelled = await resolutionDecision(redis, 'cancel-after-accepted-root', {
+      action: 'cancel', decided_by: 'pm-clean-redundant-generation',
+    });
+
+    expect(cancelled).toMatchObject({
+      ok: true,
+      data: {
+        root_task_id: 'cancel-after-accepted-root',
+        state: 'resolved',
+        latest_repair_id: 'cancel-after-accepted-root-repair-1',
+      },
+    });
+    expect(await redis.hgetall(keys.hash.task('cancel-after-accepted-root'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolved_by_task: 'cancel-after-accepted-root-repair-1',
+    });
+  });
+
+  it('a multi-generation accepted winner becomes the current pointer on every ancestor', async () => {
+    await seedTask('winner-pointer-root');
+    await seedTask('winner-pointer-root-repair-1', {
+      fix_for: 'winner-pointer-root', repair_root_task_id: 'winner-pointer-root',
+    });
+    await seedTask('winner-pointer-root-repair-2', {
+      fix_for: 'winner-pointer-root-repair-1', repair_root_task_id: 'winner-pointer-root',
+    });
+    await redis.zrem(
+      keys.zset.status.pending,
+      'winner-pointer-root',
+      'winner-pointer-root-repair-1',
+      'winner-pointer-root-repair-2',
+    );
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'winner-pointer-root');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'winner-pointer-root-repair-1');
+    await redis.zadd(keys.zset.status.done, Date.now(), 'winner-pointer-root-repair-2');
+    await redis.hset(keys.hash.task('winner-pointer-root'), {
+      status: 'failed', resolution_status: 'repairing',
+      resolution_task_id: 'winner-pointer-root-repair-1',
+      resolution_task_ids: 'winner-pointer-root-repair-1,winner-pointer-root-repair-2',
+    });
+    await redis.hset(keys.hash.task('winner-pointer-root-repair-1'), {
+      status: 'done', pm_review_status: 'rejected', fix_for: 'winner-pointer-root',
+      repair_root_task_id: 'winner-pointer-root',
+    });
+    await redis.hset(keys.hash.task('winner-pointer-root-repair-2'), {
+      status: 'done', pm_review_status: 'accepted', fix_for: 'winner-pointer-root-repair-1',
+      repair_root_task_id: 'winner-pointer-root', pm_accept_effects_applied: 'true',
+    });
+
+    await reconcileResolutionBacklog(redis);
+
+    expect(await redis.hgetall(keys.hash.task('winner-pointer-root'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolution_task_id: 'winner-pointer-root-repair-2',
+      resolved_by_task: 'winner-pointer-root-repair-2',
+    });
+  });
+
+  it('accepting a repair terminalizes every older pending sibling in the same root lineage', async () => {
+    await seedTask('winner-cleans-siblings-root');
+    await redis.zrem(keys.zset.status.pending, 'winner-cleans-siblings-root');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'winner-cleans-siblings-root');
+    await redis.hset(keys.hash.task('winner-cleans-siblings-root'), {
+      status: 'failed', resolution_status: 'repairing',
+      resolution_task_id: 'winner-cleans-siblings-repair-2',
+      resolution_task_ids: 'winner-cleans-siblings-repair-1,winner-cleans-siblings-repair-2',
+    });
+    for (const [taskId, status, review] of [
+      ['winner-cleans-siblings-repair-1', 'pending', ''],
+      ['winner-cleans-siblings-repair-2', 'done', 'accepted'],
+    ] as const) {
+      await seedTask(taskId);
+      await redis.zrem(keys.zset.status.pending, taskId);
+      await redis.zadd((keys.zset.status as Record<string, string>)[status], Date.now(), taskId);
+      await redis.hset(keys.hash.task(taskId), {
+        status, pm_review_status: review, fix_for: 'winner-cleans-siblings-root',
+        repair_root_task_id: 'winner-cleans-siblings-root',
+      });
+    }
+
+    await replayAcceptedRepairSideEffects(redis, 'winner-cleans-siblings-repair-2');
+
+    expect(await redis.hgetall(keys.hash.task('winner-cleans-siblings-root'))).toMatchObject({
+      resolution_status: 'resolved', resolved_by_task: 'winner-cleans-siblings-repair-2',
+    });
+    expect(await redis.hgetall(keys.hash.task('winner-cleans-siblings-repair-1'))).toMatchObject({
+      status: 'cancelled',
+      resolution_decision_reason: 'superseded_by_accepted_repair:winner-cleans-siblings-repair-2',
+    });
+  });
+
+  it('late sibling delivery cannot displace an already accepted repair winner', async () => {
+    await seedTask('late-sibling-root');
+    await seedTask('late-sibling-root-repair-1');
+    await seedTask('late-sibling-root-repair-2');
+    const now = Date.now();
+    await redis.zrem(
+      keys.zset.status.pending,
+      'late-sibling-root',
+      'late-sibling-root-repair-1',
+      'late-sibling-root-repair-2',
+    );
+    await redis.zadd(keys.zset.status.done, now, 'late-sibling-root');
+    await redis.zadd(keys.zset.status.done, now, 'late-sibling-root-repair-1');
+    await redis.zadd(keys.zset.status.done, now + 1, 'late-sibling-root-repair-2');
+    await redis.hset(keys.hash.task('late-sibling-root'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      resolution_status: 'resolved',
+      resolution_action: 'repair',
+      resolution_task_id: 'late-sibling-root-repair-1',
+      resolution_task_ids: 'late-sibling-root-repair-1,late-sibling-root-repair-2',
+      resolved_by_task: 'late-sibling-root-repair-1',
+    });
+    await redis.hset(keys.hash.task('late-sibling-root-repair-1'), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      fix_for: 'late-sibling-root',
+      repair_root_task_id: 'late-sibling-root',
+    });
+    await redis.hset(keys.hash.task('late-sibling-root-repair-2'), {
+      status: 'done',
+      pm_review_status: '',
+      fix_for: 'late-sibling-root',
+      repair_root_task_id: 'late-sibling-root',
+    });
+
+    const rejectedReview = await pmReview(redis, 'late-sibling-root-repair-2', {
+      verdict: 'reject',
+      reviewed_by: 'pm-late',
+      comment: 'late empty delivery',
+    });
+    expect(rejectedReview).toMatchObject({
+      ok: false,
+      error: { code: 'REPAIR_SUPERSEDED_BY_ACCEPTED_WINNER' },
+    });
+
+    const acceptedReview = await pmReview(redis, 'late-sibling-root-repair-2', {
+      verdict: 'accept',
+      reviewed_by: 'pm-late',
+      comment: 'late green delivery',
+    });
+
+    expect(acceptedReview).toMatchObject({
+      ok: false,
+      error: { code: 'REPAIR_SUPERSEDED_BY_ACCEPTED_WINNER' },
+    });
+    expect(await redis.hgetall(keys.hash.task('late-sibling-root'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolution_task_id: 'late-sibling-root-repair-1',
+      resolved_by_task: 'late-sibling-root-repair-1',
+    });
+    expect(await redis.hget(keys.hash.task('late-sibling-root-repair-2'), 'pm_review_status')).toBe('');
   });
 
   it('独立验收失败后，来源 repair accepted 只安排新的独立复验；复验 accepted 才关闭失败验收', async () => {
@@ -798,7 +2236,7 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
       state: 'cancelled',
       action: 'cancel',
       latest_repair_id: 'retry-limit-source-repair-2',
-      available_actions: ['inspect'],
+      available_actions: ['inspect', 'continue'],
     });
     expect(await redis.hgetall(keys.hash.task('retry-limit-source-repair-2'))).toEqual(failedChild2);
     expect((await getTask(redis, 'retry-limit-source')).data).toMatchObject({
@@ -813,6 +2251,29 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect((await getStatus(redis)).data.plans).toEqual(expect.arrayContaining([
       expect.objectContaining({ plan_id: 'autonomous-plan', status: 'cancelled' }),
     ]));
+
+    const resolutionEventCount = async () => {
+      const events = (await redis.xrange(keys.stream.events, '-', '+')) as [string, string[]][];
+      return events.filter(([, fields]) =>
+        fields.includes('resolution_required') && fields.includes('retry-limit-source'),
+      ).length;
+    };
+    const eventsBeforeReconcile = await resolutionEventCount();
+    await reconcileResolutionBacklog(redis);
+    expect((await getTask(redis, 'retry-limit-source')).data).toMatchObject({
+      resolution_status: 'cancelled',
+      resolution_action: 'cancel',
+    });
+    expect(await resolutionEventCount()).toBe(eventsBeforeReconcile);
+
+    const forbiddenReset = await taskReset(redis, 'retry-limit-source', {
+      force: true,
+      reset_by: 'pm-must-not-erase-reject',
+    });
+    expect(forbiddenReset).toMatchObject({
+      ok: false,
+      error: { code: 'RESOLUTION_AUDIT_IMMUTABLE' },
+    });
 
     const closedProject = new SupervisedProject({
       planId: 'autonomous-plan',
@@ -829,6 +2290,37 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect((await runWatchdog(redis)).data?.problems.filter(
       (problem) => problem.task_id?.startsWith('retry-limit-source'),
     )).toEqual([]);
+
+    // 兼容旧数据：根已明确 cancel，但末代 child 的 review 字段因旧双写缺口丢失。
+    // 根的 retry-limit/cancel 决策仍是权威，显式 continue 不能把这个旧 done child
+    // 误当成当前待验收工作并再次卡死。
+    await redis.hset(keys.hash.task('retry-limit-source-repair-2'), {
+      status: 'done',
+      pm_review_status: '',
+    });
+    const legacyUnreviewedChild = await redis.hgetall(keys.hash.task('retry-limit-source-repair-2'));
+
+    // cancelled 仍保持静默终态；只有操作者显式 continue 才重新放行一代，且旧 child
+    // 与 cancel 审计均不被 reset/覆盖。这样历史旧链可迁入普通 Worker 队列，而不会
+    // 因 retry limit 永久堵住下游 pending 依赖。
+    const reopened = await resolutionDecision(redis, 'retry-limit-source', {
+      action: 'continue',
+      decided_by: 'operator-override',
+    });
+    expect(reopened.data).toMatchObject({
+      root_task_id: 'retry-limit-source',
+      state: 'repairing',
+      action: 'repair',
+      latest_repair_id: 'retry-limit-source-repair-3',
+      created_task_ids: ['retry-limit-source-repair-3'],
+    });
+    expect(await redis.hgetall(keys.hash.task('retry-limit-source-repair-2'))).toEqual(legacyUnreviewedChild);
+    expect(await redis.hgetall(keys.hash.task('retry-limit-source-repair-3'))).toMatchObject({
+      status: 'pending',
+      fix_for: 'retry-limit-source',
+      repair_root_task_id: 'retry-limit-source',
+    });
+    expect((await getPlan(redis, 'autonomous-plan')).data).toMatchObject({ status: 'active' });
   });
 
   it('取消当前 repair 会升级成最小 PM 决策，而不是让原失败任务静默悬挂', async () => {
@@ -847,7 +2339,7 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     });
     const repairId = rejected.data!.fix_task_id!;
 
-    expect((await cancelTask(redis, repairId)).ok).toBe(true);
+    expect((await cancelTask(redis, repairId, { reason: 'PM 决定停止当前修复并重新评估' })).ok).toBe(true);
     expect(await redis.hmget(
       keys.hash.task('repair-cancel-source'),
       'resolution_status',
@@ -863,6 +2355,59 @@ describe('无人盯盘的修复与阻塞闭环（目标 RED）', () => {
     expect((await pmIntake(redis, { consumer: 'pm-autonomous' })).data?.items).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'resolution_required', task_id: 'repair-cancel-source' }),
     ]));
+  });
+
+  it('runtime reconcile 只为旧 cancelled 空审计补事实标记且不覆盖已有原因', async () => {
+    await seedTask('legacy-cancel-missing-reason');
+    await seedTask('legacy-cancel-with-reason');
+    for (const taskId of ['legacy-cancel-missing-reason', 'legacy-cancel-with-reason']) {
+      await redis.zrem(keys.zset.status.pending, taskId);
+      await redis.zadd(keys.zset.status.cancelled, 17_000, taskId);
+      await redis.hset(keys.hash.task(taskId), { status: 'cancelled', cancelled_at: '17000' });
+    }
+    await redis.hset(keys.hash.task('legacy-cancel-with-reason'), 'cancel_reason', '原始原因必须保留');
+
+    await reconcileRuntimeState(redis);
+    await reconcileRuntimeState(redis);
+
+    expect(await redis.hgetall(keys.hash.task('legacy-cancel-missing-reason'))).toMatchObject({
+      status: 'cancelled',
+      cancelled_at: '17000',
+      cancel_reason: '历史版本未记录撤销原因（不可恢复）',
+    });
+    expect(await redis.hgetall(keys.hash.task('legacy-cancel-with-reason'))).toMatchObject({
+      cancel_reason: '原始原因必须保留',
+    });
+  });
+
+  it('resolution cancel 在当前 child 仍 active 时安全拒绝，不产生 cancelled root + pending child 矛盾', async () => {
+    await seedTask('cancel-active-root');
+    await redis.zrem(keys.zset.status.pending, 'cancel-active-root');
+    await redis.zadd(keys.zset.status.failed, Date.now(), 'cancel-active-root');
+    await redis.hset(keys.hash.task('cancel-active-root'), {
+      status: 'failed',
+      resolution_status: 'needs_pm_decision',
+      resolution_action: 'inspect',
+      resolution_generation: '1',
+      resolution_attempts: '1',
+      resolution_task_id: 'cancel-active-root-repair-1',
+      resolution_task_ids: 'cancel-active-root-repair-1',
+      resolution_decision_reason: 'repair_retry_limit_reached',
+    });
+    await seedTask('cancel-active-root-repair-1', {
+      fix_for: 'cancel-active-root',
+      repair_root_task_id: 'cancel-active-root',
+    });
+
+    const cancelled = await resolutionDecision(redis, 'cancel-active-root', {
+      action: 'cancel', decided_by: 'pm-autonomous',
+    });
+    expect(cancelled).toMatchObject({
+      ok: false,
+      error: { code: 'RESOLUTION_CHILD_ACTIVE' },
+    });
+    expect(await redis.hget(keys.hash.task('cancel-active-root'), 'resolution_status')).toBe('needs_pm_decision');
+    expect(await redis.hget(keys.hash.task('cancel-active-root-repair-1'), 'status')).toBe('pending');
   });
 
   it('升级补偿会为历史 failed/rejected 任务创建一次 repair，重复运行不产生并行修复', async () => {

@@ -48,7 +48,12 @@ async function post<T = unknown>(path: string, payload: unknown): Promise<{ stat
   return { status: response.statusCode, body: response.json() as Envelope<T> };
 }
 
-async function seedAndClaim(taskId: string, agentId: string, priority = 3) {
+async function seedAndClaim(
+  taskId: string,
+  agentId: string,
+  priority = 3,
+  ownershipFiles: string[] = [],
+) {
   await writePlanToRedis(redis, {
     plan_id: 'ownership-contract-plan',
     title: 'ownership contract',
@@ -64,6 +69,7 @@ async function seedAndClaim(taskId: string, agentId: string, priority = 3) {
     priority,
     timeout_seconds: 120,
     verify: [],
+    ownership: { files: ownershipFiles },
   }, `# ${taskId}`, 'ownership-contract-plan', PROJECT_PATH, priority);
   const registered = await post<{ registration_id: string }>('/register', {
     agent_id: agentId,
@@ -105,6 +111,60 @@ afterAll(async () => {
 });
 
 describe('ownership declaration/release current-holder contract', () => {
+  it('rejects declarations outside the task authorization even with force', async () => {
+    const task = await seedAndClaim(
+      'ownership-scope-guard',
+      'worker-scope-guard',
+      9,
+      ['src/allowed/**'],
+    );
+
+    const outside = await post('/ownership/declare', {
+      agent_id: 'worker-scope-guard',
+      task_id: task.task_id,
+      claim_token: task.claim_token,
+      files: ['src/outside.ts'],
+      force: true,
+    });
+
+    expect(outside.body).toMatchObject({
+      ok: false,
+      error: { code: 'OWNERSHIP_SCOPE_VIOLATION' },
+    });
+    expect(await redis.hget(keys.hash.fileOwnership, 'src/outside.ts')).toBeNull();
+
+    const traversal = await post('/ownership/declare', {
+      agent_id: 'worker-scope-guard',
+      task_id: task.task_id,
+      claim_token: task.claim_token,
+      files: ['src/allowed/../outside.ts'],
+      force: true,
+    });
+    expect(traversal.body).toMatchObject({
+      ok: false,
+      error: { code: 'OWNERSHIP_SCOPE_VIOLATION' },
+    });
+  });
+
+  it('allows a concrete path that is contained by an authorized task glob', async () => {
+    const task = await seedAndClaim(
+      'ownership-scope-contained',
+      'worker-scope-contained',
+      9,
+      ['src/allowed/**'],
+    );
+
+    const inside = await post('/ownership/declare', {
+      agent_id: 'worker-scope-contained',
+      task_id: task.task_id,
+      claim_token: task.claim_token,
+      files: ['src/allowed/new.ts'],
+      force: true,
+    });
+
+    expect(inside.body).toMatchObject({ ok: true });
+  });
+
   it('HTTP claim 接受 preferred_plan_ids，并在同项目内于服务端过滤计划', async () => {
     await writePlanToRedis(redis, {
       plan_id: 'http-allowed-plan', title: 'allowed', project_path: PROJECT_PATH, default_priority: 1,
@@ -142,7 +202,7 @@ describe('ownership declaration/release current-holder contract', () => {
   });
 
   it('requires claim_token and derives declaration priority from the running task', async () => {
-    const task = await seedAndClaim('ownership-owner', 'worker-owner', 3);
+    const task = await seedAndClaim('ownership-owner', 'worker-owner', 3, ['src/owner/**']);
     const missingToken = await post('/ownership/declare', {
       agent_id: 'worker-owner', task_id: task.task_id, files: ['src/owner/**'], force: true,
     });
@@ -161,8 +221,8 @@ describe('ownership declaration/release current-holder contract', () => {
   });
 
   it('rejects forged agent, stale token, and non-running holder without changing the registry', async () => {
-    const task = await seedAndClaim('ownership-guarded', 'worker-guarded', 5);
     const glob = 'src/guarded/**';
+    const task = await seedAndClaim('ownership-guarded', 'worker-guarded', 5, [glob]);
     expect((await post('/ownership/declare', {
       agent_id: 'worker-guarded', task_id: task.task_id, claim_token: task.claim_token, files: [glob], force: true,
     })).body.ok).toBe(true);
@@ -189,9 +249,9 @@ describe('ownership declaration/release current-holder contract', () => {
   });
 
   it('only deletes a matching owner/task glob and makes repeated holder release idempotent', async () => {
-    const task = await seedAndClaim('ownership-release', 'worker-release', 5);
     const ownGlob = 'src/release/**';
     const otherGlob = 'src/other/**';
+    const task = await seedAndClaim('ownership-release', 'worker-release', 5, [ownGlob]);
     expect((await post('/ownership/declare', {
       agent_id: 'worker-release', task_id: task.task_id, claim_token: task.claim_token, files: [ownGlob], force: true,
     })).body.ok).toBe(true);

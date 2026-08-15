@@ -319,7 +319,8 @@ describe('pmIntake 一次性提醒', () => {
     // 不应展开 result/verify/ownership 详情
     expect(item).not.toHaveProperty('result_md');
     expect(item).not.toHaveProperty('verify_results');
-    expect(intake.data!.cursor).toBeDefined();
+    expect(intake.data!.cursor).toMatch(/^\d+-\d+$/);
+    expect(intake.data!.cursor).not.toBe('0-0');
     expect(intake.data!.counts).toBeDefined();
   });
 

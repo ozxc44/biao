@@ -13,24 +13,50 @@ import {
 } from '../api';
 import { ResolutionStatus } from './ResolutionStatus';
 import { useI18n } from '../i18n/I18nContext';
+import { buildWorkerConnectionGuide } from '../guides';
 import { getGroupLabel, getResolutionActionLabel, getResolutionLabel, getStatusLabel } from '../i18n/status';
 import { formatCountdown } from '../i18n/time';
 import type { TFunction } from '../i18n/translations';
-import { getResolutionPresentation, normalizeResolutionTaskIds } from '../resolution';
-import { BOARD_GROUP_KEYS, groupTasksForBoard, type BoardGroupKey } from '../view-model';
+import { getResolutionPresentation } from '../resolution';
+import {
+  buildRootTaskBoard,
+  getAcceptedClosureKind,
+  getAttemptAuditFacts,
+  getRootAttemptTimeline,
+  getVisibleRootTaskCards,
+  getRootCardReviewTarget,
+  projectionIssueToCard,
+  summarizeRootTaskBoard,
+  type BoardGroupKey,
+  type RootTaskCard,
+} from '../view-model';
+import CopyButton from './CopyButton';
 
 interface SelectedTask {
-  task: TaskSummary;
+  card: RootTaskCard;
   group: BoardGroupKey;
 }
 
+const BOARD_COLUMNS: ReadonlyArray<{ key: string; groups: readonly BoardGroupKey[] }> = [
+  { key: 'pending', groups: ['pending'] },
+  { key: 'active', groups: ['running', 'review_pending'] },
+  { key: 'audit', groups: ['rejected', 'failed'] },
+  { key: 'accepted', groups: ['accepted'] },
+  { key: 'blocked', groups: ['blocked'] },
+  { key: 'cancelled', groups: ['cancelled'] },
+  { key: 'superseded', groups: ['superseded'] },
+];
+
+const COLLAPSED_GROUP_LIMIT = 5;
+
 export function PlanDetailView({ planId, authRevision }: { planId: string; authRevision: number }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [plan, setPlan] = useState<PlanData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<SelectedTask | null>(null);
   const [message, setMessage] = useState('');
   const [now, setNow] = useState(Date.now());
+  const [expandedGroups, setExpandedGroups] = useState<Set<BoardGroupKey>>(() => new Set());
 
   const load = async () => {
     try {
@@ -59,14 +85,22 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
   }, [planId, authRevision]);
 
   useEffect(() => {
+    setExpandedGroups(new Set());
+  }, [planId]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const groups = useMemo(() => (plan ? groupTasksForBoard(plan.tasks) : null), [plan]);
+  const groups = useMemo(() => (plan ? buildRootTaskBoard(plan.tasks) : null), [plan]);
 
   if (error && !plan) return <div className="notice error" role="alert">{t('common.loadFailed')}{error}</div>;
   if (!plan || !groups) return <div className="notice">{t('common.loadingPlan')}</div>;
+  const declaredTaskCount = plan.declared_task_count ?? plan.task_count;
+  const rootSummary = summarizeRootTaskBoard(groups, declaredTaskCount);
+  const showsRuntimeAttempts = plan.runtime_task_count !== undefined
+    && plan.runtime_task_count !== declaredTaskCount;
 
   return (
     <main>
@@ -78,39 +112,126 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
           <h2>{plan.title || plan.plan_id}</h2>
           <p>{plan.project_path}</p>
         </div>
-        <span className={`status-chip status-${plan.status}`}>{getStatusLabel(plan.status, t)}</span>
-        <span className="section-summary">{t('planDetail.planTaskCount', { count: plan.task_count })}</span>
+        <div className="plan-detail-actions">
+          <CopyButton
+            text={buildWorkerConnectionGuide(locale, serviceOrigin(), {
+              planId: plan.plan_id,
+              projectPath: plan.project_path,
+            })}
+            label={t('planDetail.copyWorkerGuideButton')}
+          />
+          <span className={`status-chip status-${plan.status}`}>{getStatusLabel(plan.status, t)}</span>
+          <span className="section-summary">{t('planDetail.planTaskCount', { count: declaredTaskCount })}</span>
+          {showsRuntimeAttempts && (
+            <span className="section-summary">{t('planDetail.runtimeAttempts', {
+              runtime: plan.runtime_task_count ?? declaredTaskCount,
+              declared: declaredTaskCount,
+            })}</span>
+          )}
+        </div>
       </section>
 
+      {(!rootSummary.matchesDeclared || groups.projectionIssues.length > 0) && (
+        <div className="banner error" role="alert">
+          {!rootSummary.matchesDeclared && t('planDetail.rootCountMismatch', {
+            visible: rootSummary.visibleTotal,
+            declared: rootSummary.declaredTotal,
+          })}
+          {!rootSummary.matchesDeclared && groups.projectionIssues.length > 0 && ' · '}
+          {groups.projectionIssues.length > 0 && `${t('planDetail.lineageDataIssue')}（${groups.projectionIssues.length}）`}
+        </div>
+      )}
+
+      {groups.projectionIssues.length > 0 && (
+        <details className="detail-section danger-panel">
+          <summary>{t('planDetail.projectionIssuesHeading', { count: groups.projectionIssues.length })}</summary>
+          <div className="verify-list">
+            {groups.projectionIssues.map((issue, index) => (
+              <button
+                key={`${issue.task.task_id}-${index}`}
+                type="button"
+                className="btn secondary"
+                onClick={() => setSelected({ card: projectionIssueToCard(issue), group: issue.group })}
+                aria-label={t('planDetail.projectionIssueOpen', { taskId: issue.task.task_id })}
+              >
+                <code>{issue.task.task_id}</code> · {issue.reason}
+              </button>
+            ))}
+          </div>
+        </details>
+      )}
+
       <section className="review-strip" aria-label={t('planDetail.reviewStripAriaLabel')}>
-        <span><strong>{groups.review_pending.length}</strong> {getGroupLabel('review_pending', t)}</span>
+        <span><strong>{groups.pending.length}</strong> {getGroupLabel('pending', t)}</span>
+        <span><strong>{rootSummary.active}</strong> {t('planDetail.columnActive')}</span>
+        <span><strong>{rootSummary.audit}</strong> {t('planDetail.columnAudit')}</span>
         <span><strong>{groups.accepted.length}</strong> {getGroupLabel('accepted', t)}</span>
-        <span><strong>{groups.rejected.length}</strong> {getGroupLabel('rejected', t)}</span>
         <span><strong>{groups.blocked.length}</strong> {getGroupLabel('blocked', t)}</span>
         <span><strong>{groups.cancelled.length}</strong> {getGroupLabel('cancelled', t)}</span>
+        <span><strong>{groups.superseded.length}</strong> {getGroupLabel('superseded', t)}</span>
       </section>
 
       <section className="board" aria-label={t('planDetail.boardAriaLabel')}>
-        {BOARD_GROUP_KEYS.map((group) => (
-          <div key={group} className={`board-column column-${group}`}>
+        {BOARD_COLUMNS.map((column) => {
+          const cards = column.groups.flatMap((group) => groups[group]);
+          return <div key={column.key} className={`board-column column-${column.key}`}>
             <div className="column-header">
-              <span>{getGroupLabel(group, t)}</span>
-              <span className="column-count">{groups[group].length}</span>
+              <span>{column.key === 'active'
+                ? t('planDetail.columnActive')
+                : column.key === 'audit'
+                  ? t('planDetail.columnAudit')
+                  : getGroupLabel(column.groups[0], t)}</span>
+              <span className="column-count">{cards.length}</span>
             </div>
             <div className="column-body">
-              {groups[group].length === 0 && <div className="column-empty">{t('planDetail.columnEmpty')}</div>}
-              {groups[group].map((task) => (
-                <TaskCard
-                  key={task.task_id}
-                  task={task}
-                  group={group}
-                  now={now}
-                  onOpen={() => setSelected({ task, group })}
-                />
-              ))}
+              {cards.length === 0 && <div className="column-empty">{t('planDetail.columnEmpty')}</div>}
+              {column.groups.map((group) => {
+                if (groups[group].length === 0) return null;
+                const expanded = expandedGroups.has(group);
+                const groupCards = groups[group];
+                const visibleCards = getVisibleRootTaskCards(groupCards, expanded, COLLAPSED_GROUP_LIMIT);
+                return (
+                  <section key={group} className={`column-subgroup column-${group}`} data-board-group={group}>
+                    {column.groups.length > 1 && (
+                      <div className="column-subgroup-title">
+                        <span>{getGroupLabel(group, t)}</span><span>{groupCards.length}</span>
+                      </div>
+                    )}
+                    {visibleCards.map((card) => (
+                      <TaskCard
+                        key={card.root.task_id}
+                        card={card}
+                        group={group}
+                        now={now}
+                        onOpen={() => setSelected({
+                          card,
+                          group,
+                        })}
+                      />
+                    ))}
+                    {groupCards.length > COLLAPSED_GROUP_LIMIT && (
+                      <button
+                        type="button"
+                        className="column-expand-button"
+                        aria-expanded={expanded}
+                        onClick={() => setExpandedGroups((current) => {
+                          const next = new Set(current);
+                          if (next.has(group)) next.delete(group);
+                          else next.add(group);
+                          return next;
+                        })}
+                      >
+                        {expanded
+                          ? t('planDetail.collapseGroup', { count: COLLAPSED_GROUP_LIMIT })
+                          : t('planDetail.expandGroup', { count: groupCards.length })}
+                      </button>
+                    )}
+                  </section>
+                );
+              })}
             </div>
-          </div>
-        ))}
+          </div>;
+        })}
       </section>
 
       {selected && (
@@ -129,18 +250,21 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
 }
 
 function TaskCard({
-  task,
+  card,
   group,
   now,
   onOpen,
 }: {
-  task: TaskSummary;
+  card: RootTaskCard;
   group: BoardGroupKey;
   now: number;
   onOpen: () => void;
 }) {
   const { t } = useI18n();
+  const task = card.root;
+  const activeTask = card.actionTask;
   const resolution = getResolutionPresentation(task);
+  const closureKind = getAcceptedClosureKind(card);
   return (
     <article className={`task-card ${resolution?.status === 'resolved' ? 'task-card-resolved' : ''}`.trim()}>
       <button
@@ -159,13 +283,24 @@ function TaskCard({
           {task.phase && <span className="tag">{task.phase}</span>}
           <span className="tag assignee">→ {task.assignee || t('planDetail.assigneeUnassigned')}</span>
         </div>
-        {task.claimed_by && <span className="task-agent">{t('planDetail.taskAgentLabel', { agent: task.claimed_by })}</span>}
-        {group === 'running' && task.expire_at !== undefined && (
-          <span className="countdown">{t('planDetail.leaseRemaining', { time: formatCountdown(task.expire_at - now, t) })}</span>
+        {closureKind && (
+          <span className="tag">
+            {closureKind === 'original'
+              ? t('planDetail.closureOriginal')
+              : closureKind === 'reverify'
+                ? t('planDetail.closureReverify')
+                : t('planDetail.closureRepair')}
+          </span>
         )}
-        {(task.failure_reason || task.blocked_reason || task.pm_reject_reason) && (
-          <span className="task-reason">{task.failure_reason || task.blocked_reason || task.pm_reject_reason}</span>
+        {activeTask.task_id !== task.task_id && <span className="tag repair-tag">{activeTask.task_id}</span>}
+        {activeTask.claimed_by && <span className="task-agent">{t('planDetail.taskAgentLabel', { agent: activeTask.claimed_by })}</span>}
+        {group === 'running' && activeTask.expire_at !== undefined && (
+          <span className="countdown">{t('planDetail.leaseRemaining', { time: formatCountdown(activeTask.expire_at - now, t) })}</span>
         )}
+        {(activeTask.failure_reason || activeTask.blocked_reason || activeTask.pm_reject_reason || task.failure_reason || task.pm_reject_reason) && (
+          <span className="task-reason">{activeTask.failure_reason || activeTask.blocked_reason || activeTask.pm_reject_reason || task.failure_reason || task.pm_reject_reason}</span>
+        )}
+        {card.dataIssue && <span className="task-reason">{t('planDetail.lineageDataIssue')}</span>}
         <ResolutionStatus task={task} />
         <span className="task-open-hint">{t('planDetail.viewDetailsHint')}</span>
       </button>
@@ -182,15 +317,29 @@ function TaskDetails({
   onClose: () => void;
   onChanged: (message: string) => Promise<void>;
 }) {
-  const { t } = useI18n();
-  const { task, group } = selected;
+  const { locale, t } = useI18n();
+  const { card, group } = selected;
+  const { actionTask, root, repairs } = card;
+  const timeline = getRootAttemptTimeline(card);
+  const [selectedAttemptId, setSelectedAttemptId] = useState(actionTask.task_id);
+  const task = timeline.find((item) => item.task.task_id === selectedAttemptId)?.task ?? actionTask;
   const [review, setReview] = useState<TaskReviewInfo | null>(null);
   const [reviewError, setReviewError] = useState('');
   const [comment, setComment] = useState('');
   const [rejectReason, setRejectReason] = useState(task.pm_reject_reason ?? '');
   const [fixInstructions, setFixInstructions] = useState('');
+  const [cancelReason, setCancelReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState('');
+
+  useEffect(() => {
+    setSelectedAttemptId(actionTask.task_id);
+  }, [root.task_id, actionTask.task_id]);
+
+  useEffect(() => {
+    setRejectReason(task.pm_reject_reason ?? '');
+    setFixInstructions(task.pm_fix_instructions ?? '');
+  }, [task.task_id, task.pm_fix_instructions, task.pm_reject_reason]);
 
   useEffect(() => {
     let cancelled = false;
@@ -222,21 +371,20 @@ function TaskDetails({
     }
   };
 
-  const canReview = ['review_pending', 'rejected'].includes(group);
-  const resolution = getResolutionPresentation(task);
-  const canReviewCurrentTask = canReview && !resolution;
-  const canReset = !['pending', 'cancelled'].includes(group) && !resolution;
-  const canCancel = group === 'pending';
+  const reviewTarget = getRootCardReviewTarget(card);
+  const resolution = getResolutionPresentation(root);
+  const isSelectedCurrentAttempt = task.task_id === actionTask.task_id;
+  const canReviewCurrentTask = reviewTarget?.task_id === task.task_id;
+  const canReset = isSelectedCurrentAttempt && !['pending', 'cancelled'].includes(group) && !resolution;
+  const canCancel = isSelectedCurrentAttempt && group === 'pending';
   const resultText = task.result_summary || review?.result_md || stringifyResult(task.result ?? review?.result_json);
   const verifyItems = normalizeVerify(review?.verify_results ?? task.verify_results ?? task.verify ?? []);
-  const repairTaskIds = normalizeResolutionTaskIds(task.resolution_task_ids);
+  const repairTaskIds = repairs.map((item) => item.task_id);
   const auditEntries = getAuditEntries(task, t);
   const showsResolutionContext = Boolean(
     resolution
-    || task.fix_for
-    || task.repair_root_task_id
-    || task.resolution_task_id
-    || task.resolved_by_task
+    || root.resolution_task_id
+    || root.resolved_by_task
     || repairTaskIds.length > 0,
   );
 
@@ -251,8 +399,8 @@ function TaskDetails({
       <aside className="task-drawer" role="dialog" aria-modal="true" aria-labelledby="task-detail-title">
         <div className="drawer-header">
           <div>
-            <p className="eyebrow">{task.task_id}</p>
-            <h2 id="task-detail-title">{task.title}</h2>
+            <p className="eyebrow">{root.task_id}{task.task_id !== root.task_id ? ` → ${task.task_id}` : ''}</p>
+            <h2 id="task-detail-title">{root.title}</h2>
           </div>
           <button
             type="button"
@@ -264,8 +412,40 @@ function TaskDetails({
           </button>
         </div>
 
+        <details className="detail-section" open>
+          <summary>{t('planDetail.timelineHeading', { count: timeline.length })}</summary>
+          <div className="verify-list">
+            {timeline.map((item) => {
+              const attemptReview = item.task.pm_review_status ?? item.task.review_status;
+              const attemptStatus = attemptReview || item.task.status || 'pending';
+              return (
+                <button
+                  key={item.task.task_id}
+                  type="button"
+                  className="btn secondary"
+                  aria-pressed={item.task.task_id === task.task_id}
+                  onClick={() => setSelectedAttemptId(item.task.task_id)}
+                >
+                  <code>{item.task.task_id}</code>
+                  <span className="tag">{item.role === 'root'
+                    ? t('planDetail.timelineRoot')
+                    : item.role === 'reverify'
+                      ? t('planDetail.timelineReverify')
+                      : t('planDetail.timelineRepair')}</span>
+                  <span className="tag">{getStatusLabel(attemptStatus, t)}</span>
+                  {item.isCurrent && <span className="tag">{t('planDetail.timelineCurrent')}</span>}
+                  {item.isResolvedBy && <span className="tag">{t('planDetail.timelineResolvedBy')}</span>}
+                </button>
+              );
+            })}
+          </div>
+        </details>
+
         <div className="detail-grid">
-          <Detail label={t('planDetail.detailStatus')} value={getGroupLabel(group, t)} />
+          <Detail
+            label={t('planDetail.detailStatus')}
+            value={getStatusLabel(task.pm_review_status || task.review_status || task.status || group, t)}
+          />
           <Detail
             label={t('planDetail.detailPmReview')}
             value={(task.pm_review_status || review?.pm_review_status)
@@ -282,8 +462,22 @@ function TaskDetails({
           />
           <Detail label={t('planDetail.detailType')} value={task.type || '—'} />
           <Detail label={t('planDetail.detailAssignee')} value={task.assignee || t('planDetail.assigneeUnassigned')} />
+          {task.created_at !== undefined && <Detail label={t('planDetail.detailCreatedAt')} value={formatAuditTime(task.created_at, locale)} />}
+          {task.done_at !== undefined && <Detail label={t('planDetail.detailDoneAt')} value={formatAuditTime(task.done_at, locale)} />}
+          {task.cancelled_at !== undefined && <Detail label={t('planDetail.detailCancelledAt')} value={formatAuditTime(task.cancelled_at, locale)} />}
+          {task.superseded_at !== undefined && <Detail label={t('planDetail.detailSupersededAt')} value={formatAuditTime(task.superseded_at, locale)} />}
+          {task.superseded_by && <Detail label={t('planDetail.detailSupersededBy')} value={task.superseded_by} />}
+          {task.pm_reviewed_by && <Detail label={t('planDetail.detailPmReviewer')} value={task.pm_reviewed_by} />}
+          {task.pm_reviewed_at !== undefined && <Detail label={t('planDetail.detailPmReviewedAt')} value={formatAuditTime(task.pm_reviewed_at, locale)} />}
           {resolution && <Detail label={t('planDetail.resolutionStatus')} value={getResolutionLabel(resolution.status, resolution.action, t)} />}
         </div>
+
+        {task.pm_review_comment && (
+          <section className="detail-section">
+            <h3>{t('planDetail.detailPmComment')}</h3>
+            <p>{task.pm_review_comment}</p>
+          </section>
+        )}
 
         {auditEntries.length > 0 && (
           <section className="detail-section danger-panel">
@@ -300,7 +494,7 @@ function TaskDetails({
           <section className="detail-section resolution-panel">
             <div className="resolution-panel-heading">
               <h3>{t('planDetail.resolutionHeading')}</h3>
-              <ResolutionStatus task={task} />
+              <ResolutionStatus task={root} />
             </div>
             <dl className="resolution-details">
               {resolution && (
@@ -311,42 +505,30 @@ function TaskDetails({
                   <dd>{getResolutionActionLabel(resolution.action, t)}</dd>
                 </>
               )}
-              {task.resolution_task_id && (
+              {root.resolution_task_id && (
                 <>
                   <dt>{t('planDetail.resolutionCurrentTask')}</dt>
-                  <dd><code>{task.resolution_task_id}</code></dd>
+                  <dd><code>{root.resolution_task_id}</code></dd>
                 </>
               )}
-              {task.resolved_by_task && (
+              {root.resolved_by_task && (
                 <>
                   <dt>{t('planDetail.resolutionResolvedBy')}</dt>
-                  <dd><code>{task.resolved_by_task}</code></dd>
+                  <dd><code>{root.resolved_by_task}</code></dd>
                 </>
               )}
-              {task.fix_for && (
-                <>
-                  <dt>{t('planDetail.resolutionFixFor')}</dt>
-                  <dd><code>{task.fix_for}</code></dd>
-                </>
-              )}
-              {task.repair_root_task_id && task.repair_root_task_id !== task.task_id && (
-                <>
-                  <dt>{t('planDetail.resolutionRootTask')}</dt>
-                  <dd><code>{task.repair_root_task_id}</code></dd>
-                </>
-              )}
-              {task.pm_fix_instructions && (
+              {root.pm_fix_instructions && (
                 <>
                   <dt>{t('planDetail.fixInstructionsLabel')}</dt>
-                  <dd>{task.pm_fix_instructions}</dd>
+                  <dd>{root.pm_fix_instructions}</dd>
                 </>
               )}
-              {resolution && (task.resolution_attempts !== undefined || task.resolution_generation !== undefined) && (
+              {resolution && (root.resolution_attempts !== undefined || root.resolution_generation !== undefined) && (
                 <>
                   <dt>{t('planDetail.resolutionAttempts')}</dt>
                   <dd>{t('planDetail.resolutionAttemptsValue', {
-                    attempts: task.resolution_attempts ?? 0,
-                    generation: task.resolution_generation ?? 0,
+                    attempts: root.resolution_attempts ?? 0,
+                    generation: root.resolution_generation ?? 0,
                   })}</dd>
                 </>
               )}
@@ -436,9 +618,9 @@ function TaskDetails({
                 className="btn success"
                 disabled={busy}
                 onClick={() => void mutate(
-                  t('planDetail.confirmAccept', { taskId: task.task_id }),
-                  () => reviewTask(task.task_id, { verdict: 'accept', comment: comment.trim(), reviewed_by: 'pm-web' }),
-                  t('planDetail.successAccept', { taskId: task.task_id }),
+                  t('planDetail.confirmAccept', { taskId: reviewTarget!.task_id }),
+                  () => reviewTask(reviewTarget!.task_id, { verdict: 'accept', comment: comment.trim(), reviewed_by: 'pm-web' }),
+                  t('planDetail.successAccept', { taskId: reviewTarget!.task_id }),
                 )}
               >{t('planDetail.acceptButton')}</button>
               <button
@@ -446,14 +628,14 @@ function TaskDetails({
                 className="btn danger"
                 disabled={busy || !rejectReason.trim()}
                 onClick={() => void mutate(
-                  t('planDetail.confirmReject', { taskId: task.task_id }),
-                  () => reviewTask(task.task_id, {
+                  t('planDetail.confirmReject', { taskId: reviewTarget!.task_id }),
+                  () => reviewTask(reviewTarget!.task_id, {
                     verdict: 'reject',
                     reject_reason: rejectReason.trim(),
                     fix_instructions: fixInstructions.trim(),
                     reviewed_by: 'pm-web',
                   }),
-                  t('planDetail.successReject', { taskId: task.task_id }),
+                  t('planDetail.successReject', { taskId: reviewTarget!.task_id }),
                 )}
               >{t('planDetail.rejectButton')}</button>
             </div>
@@ -474,16 +656,25 @@ function TaskDetails({
             >{t('planDetail.resetButton')}</button>
           )}
           {canCancel && (
-            <button
-              type="button"
-              className="btn danger"
-              disabled={busy}
-              onClick={() => void mutate(
-                t('planDetail.confirmCancel', { taskId: task.task_id }),
-                () => cancelTask(task.task_id),
-                t('planDetail.successCancel', { taskId: task.task_id }),
-              )}
-            >{t('planDetail.cancelButton')}</button>
+            <div className="form-stack">
+              <label htmlFor="cancel-reason">{t('planDetail.cancelReasonLabel')}</label>
+              <textarea
+                id="cancel-reason"
+                value={cancelReason}
+                onChange={(event) => setCancelReason(event.target.value)}
+                placeholder={t('planDetail.cancelReasonPlaceholder')}
+              />
+              <button
+                type="button"
+                className="btn danger"
+                disabled={busy || !cancelReason.trim()}
+                onClick={() => void mutate(
+                  t('planDetail.confirmCancel', { taskId: task.task_id }),
+                  () => cancelTask(task.task_id, cancelReason.trim()),
+                  t('planDetail.successCancel', { taskId: task.task_id }),
+                )}
+              >{t('planDetail.cancelButton')}</button>
+            </div>
           )}
           <button type="button" className="btn secondary" onClick={onClose}>{t('common.close')}</button>
         </section>
@@ -494,11 +685,22 @@ function TaskDetails({
 }
 
 function getAuditEntries(task: TaskSummary, t: TFunction) {
-  return [
-    task.failure_reason ? { label: t('planDetail.auditFailure'), reason: task.failure_reason } : null,
-    task.pm_reject_reason ? { label: t('planDetail.auditRejected'), reason: task.pm_reject_reason } : null,
-    task.blocked_reason ? { label: t('planDetail.auditBlocked'), reason: task.blocked_reason } : null,
-  ].filter((entry): entry is { label: string; reason: string } => entry !== null);
+  return getAttemptAuditFacts(task).map((fact) => ({
+    label: fact.kind === 'failure'
+      ? t('planDetail.auditFailure')
+      : fact.kind === 'rejected'
+        ? t('planDetail.auditRejected')
+        : fact.kind === 'blocked'
+          ? t('planDetail.auditBlocked')
+          : fact.kind === 'cancelled'
+            ? t('planDetail.auditCancelled')
+            : t('planDetail.auditSuperseded'),
+    reason: fact.value,
+  }));
+}
+
+function formatAuditTime(timestamp: number, locale: string): string {
+  return new Date(timestamp).toLocaleString(locale);
 }
 
 function Detail({ label, value }: { label: string; value: string }) {
@@ -520,4 +722,8 @@ function stringifyResult(result: unknown): string {
   } catch {
     return String(result);
   }
+}
+
+function serviceOrigin(): string {
+  return typeof window === 'undefined' ? 'http://localhost:7331' : window.location.origin;
 }

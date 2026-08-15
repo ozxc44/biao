@@ -70,7 +70,7 @@ repair 是同一项目中的可领取任务，默认继承源任务的 ownership
 
 该操作把 `resolution_mode=reverify` 写入原 reject 的不可变审计，并立即创建 `<acceptance-root>-reverify-N`。fresh task 分别原样继承原 acceptance 的 `depends_on` 与 `acceptance_for`（不可把二者互换），并继承 ownership、Verify，同时排除原验收者和历史链执行者；它仍要由 Worker report，并由 PM accept 后才关闭根验收。所有原依赖和来源均须已 accepted/resolved。相同参数的网络重试幂等复用同一 task，改用另一种处置模式不能改写旧 reject。进程若在写审计后退出，启动补偿按持久化模式补建 fresh reverify，不会误生来源 repair。
 
-`--reverify-only` 只适用于 acceptance reject，所有来源未 accepted/resolved 时 fail closed，且不能与 `--repair-ownership` 共用。未指定该参数时仍使用默认的来源 repair 流程。
+`--reverify-only` 只适用于 acceptance reject，所有来源未 accepted/resolved 时 fail closed，且不能与 `--repair-ownership` 共用。单来源 acceptance 未指定该参数时使用来源 repair。多来源 acceptance 的普通 reject 会先冻结拒绝审计并进入 `repair_sources_required`，不会默认 fan-out；PM 随后必须执行 `task resolution <acceptance-root> --action inspect`，再用 `--action continue --repair-source-task <最小来源>` 显式选源。只有确认来源实现无需修改时才使用独立复验。
 
 独立 acceptance 失败时，repair 归属被验收的原实现，而不是归属失败的 acceptance 自身。这一点避免了：
 
@@ -104,7 +104,16 @@ resolution_action=inspect
 .biao/pm task resolution <task_id> --action cancel
 ```
 
+retry-limit 链被 cancel 后保持静默终态；如果操作者后来确认需要继续，可再次显式运行
+`--action continue` 重开一代。该操作不会 reset 或覆盖既有拒绝、失败、cancel 审计。
+
 `continue` 和 `cancel` 默认把当前 `BIAO_AGENT_ID` 记录为决策者，也可显式传 `--decided-by <pm>`。只有 continue/cancel 成功后才 ack 对应 `resolution_required` 事件；只执行 inspect 不代表事项已经处置，`--require-drained` 会继续保留门铃。
+
+历史多来源验收若已以 repair 方式拒绝，会进入 `repair_sources_required:<acceptance>`，不再对所有来源自动扩散。PM 核对最新拒绝证据后显式点名一个来源：
+
+```bash
+.biao/pm task resolution <acceptance_task_id> --action continue --repair-source-task <source_task_id>
+```
 
 ## PM 的低频操作
 
@@ -123,7 +132,7 @@ resolution_action=inspect
 # Question：先列出，再按 ID 读正文和答复
 .biao/pm question list --consumer pm --status open --plan <plan_id>
 .biao/pm question get <question_id> --consumer pm --plan <plan_id>
-.biao/pm question answer <question_id> --consumer pm --plan <plan_id> --answer '明确决定'
+.biao/pm question answer <question_id> --consumer pm --plan <plan_id> --answer '明确决定' [--approve-ownership | --reject-ownership]
 
 # 验收：先读取 evidence，再作出判断
 .biao/pm review <task_id>

@@ -126,6 +126,24 @@ function blockLockHolderOnceCommand(outputPath: string, crashMarkerPath: string)
   return child;
 }
 
+function hangingProcessTreeCommand(parentPidPath: string, childPidPath: string): string {
+  const dir = createTempDir('biao-pm-agent-timeout-child-');
+  const child = join(dir, 'hang-with-child.mjs');
+  writeFileSync(child, `#!/usr/bin/env node
+    import { spawn } from 'node:child_process';
+    import { readFileSync, writeFileSync } from 'node:fs';
+    readFileSync(0, 'utf8');
+    writeFileSync(${JSON.stringify(parentPidPath)}, String(process.pid));
+    const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    writeFileSync(${JSON.stringify(childPidPath)}, String(grandchild.pid));
+    setInterval(() => {}, 1000);
+  `, { mode: 0o755 });
+  chmodSync(child, 0o755);
+  return child;
+}
+
 async function startIntakeServer(items: unknown[]): Promise<{ url: string; paths: string[] }> {
   const paths: string[] = [];
   const server = createServer((req, res) => {
@@ -160,12 +178,25 @@ async function runWaker(args: string[], env: NodeJS.ProcessEnv): Promise<{ code:
   }
 }
 
-async function waitForFile(path: string, timeoutMs = 3_000): Promise<void> {
+async function waitForFile(path: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() > deadline) throw new Error(`等待文件超时：${path}`);
     await new Promise((resolve) => setTimeout(resolve, 15));
   }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`进程 ${pid} 在超时后仍存活`);
 }
 
 function readRecords(path: string): Array<Record<string, unknown>> {
@@ -186,6 +217,54 @@ describe('PM Agent one-shot waker', () => {
     expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
     expect(readRecords(output)).toEqual([]);
     expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+  });
+
+  it('只有 pending acceptance_ready 时保留平台可见性，但不启动 PM 模型', async () => {
+    const { url, paths } = await startIntakeServer([
+      { kind: 'acceptance_ready', plan_id: 'p1', task_id: 'acceptance-pending', event_id: 'ready-1' },
+    ]);
+    const dir = createTempDir('biao-pm-agent-acceptance-ready-');
+    const output = join(dir, 'child.jsonl');
+
+    const result = await runWaker(['--once', '--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: captureCommand(output),
+    });
+
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    expect(readRecords(output)).toEqual([]);
+    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+  });
+
+  it('首次扫描后事项已被其他 PM 消解时，启动模型前二次确认并静默退出', async () => {
+    const paths: string[] = [];
+    let reads = 0;
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      paths.push(`${req.method ?? 'GET'} ${url.pathname}${url.search}`);
+      res.setHeader('content-type', 'application/json');
+      reads++;
+      const items = reads === 1
+        ? [{ kind: 'review_requested', plan_id: 'p1', task_id: 'task-1', event_id: 'event-old' }]
+        : [];
+      res.end(JSON.stringify({ ok: true, data: { consumer: 'pm-a', cursor: `${reads}-0`, items } }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('mock intake server 未监听');
+    const dir = createTempDir('biao-pm-agent-race-');
+    const output = join(dir, 'child.jsonl');
+
+    const result = await runWaker([
+      '--once', '--biao-url', `http://127.0.0.1:${address.port}`, '--consumer', 'pm-a', '--lock-dir', dir,
+    ], { BIAO_PM_AGENT_CMD: captureCommand(output) });
+
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+    expect(readRecords(output)).toEqual([]);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
   });
 
   it('有 PM 事项时只启动一次，并仅交付无详情的汇总 payload', async () => {
@@ -222,7 +301,10 @@ describe('PM Agent one-shot waker', () => {
       count: 3,
     });
     expect(JSON.stringify(payload)).not.toContain('forbidden');
-    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
   });
 
   it('显式 PM adapter 是含空格的绝对路径时不经 shell 拆分', async () => {
@@ -297,6 +379,8 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
     expect(invoked.argv).toContain(realpathSync(workspace));
     expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm-start')));
     expect(invoked.stdin).toContain(shellQuote(join(canonicalRuntime, 'pm')));
+    expect(invoked.stdin).toContain('旧 attempt 的失败字段绝不能冒充当前交付结果');
+    expect(invoked.stdin).toContain('`changed_files=[]` 也不是自动拒绝条件');
   });
 
   it('有事项却没有显式 command 时给出可辨识配置失败，不启动 child', async () => {
@@ -334,8 +418,42 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
     expect(paths).toEqual([
       'GET /intake?consumer=pm-a',
       'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
     ]);
   });
+
+  it('PM Agent 卡死时终止整个进程组、释放锁并让 Supervisor 下轮重试', async () => {
+    const { url, paths } = await startIntakeServer([
+      { kind: 'review_requested', plan_id: 'p1', task_id: 'task-1', event_id: 'e1' },
+    ]);
+    const dir = createTempDir('biao-pm-agent-timeout-');
+    const parentPidPath = join(dir, 'parent.pid');
+    const childPidPath = join(dir, 'child.pid');
+    const command = hangingProcessTreeCommand(parentPidPath, childPidPath);
+
+    const timedOut = await runWaker(['--once', '--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: command,
+      BIAO_PM_AGENT_TIMEOUT_MS: '3000',
+    });
+
+    expect(timedOut.code).toBe(1);
+    expect(timedOut.stderr).toContain('超过 3000ms');
+    const parentPid = Number(readFileSync(parentPidPath, 'utf8'));
+    const childPid = Number(readFileSync(childPidPath, 'utf8'));
+    await Promise.all([waitForProcessExit(parentPid), waitForProcessExit(childPid)]);
+
+    const retried = await runWaker(['--once', '--biao-url', url, '--consumer', 'pm-a', '--lock-dir', dir], {
+      BIAO_PM_AGENT_CMD: '/usr/bin/true',
+      BIAO_PM_AGENT_TIMEOUT_MS: '3000',
+    });
+    expect(retried.code).toBe(0);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
+  }, 10_000);
 
   it('plans 只在客户端过滤，且只唤醒被允许范围内的事项', async () => {
     const { url, paths } = await startIntakeServer([
@@ -358,7 +476,10 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
       kinds: { question_asked: 1 },
       count: 1,
     });
-    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
   });
 
   it('服务端确认仍持有 running task 的 stale_agent 时才唤醒，且不泄露 agent 详情', async () => {
@@ -385,7 +506,10 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
     });
     expect(JSON.stringify(payload)).not.toContain('worker-private-id');
     expect(JSON.stringify(payload)).not.toContain('task-private-id');
-    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
   });
 
   it('重叠 cron/launchd 触发只允许一个 PM Agent child 和一次 intake', async () => {
@@ -411,7 +535,10 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
       });
       expect(second).toEqual({ code: 0, stdout: '', stderr: '' });
       expect(readRecords(output)).toHaveLength(1);
-      expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+      expect(paths).toEqual([
+        'GET /intake?consumer=pm-a',
+        'GET /intake?consumer=pm-a',
+      ]);
 
       writeFileSync(release, 'release');
       const code = await new Promise<number | null>((resolve, reject) => {
@@ -445,7 +572,10 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
       const forged = await runForgedInternalHandoff(args, env, nonce);
       expect(forged).toEqual({ code: 0, stdout: '', stderr: '', acknowledgement: nonce });
       expect(readRecords(output)).toHaveLength(1);
-      expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+      expect(paths).toEqual([
+        'GET /intake?consumer=pm-a',
+        'GET /intake?consumer=pm-a',
+      ]);
     } finally {
       writeFileSync(release, 'release');
       if (first.exitCode === null) {
@@ -469,7 +599,10 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
 
     expect(result.code).toBe(0);
     expect(readRecords(output)).toHaveLength(1);
-    expect(paths).toEqual(['GET /intake?consumer=pm-a']);
+    expect(paths).toEqual([
+      'GET /intake?consumer=pm-a',
+      'GET /intake?consumer=pm-a',
+    ]);
     expect(readFileSync(stalePath, 'utf8')).toBe('stale-content-that-is-not-an-owner-record');
     expect(statSync(stalePath).ino).toBe(inode);
   });
@@ -529,6 +662,8 @@ writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
       expect(recovered.code).toBe(0);
       expect(readRecords(output)).toHaveLength(2);
       expect(paths).toEqual([
+        'GET /intake?consumer=pm-a',
+        'GET /intake?consumer=pm-a',
         'GET /intake?consumer=pm-a',
         'GET /intake?consumer=pm-a',
       ]);

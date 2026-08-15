@@ -17,6 +17,29 @@ export interface PlanSummary {
   status: string;
   project_path: string;
   task_count: number;
+  runtime_task_count?: number;
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
+}
+
+export interface RootTaskLifecycle {
+  total: number;
+  pending: number;
+  running: number;
+  blocked: number;
+  review_pending: number;
+  accepted: number;
+  failed: number;
+  needs_pm_decision: number;
+  cancelled: number;
+  declared_total: number;
+  consistent: boolean;
+}
+
+export interface ReviewCounts {
+  pending: number;
+  accepted: number;
+  rejected: number;
 }
 
 export interface AgentInfo {
@@ -49,6 +72,9 @@ export interface StatusData {
     accepted: number;
     rejected: number;
   };
+  /** 以声明根任务计数；repair/reverify 仅保留在 reviews 审计中。 */
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
   /** 当前需要处理的异常；旧 tasks/reviews 字段仍保留原始审计总数。 */
   attention?: StatusAttention;
   /** 已闭环失败/拒绝与历史 Agent 的独立统计。 */
@@ -80,6 +106,8 @@ export interface TaskSummary {
   claimed_at?: number;
   expire_at?: number;
   done_at?: number;
+  created_at?: number;
+  updated_at?: number;
   status?: string;
   retries?: number;
   max_retries?: number;
@@ -94,6 +122,11 @@ export interface TaskSummary {
   failure_reason?: string;
   blocked_reason?: string;
   blocked_at?: number;
+  cancelled_at?: number;
+  cancel_reason?: string;
+  superseded_at?: number;
+  superseded_by?: string;
+  superseded_reason?: string;
   /**
    * 自动修复闭环字段。它们不改写原始 status/PM Review：
    * failed/rejected 仍是可审计事实，resolved 只表示后续修复已独立验收。
@@ -119,6 +152,10 @@ export interface PlanData {
   status: string;
   project_path: string;
   task_count: number;
+  declared_task_count?: number;
+  runtime_task_count?: number;
+  root_reviews?: ReviewCounts;
+  root_tasks?: RootTaskLifecycle;
   created_at: number;
   phases: string[];
   tasks: {
@@ -138,26 +175,23 @@ interface ApiResponse<T> {
   error?: { code: string; message: string };
 }
 
-const API_TOKEN_STORAGE_KEY = 'biao_api_token';
-
-export function getApiToken(): string {
-  if (typeof window === 'undefined') return '';
-  return window.sessionStorage.getItem(API_TOKEN_STORAGE_KEY) ?? '';
+export interface HumanSessionData {
+  authenticated: boolean;
+  mode: 'local_owner' | 'auth_disabled' | string;
+  local_session_available: boolean;
 }
 
-export function setApiToken(token: string): void {
+function clearLegacyBrowserToken(): void {
   if (typeof window === 'undefined') return;
-  const normalized = token.trim();
-  if (normalized) window.sessionStorage.setItem(API_TOKEN_STORAGE_KEY, normalized);
-  else window.sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  try {
+    window.sessionStorage.removeItem('biao_api_token');
+  } catch {
+    // 浏览器禁用 sessionStorage 时无需影响本机 Owner 会话。
+  }
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  const token = getApiToken();
-  if (token) headers.set('Authorization', `Bearer ${token}`);
-
-  const res = await fetch(url, { ...init, headers });
+  const res = await fetch(url, { ...init, credentials: init?.credentials ?? 'same-origin' });
   if (!res.ok) {
     let detail = '';
     try {
@@ -173,6 +207,31 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(body.error ? `${body.error.code}: ${body.error.message}` : `API error: ${url}`);
   }
   return body.data as T;
+}
+
+async function publicSessionRequest(url: string, init?: RequestInit): Promise<HumanSessionData> {
+  const res = await fetch(url, { ...init, credentials: 'same-origin' });
+  const body = (await res.json()) as ApiResponse<HumanSessionData>;
+  if (!res.ok || !body.ok || !body.data) {
+    throw new Error(body.error ? `${body.error.code}: ${body.error.message}` : `HTTP ${res.status}: ${url}`);
+  }
+  return body.data;
+}
+
+/** 人类 PM 的 HttpOnly 本机 Owner 会话；Agent Bearer Token 永远不进入此流程。 */
+export function fetchHumanSession(): Promise<HumanSessionData> {
+  return publicSessionRequest('/auth/session');
+}
+
+export async function beginLocalOwnerSession(): Promise<HumanSessionData> {
+  const session = await publicSessionRequest('/auth/local-session', { method: 'POST' });
+  // 迁移旧页面：成功建立 HttpOnly 会话后，主动删掉旧版留在 sessionStorage 的 Token。
+  clearLegacyBrowserToken();
+  return session;
+}
+
+export function endLocalOwnerSession(): Promise<HumanSessionData> {
+  return publicSessionRequest('/auth/local-session', { method: 'DELETE' });
 }
 
 /** GET /status → 全局任务计数、plan 列表、agent 列表 */
@@ -223,6 +282,21 @@ export interface TaskReviewInfo {
   claimed_by: string;
   done_at: string | number;
   pm_review_status: string;
+  pm_reject_reason?: string;
+  pm_fix_instructions?: string;
+  pm_rejection_resolution_mode?: string;
+  failure_reason?: string;
+  block_reason?: string;
+  fix_for?: string;
+  repair_root_task_id?: string;
+  resolution_status?: string;
+  resolution_action?: string;
+  resolution_task_id?: string;
+  resolution_task_ids?: string[];
+  resolved_by_task?: string;
+  resolution_generation?: number;
+  resolution_attempts?: number;
+  resolution_decision_reason?: string;
   result_md: string;
   result_json: Record<string, unknown>;
   changed_files: string[];
@@ -264,11 +338,11 @@ export async function resetTask(taskId: string, force: boolean): Promise<{ task_
   });
 }
 
-export async function cancelTask(taskId: string): Promise<{ task_id: string; status: string }> {
+export async function cancelTask(taskId: string, reason: string): Promise<{ task_id: string; status: string }> {
   return request<{ task_id: string; status: string }>(`/task/${encodeURIComponent(taskId)}/cancel`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify({ reason }),
   });
 }
 
@@ -289,8 +363,8 @@ const EVENT_RECONNECT_MAX_MS = 60_000;
 const EVENT_FALLBACK_POLL_MS = 60_000;
 
 /**
- * 订阅实时事件流（SSE）。有 Token 时使用可携带 Authorization header 的
- * fetch 流；无 Token 时继续使用浏览器 EventSource。标签页进入后台会暂停连接，
+ * 订阅实时事件流（SSE）。本机 Owner Cookie 走 same-origin fetch 流；没有 fetch
+ * 能力时再降级浏览器 EventSource。标签页进入后台会暂停连接，
  * 断线采用有上限的指数退避，避免网络故障时形成忙循环。
  * @returns unsubscribe 清理函数（关闭连接、定时器和 visibility listener）
  */
@@ -298,7 +372,6 @@ export function subscribeToEvents(
   onUpdate: (event: BiaoEvent) => void,
   onError?: () => void,
 ): () => void {
-  const token = getApiToken();
   let stopped = false;
   let reconnectDelay = EVENT_RECONNECT_INITIAL_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -344,7 +417,6 @@ export function subscribeToEvents(
         method: 'GET',
         headers: {
           Accept: 'text/event-stream',
-          Authorization: `Bearer ${token}`,
         },
         cache: 'no-store',
         credentials: 'same-origin',
@@ -389,7 +461,7 @@ export function subscribeToEvents(
     }
   };
 
-  const startAuthenticatedStream = () => {
+  const startSessionStream = () => {
     if (stopped || !isVisible() || fetchController) return;
     const controller = new AbortController();
     fetchController = controller;
@@ -402,7 +474,7 @@ export function subscribeToEvents(
     reconnectDelay = Math.min(reconnectDelay * 2, EVENT_RECONNECT_MAX_MS);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
-      startAuthenticatedStream();
+      startSessionStream();
     }, delay);
   }
 
@@ -429,7 +501,7 @@ export function subscribeToEvents(
 
   const resume = () => {
     if (stopped || !isVisible()) return;
-    if (token) startAuthenticatedStream();
+    if (typeof fetch === 'function') startSessionStream();
     else if (typeof EventSource !== 'undefined') startEventSource();
     else startPolling();
   };

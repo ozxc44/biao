@@ -14,7 +14,9 @@ import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import { keys } from '../src/redis/keys.js';
 import type { BiaoConfig } from '../src/types/index.js';
 
-const REDIS_URL = process.env.REPAIR_OWNERSHIP_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/13';
+// status-plan-projection 对 DB 13 使用“必须从空库开始”的独占门；本套件必须使用
+// 自己的库并在结束后清理，避免一次全量测试成功后让下一次稳定失败。
+const REDIS_URL = process.env.REPAIR_OWNERSHIP_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/9';
 const PROJECT_PATH = '/tmp/biao-repair-ownership-escalation';
 
 let redis: Redis;
@@ -36,7 +38,10 @@ beforeEach(async () => {
   }, 0);
 });
 
-afterAll(() => redis.disconnect());
+afterAll(async () => {
+  await redis.flushdb();
+  redis.disconnect();
+});
 
 async function doneSource(taskId: string, ownership = {
   files: ['apps/api/src/mail/source.ts'],

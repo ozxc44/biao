@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Local-first multi-agent PM, scheduling, ownership and acceptance platform",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ozxc44/biao.git"
@@ -25,16 +25,26 @@
     "scripts/verify-package.mjs",
     "scripts/pm-agent.mjs",
     "scripts/codex-pm-agent.mjs",
+    "scripts/adapter-kit.mjs",
+    "scripts/worker-agent.mjs",
+    "scripts/supervisor-config.mjs",
     "scripts/supervisor.mjs",
     "scripts/install.sh",
     "docs",
     "AGENTS.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "NOTICE",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "SECURITY.md"
   ],
   "bin": {
     "biao": "bin/biao.js",
     "biao-bootstrap": "bin/biao-bootstrap.js",
+    "biao-adapter-kit": "bin/biao-adapter-kit.js",
+    "biao-worker-agent": "bin/biao-worker-agent.js",
+    "biao-supervisor-config": "bin/biao-supervisor-config.js",
     "biao-worker": "bin/biao-worker.js",
     "cli-worker": "bin/cli-worker.js",
     "codex-worker": "bin/codex-worker.js",

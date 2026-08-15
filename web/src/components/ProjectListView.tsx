@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   createPlan,
   fetchPlan,
@@ -9,6 +9,7 @@ import {
   type StatusData,
 } from '../api';
 import { useI18n } from '../i18n/I18nContext';
+import { buildPmConnectionGuide, buildWorkerConnectionGuide } from '../guides';
 import { getStatusLabel } from '../i18n/status';
 import { formatHeartbeat, formatTimestamp } from '../i18n/time';
 import type { Locale } from '../i18n/translations';
@@ -17,11 +18,13 @@ import {
   countOnlineAgents,
   getGlobalStatusSummary,
   getPlanAttention,
+  getPlanSummaryProgress,
   getStatusHintMessage,
   partitionAgents,
   validatePlanId,
   type PlanAttentionAction,
 } from '../view-model';
+import CopyButton from './CopyButton';
 
 interface PlanProgress {
   accepted: number;
@@ -50,16 +53,23 @@ export function ProjectListView({
   const [error, setError] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
   const [now, setNow] = useState(Date.now());
+  const loadGeneration = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
+      const generation = ++loadGeneration.current;
       try {
         const nextStatus = await fetchStatus();
         const nextProgress: Record<string, PlanProgress> = {};
         const onlineAgents = countOnlineAgents(nextStatus.agents ?? []);
         await Promise.all(
           (nextStatus.plans ?? []).map(async (planSummary) => {
+            const projected = getPlanSummaryProgress(planSummary, onlineAgents);
+            if (projected) {
+              nextProgress[planSummary.plan_id] = projected;
+              return;
+            }
             try {
               const plan = await fetchPlan(planSummary.plan_id);
               const accepted = acceptedProgress(
@@ -95,13 +105,15 @@ export function ProjectListView({
             }
           }),
         );
-        if (!cancelled) {
+        if (!cancelled && generation === loadGeneration.current) {
           setStatus(nextStatus);
           setProgress(nextProgress);
           setError(null);
         }
       } catch (loadError) {
-        if (!cancelled) setError(loadError instanceof Error ? loadError.message : String(loadError));
+        if (!cancelled && generation === loadGeneration.current) {
+          setError(loadError instanceof Error ? loadError.message : String(loadError));
+        }
       }
     };
 
@@ -123,7 +135,8 @@ export function ProjectListView({
   if (error && !status) return <ErrorNotice message={error} onRetry={() => setReloadTick((v) => v + 1)} />;
   if (!status) return <div className="notice">{t('common.loadingConsole')}</div>;
 
-  const reviews = status.reviews ?? { ...EMPTY_REVIEWS, pending: status.tasks.done };
+  // 首页展示的是声明根任务口径；旧服务没有 root_reviews 时再兼容 raw attempt 口径。
+  const reviews = status.root_reviews ?? status.reviews ?? { ...EMPTY_REVIEWS, pending: status.tasks.done };
   const onlineAgents = countOnlineAgents(status.agents ?? []);
   const summary = getGlobalStatusSummary(status);
   const agentGroups = status.agent_groups ?? partitionAgents(status.agents ?? []);
@@ -143,8 +156,8 @@ export function ProjectListView({
       {hintMessage && <div className="banner warning">{hintMessage}</div>}
 
       <section className="metric-grid" aria-label={t('projectList.metricsAriaLabel')}>
-        <Metric label={t('projectList.metricPending')} value={status.tasks.pending} tone="neutral" />
-        <Metric label={t('projectList.metricRunning')} value={status.tasks.running} tone="blue" />
+        <Metric label={t('projectList.metricPending')} value={status.root_tasks?.pending ?? status.tasks.pending} tone="neutral" />
+        <Metric label={t('projectList.metricRunning')} value={status.root_tasks?.running ?? status.tasks.running} tone="blue" />
         <Metric label={t('projectList.metricReviewPending')} value={reviews.pending} tone="amber" />
         <Metric label={t('projectList.metricAccepted')} value={reviews.accepted} tone="green" />
         <Metric label={t('projectList.metricRejected')} value={summary.attention.rejected} tone="red" />
@@ -192,7 +205,13 @@ export function ProjectListView({
           <h2>{t('projectList.projectsHeading')}</h2>
           <p>{t('projectList.projectsHint')}</p>
         </div>
-        <CreatePlanForm locale={locale} onCreated={() => setReloadTick((value) => value + 1)} />
+        <div className="project-heading-actions">
+          <CopyButton
+            text={buildPmConnectionGuide(locale, serviceOrigin())}
+            label={t('projectList.copyPmGuideButton')}
+          />
+          <CreatePlanForm locale={locale} onCreated={() => setReloadTick((value) => value + 1)} />
+        </div>
       </div>
 
       <section className="plan-list" aria-label={t('projectList.projectsHeading')}>
@@ -478,23 +497,18 @@ function CreatePlanForm({ locale, onCreated }: { locale: Locale; onCreated: () =
 }
 
 function CopyGuideButton({ plan }: { plan: PlanSummary }) {
-  const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
-  const handleCopy = async () => {
-    const guide = `# ${t('projectList.copyGuideTitle')}\n\n- ${t('projectList.copyGuideService')}：http://localhost:7331\n- ${t('projectList.copyGuidePlanId')}：${plan.plan_id}\n- ${t('projectList.copyGuideProjectPath')}：${plan.project_path}\n\n${t('projectList.copyGuideInstructions', { project_path: plan.project_path })}`;
-    try {
-      await navigator.clipboard.writeText(guide);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(false);
-    }
-  };
-  return (
-    <button type="button" className="btn text small" onClick={() => void handleCopy()}>
-      {copied ? t('projectList.copyGuideCopied') : t('projectList.copyGuideButton')}
-    </button>
-  );
+  const { locale, t } = useI18n();
+  return <CopyButton
+    text={buildWorkerConnectionGuide(locale, serviceOrigin(), {
+      planId: plan.plan_id,
+      projectPath: plan.project_path,
+    })}
+    label={t('projectList.copyGuideButton')}
+  />;
+}
+
+function serviceOrigin(): string {
+  return typeof window === 'undefined' ? 'http://localhost:7331' : window.location.origin;
 }
 
 function ErrorNotice({ message, onRetry }: { message: string; onRetry: () => void }) {

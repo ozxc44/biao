@@ -20,6 +20,25 @@ import type { ClaimedTask, VerifyCommand } from '../src/types/index.js';
 
 let tmpDir: string;
 
+/**
+ * SIGKILL 已经让进程停止执行时，Linux 仍可能短暂保留一个等待 init 回收的
+ * zombie。它不能继续写入、持有 Worker slot 或运行 Agent，因此按终止处理。
+ */
+function isPidTerminated(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 1).trimStart().startsWith('Z');
+  } catch {
+    return true;
+  }
+}
+
 function transientFetchError(message = 'fetch failed'): TypeError {
   const error = new TypeError(message);
   Object.assign(error, { cause: { code: 'ECONNRESET' } });
@@ -326,6 +345,25 @@ describe('BiaoClient', () => {
     });
   });
 
+  it('Question 扩权申请通过 Worker 数据面发送结构化 requested_ownership', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { question_id: 'q-scope' } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new BiaoClient('http://biao.test', 'worker-1', 'worker-token');
+    await client.createQuestion(
+      'task-1', 'claim-1', '需要增加测试文件', '实现已完成',
+      { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    );
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      requested_ownership: { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    });
+  });
+
   it('共享 Supervisor 的冲突搁置通过受控接口释放当前 claim', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { blocked: true } }), {
       status: 200,
@@ -352,6 +390,15 @@ describe('Worker Question marker', () => {
       body: '选 A 还是 B？', checkpoint: '已完成 parse',
     });
     expect(() => extractQuestionMarker('BIAO_QUESTION: ask PM')).toThrow('必须是单行 JSON');
+  });
+
+  it('解析结构化 requested_ownership，供 PM 显式批准后 fresh claim', () => {
+    expect(extractQuestionMarker(
+      'BIAO_QUESTION: {"body":"需要扩权","requested_ownership":{"files":["tests/new.test.ts"],"modules":["api-tests"]}}',
+    )).toEqual({
+      body: '需要扩权',
+      requestedOwnership: { files: ['tests/new.test.ts'], modules: ['api-tests'] },
+    });
   });
 
   it('只从最后一条 Codex final agent_message 中识别嵌入的合法 Question 标记', () => {
@@ -934,7 +981,7 @@ describe('runAgentCli', () => {
     expect(r.exitCode).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(8_000);
     expect(Number.isSafeInteger(grandchildPid)).toBe(true);
-    expect(() => process.kill(grandchildPid, 0)).toThrow();
+    expect(isPidTerminated(grandchildPid)).toBe(true);
   }, 10_000);
 
   it.skipIf(process.platform === 'win32')('abort 先 SIGTERM 再强制回收 Agent 进程树，close 后不能 late-write', async () => {
@@ -988,8 +1035,8 @@ describe('runAgentCli', () => {
     expect(existsSync(termPath)).toBe(true);
     expect(existsSync(latePath)).toBe(false);
     expect(existsSync(grandchildLatePath)).toBe(false);
-    expect(() => process.kill(pids.parent, 0)).toThrow();
-    expect(() => process.kill(pids.grandchild, 0)).toThrow();
+    expect(isPidTerminated(pids.parent)).toBe(true);
+    expect(isPidTerminated(pids.grandchild)).toBe(true);
   }, 8_000);
 
   it('不存在的命令', async () => {

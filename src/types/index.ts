@@ -66,6 +66,13 @@ export interface PhaseDef {
 /** Question 状态（Worker 向 PM 提问的真实持久化实体） */
 export type QuestionStatus = 'open' | 'answered' | 'cancelled';
 
+export interface OwnershipScope {
+  files: string[];
+  modules: string[];
+}
+
+export type OwnershipDecision = 'approved' | 'rejected';
+
 /** Worker 创建 Question 的请求（POST /question） */
 export interface QuestionCreateRequest {
   task_id: string;
@@ -76,6 +83,8 @@ export interface QuestionCreateRequest {
   body: string;
   /** 可恢复 checkpoint/context：回答后重领时附带的上下文（如已完成的步骤、临时状态） */
   checkpoint?: string;
+  /** Worker 发现合法工作需要超出原任务范围时，向 PM 请求的结构化范围；不能自行生效。 */
+  requested_ownership?: Partial<OwnershipScope>;
 }
 
 /** PM 回答 Question 的请求（POST /question/:id/answer） */
@@ -85,6 +94,8 @@ export interface QuestionAnswerRequest {
   consumer: string;
   plan_id?: string;
   answer: string;
+  /** requested_ownership 存在时必须由 PM 显式批准或拒绝。 */
+  ownership_decision?: OwnershipDecision;
 }
 
 /** 持久化的 Question 记录 */
@@ -102,6 +113,10 @@ export interface QuestionRecord {
   answered_at?: number;
   answered_by?: string;
   answer?: string;
+  requested_ownership?: OwnershipScope;
+  ownership_decision?: OwnershipDecision;
+  ownership_before?: OwnershipScope;
+  ownership_after?: OwnershipScope;
 }
 
 /**
@@ -140,10 +155,15 @@ export interface TaskRecord extends TaskFrontmatter {
   /** 当前受控阻塞原因；PM Question 使用独立 Question 实体。 */
   block_reason?: string;
   blocked_at?: number;
+  /** 撤销时间与原因属于不可变审计；读取接口必须与 Redis/SQLite 真相一致。 */
+  cancelled_at?: number;
+  cancel_reason?: string;
   /** 修复任务指向的原始任务；保留原任务失败/拒绝审计，不改写历史。 */
   fix_for?: string;
   /** 一条自动修复链的根任务，用于限制重试并把最终验收回传给源任务。 */
   repair_root_task_id?: string;
+  /** 生成 reverify 时绑定的最新不可变 review/failed attempt，禁止误读更早拒绝。 */
+  trigger_review_task_id?: string;
   /** 失败、拒绝或验收失败后的可审计闭环状态。 */
   resolution_status?: ResolutionStatus;
   resolution_action?: ResolutionAction;
@@ -224,12 +244,15 @@ export interface ClaimedTask {
   phase: string;
   priority: number;
   ownership_files: string[];
+  ownership_modules?: string[];
   goal_md: string;
   timeout_seconds: number;
   claim_token: string;
   verify: VerifyCommand[];
   project_path: string;
   plan_id: string;
+  /** 任务显式模型；repair/reverify 从来源继承，执行器必须优先于 slot 默认值使用。 */
+  model_override?: string;
   /** 若该任务是因 Question 被回答而回到 pending，附带的回答上下文（PM 的答复） */
   question_answer?: string;
   question_id?: string;

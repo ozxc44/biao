@@ -99,6 +99,21 @@ describe('biao question CLI', () => {
     });
   });
 
+  it('ask 将结构化扩权 JSON 作为 requested_ownership 提交', async () => {
+    let received: Record<string, unknown> | undefined;
+    const url = await start(async (req) => {
+      received = await readJson(req);
+      return { ok: true, data: { question_id: 'q-scope', task_id: 't-1', pm_consumer: 'pm' } };
+    });
+    await runCli([
+      'question', 'ask', '--task', 't-1', '--claim-token', 'lease-1', '--agent-id', 'worker-1',
+      '--body', '需要新增测试', '--request-ownership', '{"files":["src/new.test.ts"],"modules":["tests"]}',
+    ], { BIAO_URL: url });
+    expect(received).toMatchObject({
+      requested_ownership: { files: ['src/new.test.ts'], modules: ['tests'] },
+    });
+  });
+
   it('get 只按归属 consumer + plan 读取正文，并打印精确可复制 ack 命令', async () => {
     const url = await start((req) => {
       expect(req.method).toBe('GET');
@@ -156,5 +171,27 @@ describe('biao question CLI', () => {
     expect(stdout).toContain('已回答 q-1');
     expect(stdout).toContain('.biao/pm pm ack --consumer pm-alpha --plan p-1 --event-id 1700000000000_question_asked_q-1');
     expect(received).toEqual({ consumer: 'pm-alpha', plan_id: 'p-1', answer: '按 A 方案继续' });
+  });
+
+  it.each([
+    ['--approve-ownership', 'approved'],
+    ['--reject-ownership', 'rejected'],
+  ])('answer %s 提交显式扩权决策', async (flag, decision) => {
+    let received: Record<string, unknown> | undefined;
+    const url = await start(async (req) => {
+      received = await readJson(req);
+      return { ok: true, data: { question_id: 'q-1', status: 'answered' } };
+    });
+    await runCli(['question', 'answer', 'q-1', '--answer', '已审查', flag], { BIAO_URL: url });
+    expect(received).toMatchObject({ ownership_decision: decision });
+  });
+
+  it('answer 拒绝同时批准和拒绝扩权，且不发送请求', async () => {
+    let requests = 0;
+    const url = await start(() => { requests++; return { ok: true, data: null }; });
+    await expect(runCli([
+      'question', 'answer', 'q-1', '--answer', '冲突', '--approve-ownership', '--reject-ownership',
+    ], { BIAO_URL: url })).rejects.toMatchObject({ code: 1 });
+    expect(requests).toBe(0);
   });
 });

@@ -146,9 +146,9 @@ describe('lease / ownership / report integrity', () => {
   });
 
   it('续租会同步延长当前任务的 ownership 过期时间', async () => {
-    await seedTask('renew-owner', { assignee: 'renew-agent', timeoutSeconds: 60 });
-    const task = await registerAndClaim('renew-agent');
     const glob = 'src/renew-lock/**';
+    await seedTask('renew-owner', { assignee: 'renew-agent', timeoutSeconds: 60, ownershipFiles: [glob] });
+    const task = await registerAndClaim('renew-agent');
     expect((await ownershipDeclare(redis, 'renew-agent', task.task_id, task.claim_token, [glob], true)).ok).toBe(true);
     const before = JSON.parse((await redis.hget(keys.hash.fileOwnership, glob))!);
 
@@ -258,7 +258,7 @@ describe('lease / ownership / report integrity', () => {
 
   it('claim 回收失效 lease 后会把等待该文件释放的任务恢复并只写一次 task_ready', async () => {
     const glob = 'src/reclaim-lock/**';
-    await seedTask('reclaim-owner', { assignee: 'owner-agent', priority: 9 });
+    await seedTask('reclaim-owner', { assignee: 'owner-agent', priority: 9, ownershipFiles: [glob] });
     await seedTask('reclaim-waiter', {
       assignee: 'waiter-agent',
       priority: 5,

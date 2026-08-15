@@ -5,6 +5,7 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
+import { createHmac } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -61,10 +62,46 @@ import { keys } from '../redis/keys.js';
 import type { BiaoConfig } from '../types/index.js';
 import { resolveAndValidateWorkspacePath } from './security.js';
 import {
+  isLoopbackHost,
+  isValidLocalOwnerSession,
+  issueLocalOwnerSession,
+  localOwnerClearCookie,
+  localOwnerSetCookie,
+  readCookie,
+  LOCAL_OWNER_COOKIE,
+} from './human-session.js';
+import {
   QUESTION_ANSWER_MAX_CHARS,
   QUESTION_BODY_MAX_CHARS,
   QUESTION_CHECKPOINT_MAX_CHARS,
 } from '../communication/question-context.js';
+
+type ScopedBiaoConfig = BiaoConfig & { workerApiToken?: string };
+
+const WORKER_TOKEN_CONTEXT = 'biao-worker-api-token-v1';
+
+/** Derive a one-way, scope-specific bearer without persisting a second secret. */
+export function deriveWorkerApiToken(ownerToken: string): string {
+  return createHmac('sha256', ownerToken).update(WORKER_TOKEN_CONTEXT).digest('hex');
+}
+
+/**
+ * Worker credentials are deliberately limited to the execution data plane.
+ * Identity-looking fields such as reviewed_by/consumer are audit metadata, not
+ * authorization, so they must never promote a Worker request into a PM request.
+ */
+function workerRequestAllowed(method: string, pathname: string): boolean {
+  const path = pathname.replace(/^\/api(?=\/)/, '');
+  if (method === 'GET' || method === 'HEAD') {
+    // Read access is also fail-closed: a future PM endpoint must not become Worker-readable
+    // merely because it was not added to a denylist. These are the only reads used by BiaoClient.
+    // Worker 需要当前 ownership roster 才能把共享工作树中的并发改动归给真正
+    // 持有者；该只读数据面不包含 PM token、结果正文或控制面能力。
+    return path === '/ownership' || path === '/ownership/active' || /^\/task\/[^/]+$/.test(path);
+  }
+  if (method !== 'POST') return false;
+  return /^(?:\/register|\/heartbeat|\/agent\/offline|\/claim|\/report|\/question|\/lease\/renew|\/ownership\/(?:declare|release)|\/task\/[^/]+\/block)$/.test(path);
+}
 
 const INSTALL_PACKAGE_PLACEHOLDER = '__BIAO_PKG_POSIX__';
 
@@ -135,6 +172,44 @@ const API_ENDPOINTS: Record<string, string> = {
 };
 
 const API_HINT = 'API 路径在根路径（无 /api 前缀，也兼容 /api 前缀）。curl http://localhost:7331/health 验证。';
+
+/**
+ * Redis 的 `$` 只能安全用于一次阻塞式 XREAD。这里采用非阻塞轮询，如果每轮继续
+ * 使用 `$`，游标会反复跳到“此刻最新”并永久漏掉连接后的事件。建连时将它冻结为
+ * 当前 stream 尾部的真实 ID；显式 last_id 则原样保留用于断线续传。
+ */
+export async function resolveEventStreamCursor(redis: Redis, requested: string): Promise<string> {
+  if (requested !== '$') return requested;
+  const latest = await redis.xrevrange(keys.stream.events, '+', '-', 'COUNT', 1);
+  return latest[0]?.[0] ?? '0-0';
+}
+
+function isLocalOwnerSessionPath(pathname: string): boolean {
+  return /^(?:\/api)?\/auth\/(?:session|local-session)$/.test(pathname);
+}
+
+function localOwnerSessionAvailable(config: BiaoConfig): boolean {
+  return Boolean(config.apiToken) && isLoopbackHost(config.host);
+}
+
+function hasLocalOwnerSession(cookieHeader: string | undefined, config: BiaoConfig): boolean {
+  return Boolean(
+    config.apiToken &&
+    localOwnerSessionAvailable(config) &&
+    isValidLocalOwnerSession(readCookie(cookieHeader, LOCAL_OWNER_COOKIE), config.apiToken),
+  );
+}
+
+/**
+ * Session 的创建只能来自控制台自己的同源浏览器请求。loopback 绑定保证请求来自本机，
+ * Origin + Sec-Fetch-Site 再阻断第三方页面把访问者静默登录为本机 Owner（login CSRF）。
+ */
+function isSameOriginBrowserRequest(headers: Record<string, string | string[] | undefined>): boolean {
+  const host = typeof headers.host === 'string' ? headers.host : undefined;
+  const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
+  const fetchSite = typeof headers['sec-fetch-site'] === 'string' ? headers['sec-fetch-site'] : undefined;
+  return Boolean(host && origin === `http://${host}` && fetchSite === 'same-origin');
+}
 
 const nonEmptyString = { type: 'string', minLength: 1 } as const;
 const absolutePath = { type: 'string', minLength: 1, pattern: '^/' } as const;
@@ -409,6 +484,15 @@ const requestSchemas = {
         claim_token: nonEmptyString,
         body: { type: 'string', minLength: 1, maxLength: QUESTION_BODY_MAX_CHARS },
         checkpoint: { type: 'string', maxLength: QUESTION_CHECKPOINT_MAX_CHARS },
+        requested_ownership: {
+          type: 'object',
+          minProperties: 1,
+          additionalProperties: false,
+          properties: {
+            files: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 512 } },
+            modules: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 512 } },
+          },
+        },
       },
     },
   },
@@ -422,6 +506,7 @@ const requestSchemas = {
         consumer: safeIdentifier,
         plan_id: safeIdentifier,
         answer: { type: 'string', minLength: 1, maxLength: QUESTION_ANSWER_MAX_CHARS },
+        ownership_decision: { type: 'string', enum: ['approved', 'rejected'] },
       },
     },
   },
@@ -467,6 +552,14 @@ const requestSchemas = {
       properties: {
         action: { type: 'string', enum: ['inspect', 'continue', 'cancel'] },
         decided_by: nonEmptyString,
+        repair_source_task_id: nonEmptyString,
+        repair_source_task_ids: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 64,
+          uniqueItems: true,
+          items: nonEmptyString,
+        },
       },
     },
   },
@@ -530,7 +623,7 @@ function findWebDist(): string | null {
 
 export async function createHttpServer(
   redis: Redis,
-  config: BiaoConfig,
+  config: ScopedBiaoConfig,
   options: { webDist?: string | null } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -598,13 +691,26 @@ export async function createHttpServer(
         requestUrl.pathname === '/' &&
         (req.headers.accept ?? '').includes('text/html') &&
         !(req.headers.accept ?? '').includes('application/json');
-      if (publicApiPath || publicFrontendEntry) return;
+      if (publicApiPath || publicFrontendEntry || isLocalOwnerSessionPath(requestUrl.pathname)) return;
 
-      if (req.headers.authorization !== `Bearer ${config.apiToken}`) {
+      const bearerAuthenticated = req.headers.authorization === `Bearer ${config.apiToken}`;
+      const workerAuthenticated = Boolean(
+        config.workerApiToken &&
+        req.headers.authorization === `Bearer ${config.workerApiToken}`,
+      );
+      const humanAuthenticated = hasLocalOwnerSession(req.headers.cookie, config);
+      if (!bearerAuthenticated && !workerAuthenticated && !humanAuthenticated) {
         return reply.status(401).send({
           ok: false,
           data: null,
           error: { code: 'UNAUTHORIZED', message: '需要有效的 Bearer API token' },
+        });
+      }
+      if (workerAuthenticated && !workerRequestAllowed(req.method, requestUrl.pathname)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'WORKER_SCOPE_DENIED', message: 'Worker 凭据无权执行 PM/Owner 控制面操作' },
         });
       }
     });
@@ -614,6 +720,7 @@ export async function createHttpServer(
     // 被拒请求制造无意义 permit；onResponse/onError 都按 owner 精确释放。
     app.addHook('preHandler', async (req, reply) => {
       const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
+      if (isLocalOwnerSessionPath(requestUrl.pathname)) return;
       const isRestore = /^(?:\/api)?\/db\/restore$/.test(requestUrl.pathname);
       const watchdogAutoFix = /^(?:\/api)?\/watchdog$/.test(requestUrl.pathname) &&
         ['true', '1'].includes(requestUrl.searchParams.get('auto_fix') ?? '');
@@ -655,7 +762,7 @@ export async function createHttpServer(
     // 仍在 settle 后才释放。
     app.addHook('preSerialization', async (req, reply, payload) => {
       const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
-      if (!maintenanceDiagnosticPath(requestUrl.pathname)) {
+      if (!maintenanceDiagnosticPath(requestUrl.pathname) && !isLocalOwnerSessionPath(requestUrl.pathname)) {
         const gate = await getRestoreMaintenanceGate(redis);
         if (gate) {
           reply.status(maintenanceStatus(gate.code));
@@ -673,6 +780,63 @@ export async function createHttpServer(
     });
     app.addHook('onResponse', async (req) => {
       await releaseRequestPermit(req).catch(() => undefined);
+    });
+
+    // 人类 PM 使用 HttpOnly 的本机 Owner 会话；Agent 继续走 Bearer Token。Cookie 从不携带
+    // BIAO_API_TOKEN，本机服务重启也可用同一配置密钥验证；旋转 API Token 会立即失效全部会话。
+    app.get('/auth/session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!config.apiToken) {
+        return { ok: true, data: { authenticated: true, mode: 'auth_disabled', local_session_available: false } };
+      }
+      return {
+        ok: true,
+        data: {
+          authenticated: hasLocalOwnerSession(req.headers.cookie, config),
+          mode: 'local_owner',
+          local_session_available: localOwnerSessionAvailable(config),
+        },
+      };
+    });
+
+    app.post('/auth/local-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!localOwnerSessionAvailable(config)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_UNAVAILABLE', message: '本机 Owner 会话只允许 loopback 部署' },
+        });
+      }
+      if (!isSameOriginBrowserRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_ORIGIN_DENIED', message: '本机 Owner 会话必须从控制台同源页面创建' },
+        });
+      }
+      reply.header('Set-Cookie', localOwnerSetCookie(issueLocalOwnerSession(config.apiToken!)));
+      return { ok: true, data: { authenticated: true, mode: 'local_owner', local_session_available: true } };
+    });
+
+    app.delete('/auth/local-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!isSameOriginBrowserRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'LOCAL_SESSION_ORIGIN_DENIED', message: '本机 Owner 会话必须从控制台同源页面创建' },
+        });
+      }
+      reply.header('Set-Cookie', localOwnerClearCookie());
+      return {
+        ok: true,
+        data: {
+          authenticated: false,
+          mode: config.apiToken ? 'local_owner' : 'auth_disabled',
+          local_session_available: localOwnerSessionAvailable(config),
+        },
+      };
     });
 
     // GET / → JSON 返回 API 目录；Accept: text/html 时返回前端看板
@@ -804,15 +968,21 @@ export async function createHttpServer(
       return getTask(redis, task_id);
     });
 
-    // GET /tasks?plan_id=&status=&limit= —— 批量查询任务（对应 biao task list）
+    // GET /tasks?plan_id=&status=&limit=&offset= —— 批量查询任务（对应 biao task list）
     app.get('/tasks', async (req) => {
-      const { plan_id, status, limit } = req.query as { plan_id?: string; status?: string; limit?: string };
-      const opts: { plan_id?: string; status?: string; limit?: number } = {};
+      const { plan_id, status, limit, offset } = req.query as {
+        plan_id?: string; status?: string; limit?: string; offset?: string;
+      };
+      const opts: { plan_id?: string; status?: string; limit?: number; offset?: number } = {};
       if (plan_id) opts.plan_id = plan_id;
       if (status) opts.status = status;
       if (limit) {
         const n = Number(limit);
         if (!Number.isNaN(n)) opts.limit = n;
+      }
+      if (offset) {
+        const n = Number(offset);
+        if (!Number.isNaN(n)) opts.offset = n;
       }
       return getTasks(redis, opts);
     });
@@ -826,7 +996,7 @@ export async function createHttpServer(
     // POST /task/:task_id/cancel —— 撤销 pending 任务（对应 biao task cancel）
     app.post('/task/:task_id/cancel', async (req) => {
       const { task_id } = req.params as { task_id: string };
-      return cancelTask(redis, task_id);
+      return cancelTask(redis, task_id, req.body as { reason?: string });
     });
 
     // 历史伪完成退出验收：不复用 reset，不清空 result/review；必须带理由与显式确认。
@@ -1153,7 +1323,7 @@ export async function createHttpServer(
       });
 
       const lastId = (req.query as { last_id?: string }).last_id ?? '$';
-      let cursor = lastId;
+      let cursor = await resolveEventStreamCursor(redis, lastId);
       let closed = false;
       let heartbeat: NodeJS.Timeout | undefined;
 

@@ -5,7 +5,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,12 +64,14 @@ export interface TaskRow {
   failure_reason?: string;
   fix_for?: string;
   repair_root_task_id?: string;
+  trigger_review_task_id?: string;
   /** TEXT 存储；空串表示尚未进入 resolution，非空值与公共 ResolutionStatus 同步。 */
   resolution_status?: string;
   /** TEXT 存储；包含 PM 显式 continue/cancel 决策语义，避免 SQLite 恢复后类型降级。 */
   resolution_action?: string;
   resolution_task_id?: string;
   resolution_task_ids?: string;
+  acceptance_repair_task_ids?: string;
   resolved_by_task?: string;
   resolution_generation?: number;
   resolution_attempts?: number;
@@ -81,6 +83,7 @@ export interface TaskRow {
   last_question_id: string;
   last_question_answer: string;
   cancelled_at: string;
+  cancel_reason?: string;
   superseded_at?: string;
   superseded_by?: string;
   superseded_reason?: string;
@@ -107,6 +110,10 @@ export interface QuestionRow {
   answered_at: string;
   answered_by: string;
   answer: string;
+  requested_ownership?: string;
+  ownership_decision?: string;
+  ownership_before?: string;
+  ownership_after?: string;
 }
 
 export interface AgentRegistrationRow {
@@ -183,11 +190,13 @@ export class SqliteStore {
   private readonly restoreWorkspaceRoots?: string[];
   private readonly excludeSystemTemporaryProjects: boolean;
   private readonly systemTemporaryRoots: string[];
+  private readonly dbPath: string;
 
   constructor(dbPath: string, options: SqliteStoreOptions = {}) {
     this.restoreWorkspaceRoots = options.restoreWorkspaceRoots?.map((root) => resolve(root));
     this.excludeSystemTemporaryProjects = options.excludeSystemTemporaryProjects ?? false;
     this.systemTemporaryRoots = (options.systemTemporaryRoots ?? defaultSystemTemporaryRoots()).map((root) => resolve(root));
+    this.dbPath = dbPath;
     const fileBacked = dbPath !== ':memory:';
     if (fileBacked) {
       // Question 正文、项目路径和验收记录都属于本机私有审计数据。先以 0600 创建/
@@ -228,7 +237,7 @@ export class SqliteStore {
     if (!sql) {
       // 兜底：内联 schema（避免找不到文件导致启动失败）
       sql = `CREATE TABLE IF NOT EXISTS plans (plan_id TEXT PRIMARY KEY, title TEXT, status TEXT DEFAULT 'submitted', project_path TEXT, default_assignee TEXT DEFAULT 'auto', default_priority INTEGER DEFAULT 5, phases TEXT DEFAULT '[]', task_count INTEGER DEFAULT 0, created_at TEXT, submitted_at TEXT);
-CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, title TEXT, type TEXT, phase TEXT, status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 5, assignee TEXT DEFAULT 'auto', ownership_files TEXT, ownership_modules TEXT, depends_on TEXT, timeout_seconds INTEGER DEFAULT 3600, max_retries INTEGER DEFAULT 2, model_override TEXT, acceptance_for TEXT, verify TEXT DEFAULT '[]', claimed_by TEXT, claimed_at TEXT, expire_at TEXT, result_path TEXT, result_json_path TEXT, done_at TEXT, retries INTEGER DEFAULT 0, pm_review_status TEXT, pm_reviewed_by TEXT, pm_reviewed_at TEXT, pm_review_comment TEXT, pm_accept_effects_applied TEXT, pm_reject_reason TEXT, pm_fix_instructions TEXT, pm_rejection_resolution_mode TEXT, repair_ownership_extension TEXT, pm_repair_ownership_required TEXT, pm_repair_ownership_intent TEXT, failure_reason TEXT, fix_for TEXT, repair_root_task_id TEXT, resolution_status TEXT, resolution_action TEXT, resolution_task_id TEXT, resolution_task_ids TEXT, resolved_by_task TEXT, resolution_generation INTEGER DEFAULT 0, resolution_attempts INTEGER DEFAULT 0, resolution_decision_reason TEXT, blocked_at TEXT, block_reason TEXT, blocked_question_id TEXT, blocked_lease_remaining TEXT, last_question_id TEXT, last_question_answer TEXT, cancelled_at TEXT, superseded_at TEXT, superseded_by TEXT, superseded_reason TEXT, supersede_preview_token TEXT, supersede_batch_size INTEGER, verify_results TEXT DEFAULT '[]', goal_md TEXT, created_at TEXT, updated_at TEXT, FOREIGN KEY (plan_id) REFERENCES plans(plan_id));
+CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, title TEXT, type TEXT, phase TEXT, status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 5, assignee TEXT DEFAULT 'auto', ownership_files TEXT, ownership_modules TEXT, depends_on TEXT, timeout_seconds INTEGER DEFAULT 3600, max_retries INTEGER DEFAULT 2, model_override TEXT, acceptance_for TEXT, verify TEXT DEFAULT '[]', claimed_by TEXT, claimed_at TEXT, expire_at TEXT, result_path TEXT, result_json_path TEXT, done_at TEXT, retries INTEGER DEFAULT 0, pm_review_status TEXT, pm_reviewed_by TEXT, pm_reviewed_at TEXT, pm_review_comment TEXT, pm_accept_effects_applied TEXT, pm_reject_reason TEXT, pm_fix_instructions TEXT, pm_rejection_resolution_mode TEXT, repair_ownership_extension TEXT, pm_repair_ownership_required TEXT, pm_repair_ownership_intent TEXT, failure_reason TEXT, fix_for TEXT, repair_root_task_id TEXT, trigger_review_task_id TEXT, resolution_status TEXT, resolution_action TEXT, resolution_task_id TEXT, resolution_task_ids TEXT, acceptance_repair_task_ids TEXT, resolved_by_task TEXT, resolution_generation INTEGER DEFAULT 0, resolution_attempts INTEGER DEFAULT 0, resolution_decision_reason TEXT, blocked_at TEXT, block_reason TEXT, blocked_question_id TEXT, blocked_lease_remaining TEXT, last_question_id TEXT, last_question_answer TEXT, cancelled_at TEXT, cancel_reason TEXT, superseded_at TEXT, superseded_by TEXT, superseded_reason TEXT, supersede_preview_token TEXT, supersede_batch_size INTEGER, verify_results TEXT DEFAULT '[]', goal_md TEXT, created_at TEXT, updated_at TEXT, FOREIGN KEY (plan_id) REFERENCES plans(plan_id));
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
     }
@@ -268,10 +277,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       failure_reason: 'TEXT',
       fix_for: 'TEXT',
       repair_root_task_id: 'TEXT',
+      trigger_review_task_id: 'TEXT',
       resolution_status: 'TEXT',
       resolution_action: 'TEXT',
       resolution_task_id: 'TEXT',
       resolution_task_ids: 'TEXT',
+      acceptance_repair_task_ids: 'TEXT',
       resolved_by_task: 'TEXT',
       resolution_generation: 'INTEGER DEFAULT 0',
       resolution_attempts: 'INTEGER DEFAULT 0',
@@ -283,6 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       last_question_id: 'TEXT',
       last_question_answer: 'TEXT',
       cancelled_at: 'TEXT',
+      cancel_reason: 'TEXT',
       superseded_at: 'TEXT',
       superseded_by: 'TEXT',
       superseded_reason: 'TEXT',
@@ -312,6 +324,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       (this.db.prepare('PRAGMA table_info(questions)').all() as Array<{ name: string }>).map((column) => column.name),
     );
     if (!questionColumns.has('asked_event_id')) this.db.exec('ALTER TABLE questions ADD COLUMN asked_event_id TEXT');
+    if (!questionColumns.has('requested_ownership')) this.db.exec('ALTER TABLE questions ADD COLUMN requested_ownership TEXT');
+    if (!questionColumns.has('ownership_decision')) this.db.exec('ALTER TABLE questions ADD COLUMN ownership_decision TEXT');
+    if (!questionColumns.has('ownership_before')) this.db.exec('ALTER TABLE questions ADD COLUMN ownership_before TEXT');
+    if (!questionColumns.has('ownership_after')) this.db.exec('ALTER TABLE questions ADD COLUMN ownership_after TEXT');
     this.db.exec(`CREATE TABLE IF NOT EXISTS agent_registrations (
       agent_id TEXT NOT NULL,
       registration_id TEXT NOT NULL,
@@ -447,10 +463,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       failure_reason: task.failure_reason ?? '',
       fix_for: task.fix_for ?? '',
       repair_root_task_id: task.repair_root_task_id ?? '',
+      trigger_review_task_id: task.trigger_review_task_id ?? '',
       resolution_status: task.resolution_status ?? '',
       resolution_action: task.resolution_action ?? '',
       resolution_task_id: task.resolution_task_id ?? '',
       resolution_task_ids: task.resolution_task_ids ?? '',
+      acceptance_repair_task_ids: task.acceptance_repair_task_ids ?? '',
       resolved_by_task: task.resolved_by_task ?? '',
       resolution_generation: task.resolution_generation ?? 0,
       resolution_attempts: task.resolution_attempts ?? 0,
@@ -462,6 +480,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       last_question_id: task.last_question_id ?? '',
       last_question_answer: task.last_question_answer ?? '',
       cancelled_at: task.cancelled_at ?? '',
+      cancel_reason: task.cancel_reason ?? '',
       superseded_at: task.superseded_at ?? '',
       superseded_by: task.superseded_by ?? '',
       superseded_reason: task.superseded_reason ?? '',
@@ -475,18 +494,18 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
          (task_id, plan_id, title, type, phase, status, priority, assignee, ownership_files, ownership_modules, depends_on,
           timeout_seconds, max_retries, model_override, acceptance_for, verify, claimed_by, claimed_at, expire_at,
           result_path, result_json_path, done_at, retries, pm_review_status, pm_reviewed_by, pm_reviewed_at,
-          pm_review_comment, pm_accept_effects_applied, pm_reject_reason, pm_fix_instructions, pm_rejection_resolution_mode, repair_ownership_extension, pm_repair_ownership_required, pm_repair_ownership_intent, failure_reason, fix_for, repair_root_task_id, resolution_status,
-          resolution_action, resolution_task_id, resolution_task_ids, resolved_by_task, resolution_generation, resolution_attempts, resolution_decision_reason,
+          pm_review_comment, pm_accept_effects_applied, pm_reject_reason, pm_fix_instructions, pm_rejection_resolution_mode, repair_ownership_extension, pm_repair_ownership_required, pm_repair_ownership_intent, failure_reason, fix_for, repair_root_task_id, trigger_review_task_id, resolution_status,
+          resolution_action, resolution_task_id, resolution_task_ids, acceptance_repair_task_ids, resolved_by_task, resolution_generation, resolution_attempts, resolution_decision_reason,
           blocked_at, block_reason, blocked_question_id,
-          blocked_lease_remaining, last_question_id, last_question_answer, cancelled_at, superseded_at, superseded_by, superseded_reason, supersede_preview_token, supersede_batch_size, verify_results, goal_md, created_at, updated_at)
+          blocked_lease_remaining, last_question_id, last_question_answer, cancelled_at, cancel_reason, superseded_at, superseded_by, superseded_reason, supersede_preview_token, supersede_batch_size, verify_results, goal_md, created_at, updated_at)
          VALUES
          (@task_id, @plan_id, @title, @type, @phase, @status, @priority, @assignee, @ownership_files, @ownership_modules, @depends_on,
           @timeout_seconds, @max_retries, @model_override, @acceptance_for, @verify, @claimed_by, @claimed_at, @expire_at,
           @result_path, @result_json_path, @done_at, @retries, @pm_review_status, @pm_reviewed_by, @pm_reviewed_at,
-          @pm_review_comment, @pm_accept_effects_applied, @pm_reject_reason, @pm_fix_instructions, @pm_rejection_resolution_mode, @repair_ownership_extension, @pm_repair_ownership_required, @pm_repair_ownership_intent, @failure_reason, @fix_for, @repair_root_task_id, @resolution_status,
-          @resolution_action, @resolution_task_id, @resolution_task_ids, @resolved_by_task, @resolution_generation, @resolution_attempts, @resolution_decision_reason,
+          @pm_review_comment, @pm_accept_effects_applied, @pm_reject_reason, @pm_fix_instructions, @pm_rejection_resolution_mode, @repair_ownership_extension, @pm_repair_ownership_required, @pm_repair_ownership_intent, @failure_reason, @fix_for, @repair_root_task_id, @trigger_review_task_id, @resolution_status,
+          @resolution_action, @resolution_task_id, @resolution_task_ids, @acceptance_repair_task_ids, @resolved_by_task, @resolution_generation, @resolution_attempts, @resolution_decision_reason,
           @blocked_at, @block_reason, @blocked_question_id,
-          @blocked_lease_remaining, @last_question_id, @last_question_answer, @cancelled_at, @superseded_at, @superseded_by, @superseded_reason, @supersede_preview_token, @supersede_batch_size, @verify_results, @goal_md, @created_at, @updated_at)`,
+          @blocked_lease_remaining, @last_question_id, @last_question_answer, @cancelled_at, @cancel_reason, @superseded_at, @superseded_by, @superseded_reason, @supersede_preview_token, @supersede_batch_size, @verify_results, @goal_md, @created_at, @updated_at)`,
       )
       .run(normalized);
   }
@@ -597,6 +616,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
     return (this.db.prepare('SELECT COUNT(*) as count FROM tasks').get() as { count: number }).count;
   }
 
+  /** 主文件与 WAL 体积：仅用于 /db/status 观测展示，不触发任何自动清理。 */
+  getFileSizes(): { main_bytes: number; wal_bytes: number } {
+    if (this.dbPath === ':memory:') return { main_bytes: 0, wal_bytes: 0 };
+    try {
+      const mainBytes = statSync(this.dbPath).size;
+      const walPath = `${this.dbPath}-wal`;
+      const walBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+      return { main_bytes: mainBytes, wal_bytes: walBytes };
+    } catch {
+      return { main_bytes: 0, wal_bytes: 0 };
+    }
+  }
+
   /** Redis 灾难恢复不能只看 task：Agent epoch 等空项目状态同样是安全真相。 */
   hasDurableState(): boolean {
     const row = this.db.prepare(`SELECT
@@ -636,13 +668,17 @@ CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);`;
       answered_at: q.answered_at ?? '',
       answered_by: q.answered_by ?? '',
       answer: q.answer ?? '',
+      requested_ownership: q.requested_ownership ?? '',
+      ownership_decision: q.ownership_decision ?? '',
+      ownership_before: q.ownership_before ?? '',
+      ownership_after: q.ownership_after ?? '',
     };
     this.db
       .prepare(
         `INSERT OR REPLACE INTO questions
-         (question_id, task_id, plan_id, agent_id, pm_consumer, asked_event_id, body, checkpoint, status, created_at, answered_at, answered_by, answer)
+         (question_id, task_id, plan_id, agent_id, pm_consumer, asked_event_id, body, checkpoint, status, created_at, answered_at, answered_by, answer, requested_ownership, ownership_decision, ownership_before, ownership_after)
          VALUES
-         (@question_id, @task_id, @plan_id, @agent_id, @pm_consumer, @asked_event_id, @body, @checkpoint, @status, @created_at, @answered_at, @answered_by, @answer)`,
+         (@question_id, @task_id, @plan_id, @agent_id, @pm_consumer, @asked_event_id, @body, @checkpoint, @status, @created_at, @answered_at, @answered_by, @answer, @requested_ownership, @ownership_decision, @ownership_before, @ownership_after)`,
       )
       .run(n);
   }

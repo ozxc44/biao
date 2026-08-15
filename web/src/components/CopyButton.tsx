@@ -6,9 +6,40 @@ interface CopyButtonProps {
   text: string;
   /** 按钮文字 */
   label: string;
+  className?: string;
 }
 
-export default function CopyButton({ text, label }: CopyButtonProps) {
+export async function copyTextToClipboard(
+  text: string,
+  clipboard: Pick<Clipboard, 'writeText'> | undefined = globalThis.navigator?.clipboard,
+  documentRef: Document | undefined = globalThis.document,
+): Promise<boolean> {
+  if (clipboard) {
+    try {
+      await clipboard.writeText(text);
+      return true;
+    } catch {
+      // Some embedded browsers expose the async API but reject it at runtime.
+    }
+  }
+
+  if (!documentRef?.body || typeof documentRef.execCommand !== 'function') return false;
+  const textarea = documentRef.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  documentRef.body.appendChild(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    return documentRef.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+}
+
+export default function CopyButton({ text, label, className = 'btn secondary small' }: CopyButtonProps) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -20,18 +51,15 @@ export default function CopyButton({ text, label }: CopyButtonProps) {
   }, []);
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyTextToClipboard(text)) {
       setCopied(true);
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // 剪贴板不可用（如非安全上下文），静默忽略
     }
   };
 
   return (
-    <button type="button" className="btn-copy" onClick={() => void handleCopy()}>
+    <button type="button" className={className} onClick={() => void handleCopy()}>
       {copied ? t('copyButton.copied') : label}
     </button>
   );

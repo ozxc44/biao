@@ -34,6 +34,25 @@ describe('npm package contents', () => {
     expect([...new Set(linkedDocs)].filter((path) => !packagedPaths.has(path))).toEqual([]);
   });
 
+  it('documents the three-step handoff from an unfamiliar Agent to Supervisor', () => {
+    const packageRoot = join(import.meta.dirname, '..');
+    const readme = readFileSync(join(packageRoot, 'README.md'), 'utf8');
+    const englishReadme = readFileSync(join(packageRoot, 'README.en.md'), 'utf8');
+    const guide = readFileSync(join(packageRoot, 'docs', 'agent-adapter-kit.md'), 'utf8');
+
+    expect(readme).toContain('docs/agent-adapter-kit.md');
+    expect(englishReadme).toContain('docs/agent-adapter-kit.md');
+    expect(englishReadme).toContain('contract → scaffold → check');
+    expect(guide).toContain('agent-kit contract --role');
+    expect(guide).toContain('agent-kit scaffold --role');
+    expect(guide).toContain('agent-kit check --role');
+    expect(guide).toContain('BIAO_WORKER_SLOTS');
+    expect(guide).toContain('BIAO_PM_AGENT_ROUTES');
+    expect(guide).toContain('Supervisor');
+    expect(readme).not.toContain('执行文件路径及固定参数中不要包含空格');
+    expect(englishReadme).not.toContain('executable path and fixed arguments must not contain spaces');
+  });
+
   it('package files declaration covers the complete prebuilt runtime used by bootstrap', () => {
     const packageRoot = join(import.meta.dirname, '..');
     const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as { files?: string[] };
@@ -63,11 +82,40 @@ describe('npm package contents', () => {
     expect(help).toContain('./bootstrap.sh --yes --workspace');
   });
 
+  it('exposes the credential-free Agent adapter kit as a packaged CLI', () => {
+    const packageRoot = join(import.meta.dirname, '..');
+    const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as {
+      bin?: Record<string, string>;
+    };
+    const packagedPaths = getPackagedPaths(packageRoot);
+
+    expect(packageJson.bin?.['biao-adapter-kit']).toBe('bin/biao-adapter-kit.js');
+    expect(packagedPaths).toContain('bin/biao-adapter-kit.js');
+    expect(packagedPaths).toContain('scripts/adapter-kit.mjs');
+  });
+
+  it('exposes the credential-free on-demand Worker waker as a packaged CLI', () => {
+    const packageRoot = join(import.meta.dirname, '..');
+    const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as {
+      bin?: Record<string, string>;
+    };
+    const packagedPaths = getPackagedPaths(packageRoot);
+
+    expect(packageJson.bin?.['biao-worker-agent']).toBe('bin/biao-worker-agent.js');
+    expect(packageJson.bin?.['biao-supervisor-config']).toBe('bin/biao-supervisor-config.js');
+    expect(packagedPaths).toContain('bin/biao-worker-agent.js');
+    expect(packagedPaths).toContain('scripts/worker-agent.mjs');
+    expect(packagedPaths).toContain('bin/biao-supervisor-config.js');
+    expect(packagedPaths).toContain('scripts/supervisor-config.mjs');
+  });
+
   it('the served local CLI installer exposes the same bootstrap command', () => {
     const packageRoot = join(import.meta.dirname, '..');
     const installer = readFileSync(join(packageRoot, 'scripts', 'install.sh'), 'utf8');
 
     expect(installer).toContain('bin/biao-bootstrap.js" "$BIN_DIR/biao-bootstrap"');
+    expect(installer).toContain('bin/biao-worker-agent.js" "$BIN_DIR/biao-worker-agent"');
+    expect(installer).toContain('bin/biao-supervisor-config.js" "$BIN_DIR/biao-supervisor-config"');
   });
 
   it('renders the served installer package path as inert POSIX shell data', () => {

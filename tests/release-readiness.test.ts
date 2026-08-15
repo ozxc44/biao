@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import YAML from 'yaml';
@@ -122,7 +122,7 @@ describe('release configuration', () => {
     expect(readme).toContain('排除但保留审计');
   });
 
-  it('keeps distribution private and unlicensed for public reuse', () => {
+  it('licenses public source under Apache-2.0 while keeping npm publishing disabled', () => {
     const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
       private?: boolean;
       license?: string;
@@ -132,7 +132,11 @@ describe('release configuration', () => {
       .map((name) => readFileSync(join(root, '.github', 'workflows', name), 'utf8'));
 
     expect(packageJson.private).toBe(true);
-    expect(packageJson.license).toBe('UNLICENSED');
+    expect(packageJson.license).toBe('Apache-2.0');
+    expect(readFileSync(join(root, 'LICENSE'), 'utf8')).toContain('Apache License');
+    for (const document of ['NOTICE', 'CONTRIBUTING.md', 'SECURITY.md']) {
+      expect(existsSync(join(root, document))).toBe(true);
+    }
     expect(workflowSources.join('\n')).not.toMatch(/\bnpm publish\b/);
   });
 });

@@ -458,11 +458,24 @@ describe('PM review 与状态可见性', () => {
       claim_token: 'to-block-token',
       reason: 'waiting_dependency',
     });
-    await cancelTask(redis, 'to-cancel');
+    const missingReason = await cancelTask(redis, 'to-cancel');
+    expect(missingReason).toMatchObject({
+      ok: false,
+      error: { code: 'CANCEL_REASON_REQUIRED' },
+    });
+    await cancelTask(redis, 'to-cancel', { reason: '该任务已由合并后的根任务替代' });
 
     const plan = await getPlan(redis, 'core-plan');
     expect(plan.data.tasks.blocked.map((t: { task_id: string }) => t.task_id)).toContain('to-block');
     expect(plan.data.tasks.cancelled.map((t: { task_id: string }) => t.task_id)).toContain('to-cancel');
+    expect(plan.data.tasks.cancelled.find((t: { task_id: string }) => t.task_id === 'to-cancel')).toMatchObject({
+      cancel_reason: '该任务已由合并后的根任务替代',
+      cancelled_at: expect.any(Number),
+    });
+    expect((await getTask(redis, 'to-cancel')).data).toMatchObject({
+      cancel_reason: '该任务已由合并后的根任务替代',
+      cancelled_at: expect.any(Number),
+    });
     const status = await getStatus(redis);
     expect(status.data).toMatchObject({ tasks: { blocked: 1, cancelled: 1 } });
   });
@@ -901,6 +914,15 @@ describe('文件占用解除后的自动恢复', () => {
     const owner = await claimAs('owner-agent');
     expect(owner.data?.task_id).toBe('reset-owner');
     await agentRegister(redis, 'waiter-agent', 'mock', ['code']);
+
+    // 在线 Worker 的执行现场不能被 PM reset/抢占；只在租约已经失效后允许人工恢复。
+    expect(await taskReset(redis, 'reset-owner', { force: true, reset_by: 'pm' })).toMatchObject({
+      ok: false,
+      error: { code: 'TASK_RUNNING_ACTIVE' },
+    });
+    await redis.del(keys.string.lease('reset-owner'));
+    await redis.hset(keys.hash.task('reset-owner'), 'expire_at', String(Date.now() - 1));
+    await redis.zadd(keys.zset.status.running, Date.now() - 1, 'reset-owner');
 
     // file-waiter 已拿到一个不冲突的执行片段、随后发现 shared 文件仍被 owner 占用；
     // 直接搭建该运行态以验证 /block → reset-release 的恢复状态机，而不是模拟 ownership 冲突本身。

@@ -11,6 +11,9 @@ echo "[biao] Installing CLI to $BIN_DIR"
 
 # 创建 symlink（bootstrap / biao / biao-worker / 各 agent worker）
 ln -sf "$BIAO_PKG/bin/biao-bootstrap.js" "$BIN_DIR/biao-bootstrap"
+ln -sf "$BIAO_PKG/bin/biao-adapter-kit.js" "$BIN_DIR/biao-adapter-kit"
+ln -sf "$BIAO_PKG/bin/biao-worker-agent.js" "$BIN_DIR/biao-worker-agent"
+ln -sf "$BIAO_PKG/bin/biao-supervisor-config.js" "$BIN_DIR/biao-supervisor-config"
 ln -sf "$BIAO_PKG/bin/biao.js" "$BIN_DIR/biao"
 ln -sf "$BIAO_PKG/bin/biao-worker.js" "$BIN_DIR/biao-worker"
 ln -sf "$BIAO_PKG/bin/cli-worker.js" "$BIN_DIR/cli-worker"

@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHttpServer } from '../src/server/http.js';
 import { SqliteStore, type PlanRow, type TaskRow } from '../src/db/sqlite-store.js';
-import { setSqliteStore, dbRestore, agentRegister, claim, taskBlock, taskResume, pmIntake } from '../src/server/service.js';
+import { activeLocalMutationCount, setSqliteStore, dbRestore, agentRegister, claim, taskBlock, taskResume, pmIntake, createQuestion, answerQuestion, getQuestion } from '../src/server/service.js';
 import { keys, pendingScore } from '../src/redis/keys.js';
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import type { BiaoConfig } from '../src/types/index.js';
@@ -74,6 +74,14 @@ async function http(method: string, url: string, payload?: unknown) {
 
 function body(response: Awaited<ReturnType<typeof http>>): any {
   return response.json();
+}
+
+async function waitForLocalMutationsToDrain(timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (activeLocalMutationCount() > 0) {
+    if (Date.now() >= deadline) throw new Error('HTTP mutation permit 未在限定时间内释放');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function eventFields(type: string): Promise<Record<string, string>[]> {
@@ -217,6 +225,118 @@ describe('Question HTTP 生命周期', () => {
     expect(conflict.error.code).toBe('ANSWER_CONFLICT');
   });
 
+  it('PM 可原子批准结构化扩权，fresh claim 获得并集且 Question 保留 before/after 审计', async () => {
+    const claimed = await claim(redis, { agent_id: 'worker-a', blocking: false });
+    const asked = body(await http('POST', '/question', {
+      task_id: 'question-task',
+      agent_id: 'worker-a',
+      claim_token: claimed.data!.claim_token,
+      body: '新增测试文件需要扩权',
+      checkpoint: 'implementation paused',
+      requested_ownership: {
+        files: ['src/question/new.test.ts', 'src/question/new.test.ts'],
+        modules: ['question-tests'],
+      },
+    }));
+    expect(asked.ok).toBe(true);
+    const questionId = asked.data!.question_id;
+
+    const detail = await getQuestion(redis, questionId, { consumer: 'pm-a' });
+    expect(detail.data).toMatchObject({
+      requested_ownership: { files: ['src/question/new.test.ts'], modules: ['question-tests'] },
+      ownership_before: { files: ['src/question/**'], modules: [] },
+    });
+
+    const answered = body(await http('POST', `/question/${questionId}/answer`, {
+      consumer: 'pm-a',
+      plan_id: 'question-plan',
+      answer: '批准新增测试文件',
+      ownership_decision: 'approved',
+    }));
+    expect(answered.ok).toBe(true);
+    expect(await redis.hget(keys.hash.task('question-task'), 'ownership_files'))
+      .toBe('src/question/**,src/question/new.test.ts');
+    expect(await redis.hget(keys.hash.task('question-task'), 'ownership_modules'))
+      .toBe('question-tests');
+
+    const audited = await getQuestion(redis, questionId, { consumer: 'pm-a' });
+    expect(audited.data).toMatchObject({
+      ownership_decision: 'approved',
+      ownership_before: { files: ['src/question/**'], modules: [] },
+      ownership_after: {
+        files: ['src/question/**', 'src/question/new.test.ts'],
+        modules: ['question-tests'],
+      },
+    });
+    expect(store.getQuestion(questionId)).toMatchObject({
+      requested_ownership: JSON.stringify({ files: ['src/question/new.test.ts'], modules: ['question-tests'] }),
+      ownership_decision: 'approved',
+      ownership_before: JSON.stringify({ files: ['src/question/**'], modules: [] }),
+      ownership_after: JSON.stringify({ files: ['src/question/**', 'src/question/new.test.ts'], modules: ['question-tests'] }),
+    });
+    await redis.flushdb();
+    await dbRestore(redis, store);
+    expect((await getQuestion(redis, questionId, { consumer: 'pm-a' })).data).toMatchObject({
+      ownership_decision: 'approved',
+      ownership_after: { files: ['src/question/**', 'src/question/new.test.ts'], modules: ['question-tests'] },
+    });
+    await agentRegister(redis, 'worker-a', 'mock', ['code']);
+    const reclaimed = await claim(redis, { agent_id: 'worker-a', blocking: false });
+    expect(reclaimed.data!.ownership_files).toEqual(['src/question/**', 'src/question/new.test.ts']);
+    expect(reclaimed.data!.ownership_modules).toEqual(['question-tests']);
+  });
+
+  it('拒绝扩权不改变任务范围；回答必须显式决策且跨 consumer/冲突重放不能覆盖审计', async () => {
+    const claimed = await claim(redis, { agent_id: 'worker-a', blocking: false });
+    const asked = await createQuestion(redis, {
+      task_id: 'question-task', agent_id: 'worker-a', claim_token: claimed.data!.claim_token,
+      body: '请求越界文件', requested_ownership: { files: ['src/other/new.ts'] },
+    });
+    const questionId = asked.data!.question_id;
+
+    const missingDecision = await answerQuestion(redis, questionId, {
+      question_id: questionId, consumer: 'pm-a', answer: '口头同意不算批准',
+    });
+    expect(missingDecision.error?.code).toBe('OWNERSHIP_DECISION_REQUIRED');
+    const foreign = await answerQuestion(redis, questionId, {
+      question_id: questionId, consumer: 'pm-b', answer: '批准', ownership_decision: 'approved',
+    });
+    expect(foreign.error?.code).toBe('CONSUMER_NOT_AUTHORIZED');
+
+    const rejected = await answerQuestion(redis, questionId, {
+      question_id: questionId, consumer: 'pm-a', answer: '不批准，请保持原范围', ownership_decision: 'rejected',
+    });
+    expect(rejected.ok).toBe(true);
+    expect(await redis.hget(keys.hash.task('question-task'), 'ownership_files')).toBe('src/question/**');
+
+    const replay = await answerQuestion(redis, questionId, {
+      question_id: questionId, consumer: 'pm-a', answer: '不批准，请保持原范围', ownership_decision: 'rejected',
+    });
+    expect(replay.ok).toBe(true);
+    const conflict = await answerQuestion(redis, questionId, {
+      question_id: questionId, consumer: 'pm-a', answer: '改为批准', ownership_decision: 'approved',
+    });
+    expect(conflict.error?.code).toBe('ANSWER_CONFLICT');
+    expect((await getQuestion(redis, questionId, { consumer: 'pm-a' })).data).toMatchObject({
+      ownership_decision: 'rejected',
+      ownership_after: { files: ['src/question/**'], modules: [] },
+    });
+  });
+
+  it.each([
+    { files: ['/tmp/escape.ts'] },
+    { files: ['src/../escape.ts'] },
+    { files: ['../escape.ts'] },
+    { files: ['src\\escape.ts'] },
+  ])('扩权请求拒绝非项目相对边界：%o', async (requested_ownership) => {
+    const claimed = await claim(redis, { agent_id: 'worker-a', blocking: false });
+    const asked = await createQuestion(redis, {
+      task_id: 'question-task', agent_id: 'worker-a', claim_token: claimed.data!.claim_token,
+      body: 'bad scope', requested_ownership,
+    });
+    expect(asked.error?.code).toBe('INVALID_REQUESTED_OWNERSHIP');
+  });
+
   it('旧版缺少 pm_consumer 的 Question 列表只归属默认 PM，不向其它 consumer 暴露元数据', async () => {
     await redis.hset(keys.hash.question('legacy-question-without-consumer'), {
       question_id: 'legacy-question-without-consumer',
@@ -269,6 +389,9 @@ describe('Question HTTP 生命周期', () => {
     }));
     const questionId = asked.data.question_id as string;
 
+    // Fastify inject 收到响应时，HTTP hook 的 permit finally 仍可能正在执行。
+    // dbRestore 必须拒绝真实并发写入；这里先等待同进程请求完全收尾，再验证重启恢复。
+    await waitForLocalMutationsToDrain();
     await redis.flushdb();
     await dbRestore(redis, store);
     const restored = body(await http('GET', '/question/' + questionId + '?consumer=pm-a'));

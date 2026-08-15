@@ -2,6 +2,10 @@
 
 本契约适用于 Codex、Kimi、通用 CLI 以及直接调用 HTTP API 的自定义 Worker。目标是让执行器只负责领取、在受限范围内完成任务、提交证据；它不能自行验收，也不能把 PM 决策退回给当前人类会话。
 
+若接入的是不了解 Biao 的新 harness，可先使用无凭据的
+[`agent-kit contract → scaffold → check`](agent-adapter-kit.md) 生成并离线验证单文件适配器，
+再把它登记为 Supervisor 的 custom Worker slot 或 Plan PM 路由。
+
 ## 先决条件
 
 在 clone 后先完成一次显式配置：
@@ -19,7 +23,7 @@
 
 `.biao/config.env` 包含服务地址、工作区和 API Token，权限为 `600`。将它视为本机凭据：不提交、不打印、不传给执行子进程。
 
-网页控制台启用鉴权时，保持 `.biao/start` 运行，另开终端执行 `.biao/copy-token`，再把剪贴板内容粘贴到网页右上角 **API Token**。网页只保存到当前标签页的 `sessionStorage`；命令不会把 Token 写进 argv、URL、版本库或默认终端输出。`.biao/token-status` 仅显示是否已配置和 SHA-256 指纹末尾。Linux 若没有 `wl-copy`、`xclip` 或 `xsel`，复制命令会安全失败并提示安装，不会回退为在终端显示凭据。
+人类 PM 在 loopback 本机直接打开网页，首次点击“进入控制台”即可获得 HttpOnly 本机 Owner 会话；浏览器不会接收或保存 API Token。`BIAO_API_TOKEN` 仅供 Worker、PM CLI 和受控 API 客户端使用，生成的启动器会从 `.biao/config.env` 读取它。`.biao/token-status` 仅显示是否已配置和 SHA-256 指纹末尾；`.biao/copy-token` 仅供受控 CLI 调试，不用于网页登录。
 
 ## PM Agent 不是 Worker
 
@@ -29,6 +33,12 @@ bootstrap 使用 `--pm-agent codex` 时，唯一共享 Supervisor 会在有 PM �
 # 不在命令行传 Token；只有有 PM 事项时才会启动一次该命令。
 BIAO_PM_AGENT_CMD='your-pm-agent-command' .biao/pm-agent --once
 ```
+
+若不同 Plan 由不同 PM 会话负责，使用 `BIAO_PM_AGENT_ROUTES` 做本机路由。每项包含
+`command`（适配器绝对路径或受控命令）和可选 `target`（会作为 `BIAO_PM_TARGET`
+传入）；精确 Plan 优先，`*` 为默认。命令与 target 不进入 Redis、任务正文或门铃 JSON。
+Codex 内置适配器把 target 解释为 thread ID；ZCode、Kimi 和其他 harness 的适配器
+必须读取同一份最小 stdin 门铃，自行回平台取详情，并用退出码表示是否真实处理完毕。
 
 被唤醒的 PM Agent 只能获得最小汇总，必须自行读取平台详情，并在实际处置后才 ack。它不自动 review、answer 或 ack，也不会自动安装 cron / launchd。Worker 遇到产品决策仍必须创建 Biao Question；不能把问题退回给当前人类，也不能假设 PM Agent 已经作答。文件占用、依赖等待和技术实现细节仍由 Worker / Supervisor 自行处理。
 
@@ -49,15 +59,16 @@ BIAO_PREFERRED_PROJECT=/path/to/workspace/my-project \
 bootstrap 生成的单 Worker 入口默认在队列为空后退出，适合一次性执行。多 Agent 的常驻场景应使用共享 Supervisor，而不是为每个 Worker 留一个独立空轮询循环：
 
 ```bash
-BIAO_WORKER_SLOTS='[
-  {"kind":"codex","agentId":"codex-impl-1","project":"/path/to/workspace/my-project","types":["code","docs"]},
-  {"kind":"kimi","agentId":"kimi-qa-1","project":"/path/to/workspace/my-project","types":["review","acceptance"]}
-]' .biao/supervisor --consumer pm --interval 60
+.biao/supervisor-config worker add --id codex-impl-1 --kind codex \
+  --project /path/to/workspace/my-project --types code,docs
+.biao/supervisor-config worker add --id kimi-qa-1 --kind kimi \
+  --project /path/to/workspace/my-project --types review,acceptance
+.biao/start
 ```
 
 `agentId` 在同一台机器上必须唯一；`project` 是传给 claim 的 `preferred_project`，只会领取完全匹配该项目路径的任务。每个 slot 的 `types` 只限制可领取任务类型，不会绕过依赖、独立验收或 ownership 规则。
 
-Supervisor 只有一个本机锁和一个共享低频主循环。空闲 slot 不创建独立 timer，也不各自轮询 claim；每个共享轮次只为每个空闲 slot 至多发送一次 presence heartbeat，避免服务端误判 stale。slot 一旦运行任务，presence heartbeat 停止，改由 Worker 自己维护带当前任务的 heartbeat 与 lease。所有受管 Plan 闭环后，Supervisor 自动退出。
+Supervisor 只有一个本机锁和一个共享低频主循环。它本身就是 Worker slot 的生命周期所有者，不要求 Codex/Kimi 先常驻在线：出现 pending、repair 或 reverify 时由 Supervisor 领取，领到后才启动实际 Agent CLI。空闲 slot 不创建独立 timer，也不各自轮询 claim；每个共享轮次只为每个空闲 slot 至多发送一次 presence heartbeat，避免服务端误判 stale。slot 一旦运行任务，presence heartbeat 停止，改由 Worker 自己维护带当前任务的 heartbeat 与 lease；任务结束后同一 Supervisor 立即检测下一项。所有受管 Plan 闭环后，Supervisor 自动退出。
 
 ## 必经的 Worker 生命周期
 
@@ -142,10 +153,10 @@ Lease 失效或 `CLAIM_TOKEN_INVALID` 后不得继续代表旧任务写入或 re
 
 | 角色 | HTTP API | CLI | 作用 |
 | --- | --- | --- | --- |
-| Worker | `POST /question` | `biao question ask` | 创建问题并带上当前任务、claim token 与可选 checkpoint。 |
+| Worker | `POST /question` | `biao question ask` | 创建问题并带上当前任务、claim token、可选 checkpoint 与结构化 `requested_ownership`。 |
 | PM | `GET /questions` | `biao question list` | 列出待处理 Question 的最小路由信息。 |
 | PM | `GET /question/:question_id` | `biao question get` | 读取问题正文与 checkpoint。 |
-| PM | `POST /question/:question_id/answer` | `biao question answer` | 记录 PM 答案并允许任务重新入队。 |
+| PM | `POST /question/:question_id/answer` | `biao question answer` | 记录 PM 答案；有扩权申请时必须显式批准或拒绝，再允许任务重新入队。 |
 
 ```text
 BIAO_QUESTION: {"body":"是否只发布 A 模块？","checkpoint":"测试已通过，尚未创建发布包"}
@@ -165,6 +176,16 @@ BIAO_QUESTION: {"body":"是否只发布 A 模块？","checkpoint":"测试已通�
 ```
 
 `--agent-id` 必须是当前 claim 的真实 Worker 身份并显式传入；不得沿用 `.biao/pm` wrapper 默认的 `pm-agent`。成功响应会返回对应 `asked_event_id`，供 PM 在回答后精确 ack。
+
+任务执行中发现必须修改原 ownership 以外的路径时，Worker 必须先停止写入，并用结构化参数申请：
+
+```bash
+biao question ask --task <task_id> --claim-token <token> --agent-id <worker-id> \
+  --body '需要新增合同测试' \
+  --request-ownership '{"files":["apps/api/src/new-contract.test.ts"],"modules":["api-tests"]}'
+```
+
+PM 审查 Question 后必须二选一执行 `question answer ... --approve-ownership` 或 `--reject-ownership`。批准会把审计后的范围合入任务，拒绝则保持原范围；两种结果都释放旧 claim，Worker 只能通过 fresh claim 获得最终范围后继续。`ownership declare --force` 只允许在既有任务授权范围内处理占用优先级冲突，不能用于扩权，也不能把请求体中的文件声明当作 PM 授权。
 
 Question 不用于文件占用、依赖等待或技术实现细节；这些事项由 Worker/Supervisor 自行释放、继续领取或失败进入 repair。
 

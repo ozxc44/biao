@@ -53,12 +53,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   failure_reason TEXT,
   fix_for TEXT,
   repair_root_task_id TEXT,
+  trigger_review_task_id TEXT,
   -- required/repairing/resolved/needs_pm_decision/cancelled；空值表示尚未进入闭环。
   resolution_status TEXT,
   -- repair/reverify/inspect/continue/cancel；显式终止也必须可恢复、可审计。
   resolution_action TEXT,
   resolution_task_id TEXT,
   resolution_task_ids TEXT,
+  acceptance_repair_task_ids TEXT,
   resolved_by_task TEXT,
   resolution_generation INTEGER DEFAULT 0,
   resolution_attempts INTEGER DEFAULT 0,
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   last_question_id TEXT,
   last_question_answer TEXT,
   cancelled_at TEXT,
+  cancel_reason TEXT,
   superseded_at TEXT,
   superseded_by TEXT,
   superseded_reason TEXT,
@@ -102,6 +105,10 @@ CREATE TABLE IF NOT EXISTS questions (
   answered_at   TEXT,
   answered_by   TEXT,
   answer        TEXT,
+  requested_ownership TEXT,
+  ownership_decision TEXT,
+  ownership_before TEXT,
+  ownership_after TEXT,
   FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
 

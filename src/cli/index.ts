@@ -169,10 +169,11 @@ function printTaskLifecycleSummary(tasks: TaskListDisplayItem[]): void {
 }
 
 function printPmHelp(): void {
-  console.log(`用法：biao pm <start|intake|unacked|ack|watch> [选项]
+  console.log(`用法：biao pm <start|heartbeat|intake|unacked|ack|watch> [选项]
 
 PM 只接收最小门铃，详情由 PM 主动从平台读取；平台不会自动验收、答复或 ack。
   biao pm start --once [--consumer <pm>]       PM 会话开场：检查状态、intake 和共享 Supervisor
+  biao pm heartbeat --once [--consumer <pm>]   轻量门控；无待办时静默退出，不启动 PM Agent
   biao pm intake [--consumer <pm>]             一次读取待处理门铃
   biao pm unacked [--consumer <pm>] [--plan <id>] 读取未确认事件（脚本使用）
   biao pm ack --event-id <id> [--consumer <pm>] [--plan <id>] 仅在事项实际处理完成后确认事件
@@ -197,25 +198,26 @@ function printQuestionHelp(): void {
   console.log(`用法：biao question <ask|list|get|answer> [选项]
 
 Worker → PM 的平台内通讯闭环：
-  Worker：biao question ask --task <task_id> --claim-token <token> --agent-id <current-worker-id> --body "问题" [--checkpoint "已完成进度"]
+  Worker：biao question ask --task <task_id> --claim-token <token> --agent-id <current-worker-id> --body "问题" [--checkpoint "已完成进度"] [--request-ownership '{"files":["src/new.ts"]}']
   PM：    biao question list --consumer <pm> --status open --plan <id>
          biao question get <question_id> --consumer <pm> --plan <id>
-         biao question answer <question_id> --consumer <pm> --plan <id> --answer "明确答复"
+         biao question answer <question_id> --consumer <pm> --plan <id> --answer "明确答复" [--approve-ownership | --reject-ownership]
 
 集成式 Codex/Kimi/custom Worker 遇到必须由 PM 决策的问题时，在最终消息中只输出一行：
   BIAO_QUESTION: {"body":"需要 PM 决策的问题","checkpoint":"已完成内容与恢复点"}
 
 平台会持久化 Question、释放当前 claim/ownership，并向归属 PM 发出 question_asked 门铃。
-PM 回答后任务重新进入 pending；Worker 用新的 claim token 领取，并从平台获得答复和 checkpoint。
+扩权必须用 --request-ownership 结构化申请；force 只处理占用冲突，绝不扩大任务授权。PM 必须显式批准或拒绝扩权。
+PM 回答后任务重新进入 pending；Worker 用新的 claim token 领取，并从平台获得答复、checkpoint 与批准后的范围。
 旧 claim token 在 ask 成功后失效；等待答复期间不要 report、resume，也不要询问当前人类。`);
 }
 
 function printQuestionLeafHelp(command: string): void {
   const usage: Record<string, string> = {
-    ask: 'biao question ask --task <task_id> --claim-token <token> --agent-id <current-worker-id> --body "问题" [--checkpoint "进度"]',
+    ask: 'biao question ask --task <task_id> --claim-token <token> --agent-id <current-worker-id> --body "问题" [--checkpoint "进度"] [--request-ownership <json>]',
     list: 'biao question list --consumer <pm> --status open [--plan <id>]',
     get: 'biao question get <question_id> --consumer <pm> [--plan <id>]',
-    answer: 'biao question answer <question_id> --consumer <pm> [--plan <id>] --answer "明确答复"',
+    answer: 'biao question answer <question_id> --consumer <pm> [--plan <id>] --answer "明确答复" [--approve-ownership | --reject-ownership]',
   };
   console.log(`用法：${usage[command] ?? 'biao question --help'}`);
   if (command === 'ask') console.log('必须显式传入当前 claim 的 Worker agent id；不得使用 pm-agent（.biao/pm 的默认身份）。');
@@ -243,7 +245,7 @@ const TOP_LEVEL_COMMANDS = new Set([
 ]);
 
 const COMMAND_GROUPS: Record<string, readonly string[]> = {
-  pm: ['start', 'intake', 'unacked', 'ack', 'watch'],
+  pm: ['start', 'heartbeat', 'intake', 'unacked', 'ack', 'watch'],
   plan: ['init', 'create', 'submit', 'list', 'status', 'revise', 'intake', 'supersede'],
   task: ['get', 'add', 'edit', 'cancel', 'block', 'resume', 'reset', 'list', 'supersede', 'resolution'],
   question: ['ask', 'list', 'get', 'answer'],
@@ -259,6 +261,11 @@ type StrictOptionSpec = {
 
 const PM_OPTION_SPECS: Record<string, StrictOptionSpec> = {
   start: { values: ['consumer', 'interval', 'plans'], booleans: ['once'], positionals: 0 },
+  heartbeat: {
+    values: ['consumer', 'plans', 'command', 'lock-dir', 'agent-timeout-ms'],
+    booleans: ['once', 'require-drained'],
+    positionals: 0,
+  },
   intake: { values: ['consumer', 'plan', 'project'], booleans: ['json'], positionals: 0 },
   unacked: { values: ['consumer', 'type', 'limit', 'plan'], booleans: ['json'], positionals: 0 },
   ack: { values: ['consumer', 'event-id', 'plan'], positionals: 0 },
@@ -267,13 +274,13 @@ const PM_OPTION_SPECS: Record<string, StrictOptionSpec> = {
 
 const QUESTION_OPTION_SPECS: Record<string, StrictOptionSpec> = {
   ask: {
-    values: ['task', 'claim-token', 'body', 'checkpoint', 'agent-id'],
+    values: ['task', 'claim-token', 'body', 'checkpoint', 'agent-id', 'request-ownership'],
     booleans: ['json'],
     positionals: 0,
   },
   list: { values: ['consumer', 'status', 'plan'], booleans: ['json'], positionals: 0 },
   get: { values: ['consumer', 'plan'], booleans: ['json'], positionals: 1 },
-  answer: { values: ['consumer', 'plan', 'answer'], booleans: ['json'], positionals: 1 },
+  answer: { values: ['consumer', 'plan', 'answer'], booleans: ['json', 'approve-ownership', 'reject-ownership'], positionals: 1 },
 };
 
 const SUPERSEDE_OPTION_SPECS: Record<'task' | 'plan', StrictOptionSpec> = {
@@ -282,7 +289,7 @@ const SUPERSEDE_OPTION_SPECS: Record<'task' | 'plan', StrictOptionSpec> = {
 };
 
 const TASK_RESOLUTION_OPTION_SPEC: StrictOptionSpec = {
-  values: ['action', 'decided-by'],
+  values: ['action', 'decided-by', 'repair-source-task'],
   booleans: ['json'],
   positionals: 1,
 };
@@ -416,13 +423,14 @@ ${DB_RESTORE_SAFETY_NOTICE}
 }
 
 function printTaskResolutionHelp(): void {
-  console.log(`用法：biao task resolution <task_id> [--action inspect|continue|cancel] [--decided-by <pm>] [--json]
+  console.log(`用法：biao task resolution <task_id> [--action inspect|continue|cancel] [--decided-by <pm>] [--repair-source-task <task_id>] [--json]
 
 处理自动 repair/reverify 达到 max_retries 后的 needs_pm_decision：
   inspect    只读根因、最新 repair、完整 lineage 与可用动作；默认动作。
   continue   明确额外放行一代 repair/reverify；失败后不会无限续跑。
   cancel     终止该修复闭环并保留全部失败/拒绝审计；计划显示 cancelled，不伪装 completed。
 
+--repair-source-task 仅用于多来源验收返修，显式点名 acceptance_for 中的一个来源。
 --decided-by 仅用于 continue/cancel；默认使用 BIAO_AGENT_ID（未配置时为 pm）。
 inspect 不写决策，也不接受 --decided-by。`);
 }
@@ -510,8 +518,47 @@ async function main() {
       ? validateStrictOptions(`biao pm ${sub}`, rest, optionSpec)
       : undefined;
     if (!parsedOptions) return;
-    if (parsedOptions.helpRequested && sub !== 'start') {
+    if (parsedOptions.helpRequested && sub !== 'start' && sub !== 'heartbeat') {
       printPmHelp();
+      return;
+    }
+
+    if (sub === 'heartbeat') {
+      if (parsedOptions.helpRequested) {
+        console.log(`用法：biao pm heartbeat [--once] [--consumer <pm>] [--plans <p1,p2>] [--command <adapter>]
+
+轻量 PM 验收心跳门控：先读取最小 intake，再决定是否需要唤醒对应 PM。
+  - 无待办时静默退出，不启动 PM Agent，也不消耗模型 token。
+  - pending acceptance_ready 只交给独立 Worker，不启动 PM；Worker 交付后的
+    review_requested 才唤醒 PM。
+  - 只有已交付待 Review、Question、需决策或异常状态才启动显式配置的 PM adapter。
+  - 本命令只做一次扫描；定时执行由本机唯一的共用 Supervisor 负责，不为每个 PM
+    建独立 timer。没有本地监视时运行 .biao/start，即可复用同一个 Supervisor。
+  - 不自动 review、answer 或 ack；实际处理完成后仍需 PM 显式确认。
+
+兼容部署可低频定时调用 .biao/pm-heartbeat；生产推荐直接运行 .biao/start。`);
+        return;
+      }
+      const heartbeatArgs = [
+        fileURLToPath(new URL('../../scripts/pm-agent.mjs', import.meta.url)),
+        '--once',
+        '--biao-url', BIAO_URL,
+        '--consumer', consumerFlag(rest),
+      ];
+      for (const option of ['plans', 'command', 'lock-dir', 'agent-timeout-ms'] as const) {
+        const value = flagVal(rest, option);
+        if (value) heartbeatArgs.push(`--${option}`, value);
+      }
+      if (rest.includes('--require-drained')) heartbeatArgs.push('--require-drained');
+      const exitCode = await new Promise<number>((resolveExit, rejectExit) => {
+        const child = spawn(process.execPath, heartbeatArgs, { stdio: 'inherit', env: process.env });
+        child.once('error', rejectExit);
+        child.once('close', (code) => resolveExit(code ?? 1));
+      }).catch((error) => {
+        console.error(`✗ PM 心跳门控启动失败：${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      });
+      if (exitCode !== 0) process.exitCode = exitCode;
       return;
     }
 
@@ -1317,6 +1364,8 @@ verify: []
     for (let i = 0; i < rest.length; i++) {
       if (rest[i] === '--json') {
         flags.json = 'true';
+      } else if (rest[i] === '--approve-ownership' || rest[i] === '--reject-ownership') {
+        flags[rest[i].slice(2).replace(/-/g, '_')] = 'true';
       } else if (rest[i].startsWith('--') && rest[i + 1]) {
         flags[rest[i].slice(2).replace(/-/g, '_')] = rest[++i];
       }
@@ -1331,6 +1380,19 @@ verify: []
         console.error('用法：biao question ask --task <task_id> --claim-token <token> --agent-id <current-worker-id> --body "问题" [--checkpoint "进度"] [--json]');
         process.exit(1);
       }
+      let requestedOwnership: unknown;
+      if (flags.request_ownership) {
+        try {
+          requestedOwnership = JSON.parse(flags.request_ownership);
+        } catch {
+          console.error('--request-ownership 必须是合法 JSON 对象，例如 {"files":["src/new.test.ts"]}');
+          process.exit(1);
+        }
+        if (!requestedOwnership || typeof requestedOwnership !== 'object' || Array.isArray(requestedOwnership)) {
+          console.error('--request-ownership 必须是包含 files 和/或 modules 的 JSON 对象');
+          process.exit(1);
+        }
+      }
       const r = await api('/question', {
         method: 'POST',
         body: JSON.stringify({
@@ -1339,6 +1401,7 @@ verify: []
           claim_token: claimToken,
           body,
           ...(flags.checkpoint ? { checkpoint: flags.checkpoint } : {}),
+          ...(requestedOwnership ? { requested_ownership: requestedOwnership } : {}),
         }),
       });
       if (flags.json) {
@@ -1410,9 +1473,21 @@ verify: []
         console.error('用法：biao question answer <question_id> --answer "答复" [--consumer <pm>] [--plan <id>] [--json]');
         process.exit(1);
       }
+      if (flags.approve_ownership && flags.reject_ownership) {
+        console.error('--approve-ownership 与 --reject-ownership 互斥');
+        process.exit(1);
+      }
+      const ownershipDecision = flags.approve_ownership
+        ? 'approved'
+        : flags.reject_ownership ? 'rejected' : undefined;
       const r = await api(`/question/${encodeURIComponent(questionId)}/answer`, {
         method: 'POST',
-        body: JSON.stringify({ consumer, ...(flags.plan ? { plan_id: flags.plan } : {}), answer }),
+        body: JSON.stringify({
+          consumer,
+          ...(flags.plan ? { plan_id: flags.plan } : {}),
+          answer,
+          ...(ownershipDecision ? { ownership_decision: ownershipDecision } : {}),
+        }),
       });
       if (flags.json) {
         printJson(r);
@@ -1468,6 +1543,11 @@ verify: []
         process.exitCode = 1;
         return;
       }
+      if (action !== 'continue' && flags['repair-source-task'] !== undefined) {
+        console.error('✗ --repair-source-task 只能与 --action continue 一起使用');
+        process.exitCode = 1;
+        return;
+      }
       if (flags['decided-by'] !== undefined && !flags['decided-by'].trim()) {
         console.error('✗ --decided-by 不能为空');
         process.exitCode = 1;
@@ -1486,6 +1566,7 @@ verify: []
           attempts: number;
           max_retries: number;
           available_actions: string[];
+          repair_source_candidates?: string[];
           created_task_ids?: string[];
         } | null;
         error?: { code?: string; message?: string };
@@ -1498,6 +1579,11 @@ verify: []
             body: JSON.stringify({
               action,
               decided_by: flags['decided-by'] ?? process.env.BIAO_AGENT_ID ?? 'pm',
+              ...(flags['repair-source-task']
+                ? flags['repair-source-task'].includes(',')
+                  ? { repair_source_task_ids: flags['repair-source-task'].split(',').map((id) => id.trim()).filter(Boolean) }
+                  : { repair_source_task_id: flags['repair-source-task'] }
+                : {}),
             }),
           })) as ResolutionCliResponse;
 
@@ -1518,6 +1604,10 @@ verify: []
       console.log(`lineage：${data.resolution_lineage.length > 0 ? data.resolution_lineage.join(' → ') : '无'}`);
       console.log(`尝试：${data.attempts}/${data.max_retries}`);
       console.log(`可用动作：${data.available_actions.join(', ') || 'inspect'}`);
+      if (data.repair_source_candidates?.length) {
+        console.log(`合法返修来源：${data.repair_source_candidates.join(', ')}`);
+        console.log('继续时：--action continue --repair-source-task <上列一个来源；多个用逗号分隔>');
+      }
       if (data.created_task_ids?.length) console.log(`新建任务：${data.created_task_ids.join(', ')}`);
       return;
     }
@@ -1578,13 +1668,18 @@ verify: []
       return;
     }
     if (sub === 'cancel') {
-      // biao task cancel <task_id> —— 撤销 pending 任务
+      // biao task cancel <task_id> --reason <reason> —— 撤销 pending 任务
       const taskId = rest[0];
-      if (!taskId) {
-        console.error('用法：biao task cancel <task_id>（只能撤销 pending 任务）');
+      const reasonIndex = rest.indexOf('--reason');
+      const reason = reasonIndex >= 0 ? rest[reasonIndex + 1]?.trim() : '';
+      if (!taskId || !reason) {
+        console.error('用法：biao task cancel <task_id> --reason "撤销原因"（只能撤销 pending 任务）');
         process.exit(1);
       }
-      const r = (await api(`/task/${taskId}/cancel`, { method: 'POST', body: '{}' })) as {
+      const r = (await api(`/task/${taskId}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      })) as {
         ok: boolean;
         data: { task_id: string; status: string } | null;
         error?: { code: string; message: string };
@@ -1659,8 +1754,10 @@ verify: []
       const taskId = rest[0];
       if (!taskId || taskId === '--help' || taskId === '-h') {
         console.log(`用法：biao task reset <task_id> [--force] [--json]
-  把任意状态（running/done/failed）的 task 重置为 pending
+  把可恢复状态的 task 重置为 pending
+  running 仅在 lease 与 expire_at 都已失效后可 reset；在线 Worker 即使 --force 也禁止打断
   done/failed 的 reset 需要 --force（防误操作）
+  rejected、repair/reverify 已闭合或 cancelled 的审计链不能 reset；须 resolution continue 或新建任务
   cancelled/superseded 是终态，不能 reset；superseded 会永久保留原交付审计
 
 选项：
@@ -1700,7 +1797,7 @@ verify: []
       return;
     }
     if (sub === 'list') {
-      // biao task list [--plan <id>] [--status pending|running|done|failed] [--limit 100] [--json]
+      // biao task list [--plan <id>] [--status pending|running|done|failed] [--limit N] [--json]
       const flags: Record<string, string> = {};
       for (let i = 0; i < rest.length; i++) {
         if (rest[i] === '--json') {
@@ -1712,13 +1809,48 @@ verify: []
       const params = new URLSearchParams();
       if (flags.plan) params.set('plan_id', flags.plan);
       if (flags.status) params.set('status', flags.status);
-      if (flags.limit) params.set('limit', flags.limit);
-      const r = (await api(`/tasks?${params.toString()}`)) as {
+      const requestedLimit = flags.limit ? Number(flags.limit) : undefined;
+      if (requestedLimit !== undefined && (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1)) {
+        console.error('✗ --limit 必须是正整数');
+        process.exitCode = 1;
+        return;
+      }
+      const pageSize = Math.min(requestedLimit ?? 500, 1000);
+      params.set('limit', String(pageSize));
+      let offset = 0;
+      let total = 0;
+      const tasks: TaskListDisplayItem[] = [];
+      let ok = true;
+      do {
+        params.set('offset', String(offset));
+        const page = (await api(`/tasks?${params.toString()}`)) as {
+          ok: boolean;
+          data: {
+            tasks: TaskListDisplayItem[];
+            total: number;
+            has_more?: boolean;
+          } | null;
+        };
+        if (!page.ok || !page.data) {
+          ok = false;
+          break;
+        }
+        total = page.data.total;
+        const remaining = requestedLimit === undefined ? page.data.tasks.length : requestedLimit - tasks.length;
+        tasks.push(...page.data.tasks.slice(0, Math.max(0, remaining)));
+        offset += page.data.tasks.length;
+        if (requestedLimit !== undefined && tasks.length >= requestedLimit) break;
+        if (!page.data.has_more || page.data.tasks.length === 0) break;
+      } while (true);
+      const r = {
+        ok,
+        data: ok ? { tasks, total } : null,
+      } as {
         ok: boolean;
         data: {
           tasks: TaskListDisplayItem[];
           total: number;
-        };
+        } | null;
       };
       if (flags.json) {
         printJson(r);
@@ -1985,6 +2117,7 @@ verify: []
           task_count: number;
           plan_count: number;
           by_status: Record<string, number>;
+          file_sizes?: { main_bytes: number; wal_bytes: number };
           restore_projection?: {
             restorable_tasks: number;
             restorable_plans: number;
@@ -2015,6 +2148,14 @@ verify: []
       console.log(`  plans: ${r.data.plan_count}`);
       console.log(`  tasks: ${r.data.task_count}`);
       console.log(`  按状态:`, JSON.stringify(r.data.by_status));
+      if (r.data.file_sizes) {
+        const mb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+        console.log(`  文件体积: ${mb(r.data.file_sizes.main_bytes)}（WAL ${mb(r.data.file_sizes.wal_bytes)}）`);
+        if (r.data.file_sizes.main_bytes > 200 * 1024 * 1024) {
+          console.log(`  提示: 审计库已较大；SQLite 记录是灾难恢复与历史审计的唯一依据，平台不会自动清理。`);
+          console.log(`        需要归档时请在停机窗口复制备份整个数据库文件（含 -wal/-shm），不要删除或截断。`);
+        }
+      }
       if (r.data.restore_projection) {
         const projection = r.data.restore_projection;
         console.log(`  可恢复投影: ${projection.restorable_plans} plans / ${projection.restorable_tasks} tasks`);
@@ -2323,12 +2464,12 @@ verify: []
   biao task edit <task_id> [--from-file <md>|--editor <path>|--verify-cmd <cmd>...] 编辑、校验、自动 submit；失败回滚
   biao task get <task_id>
   biao task list [--plan <id>] [--status pending|running|done|failed|cancelled|superseded] [--json]   批量看任务状态
-  biao task cancel <task_id>                                      撤销 pending 任务
+  biao task cancel <task_id> --reason "..."                       撤销 pending 任务并记录原因
   biao task supersede <task_id> --reason "..." --yes              安全退出历史 done+待验收（保留结果/审计）
   biao task block <task_id> --claim-token <token> --reason waiting_file_release|waiting_dependency
   biao task resume <task_id> [--agent-id <id>]                    恢复搁置任务
   biao task reset <task_id> [--force] [--json]                    重置任务到 pending（done/failed 需 --force）
-  biao task resolution <task_id> [--action inspect|continue|cancel] [--decided-by <pm>] [--json] 处理 repair/reverify 重试耗尽
+  biao task resolution <task_id> [--action inspect|continue|cancel] [--decided-by <pm>] [--repair-source-task <task_id>] [--json] 处理 repair/reverify 重试耗尽
   biao question ask --task <id> --claim-token <token> --agent-id <current-worker-id> --body "..."  Worker 通过平台向对应 PM 提问
   biao question list [--consumer pm] [--plan <id>] [--status open|answered|all]   PM 列出受管计划待答问题
   biao question get <question_id> [--consumer pm] [--plan <id>]                  PM 读取归属 Question 正文
@@ -2343,6 +2484,7 @@ verify: []
   biao ownership list [--json]                                         当前活跃文件占用（谁卡着谁）
   biao watchdog [--auto-fix] [--interval <s>] [--json]                 PM 巡检（failed/stale/未验收）
   biao pm start [--consumer pm] [--once] [--interval 60] [--plans p1,p2]  PM 统一入口：检查、门铃与共享 Supervisor（不自动 ack/验收）
+  biao pm heartbeat [--once] [--consumer pm] [--plans p1,p2]             先扫最小状态；空状态不唤醒 PM、不耗模型 token
   biao pm intake [--consumer pm] [--plan <id>] [--json]               PM 主动轮询门铃（待签核/就绪/失败/阻塞/stale）
   biao pm unacked [--consumer pm] [--type review_requested] [--json]  按 consumer 查未确认事件
   biao pm ack --consumer pm --event-id <id>                           幂等确认事件（不影响其他 consumer）

@@ -183,6 +183,31 @@ describe('Supervisor 项目生命周期', () => {
     expect(calls.remind.length).toBe(1);
   });
 
+  it('同一逻辑事项即使 event_id 重发变化也只提醒一次', async () => {
+    let event = 0;
+    const proj = new SupervisedProject({
+      planId: 'p',
+      isClosed: async () => false,
+      pendingItems: async () => [{
+        kind: 'review_requested', plan_id: 'p', task_id: 't1', event_id: `event-${++event}`,
+      }],
+    });
+    let reminders = 0;
+    const sup = new Supervisor({
+      biaoUrl: 'http://127.0.0.1:7331',
+      projects: [proj],
+      hooks: { onPmReminder: async () => { reminders++; } },
+      pollIntervalMs: 5,
+      minBackoffMs: 5,
+      maxBackoffMs: 20,
+    });
+
+    await sup.runOnce();
+    await sup.runOnce();
+    await sup.runOnce();
+    expect(reminders).toBe(1);
+  });
+
   it('PM 门铃处理失败时不吞掉事项：下轮重试，成功后再去重', async () => {
     const items = [{ kind: 'review_requested', plan_id: 'p', task_id: 't1', event_id: 'e1' }];
     const proj = new SupervisedProject({

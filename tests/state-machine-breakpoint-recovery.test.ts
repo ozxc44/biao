@@ -156,7 +156,8 @@ describe('状态机断点恢复', () => {
     });
     expect(await redis.hgetall(keys.hash.task('acceptance-reject-breakpoint'))).toMatchObject({
       resolution_status: 'repairing',
-      resolution_task_id: 'acceptance-reject-source-repair-1',
+      resolution_task_id: '',
+      acceptance_repair_task_ids: 'acceptance-reject-source-repair-1',
     });
   });
 
@@ -309,7 +310,8 @@ describe('状态机断点恢复', () => {
     });
     expect(await redis.hgetall(keys.hash.task('acceptance-ownership-breakpoint'))).toMatchObject({
       resolution_status: 'repairing',
-      resolution_task_id: 'acceptance-ownership-source-repair-1',
+      resolution_task_id: '',
+      acceptance_repair_task_ids: 'acceptance-ownership-source-repair-1',
     });
   });
 
@@ -470,6 +472,71 @@ describe('状态机断点恢复', () => {
     expect(await redis.zscore(keys.zset.status.pending, 'accepted-repair-downstream')).not.toBeNull();
   });
 
+  it('accepted repair 遇到残留 continue intent 时重放闭环，并自动终态化未领取孤儿 child', async () => {
+    await seedTask('accepted-race-source');
+    await seedTask('accepted-race-source-repair-1');
+    await seedTask('accepted-race-source-repair-2');
+    const now = Date.now();
+
+    await redis.zrem(
+      keys.zset.status.pending,
+      'accepted-race-source',
+      'accepted-race-source-repair-1',
+    );
+    await redis.zadd(keys.zset.status.done, now, 'accepted-race-source');
+    await redis.zadd(keys.zset.status.done, now, 'accepted-race-source-repair-1');
+    await redis.hset(keys.hash.task('accepted-race-source'), {
+      status: 'done',
+      pm_review_status: 'rejected',
+      resolution_status: 'repairing',
+      resolution_action: 'repair',
+      resolution_task_id: 'accepted-race-source-repair-2',
+      resolution_task_ids: 'accepted-race-source-repair-1,accepted-race-source-repair-2',
+      resolution_generation: '2',
+      resolution_attempts: '2',
+      resolution_continue_owner: 'stale-owner',
+      resolution_continue_snapshot_generation: '1',
+      resolution_continue_snapshot_reason: 'repair_retry_limit_reached',
+      resolution_continue_snapshot_task_ids: 'accepted-race-source-repair-1',
+      resolution_continue_snapshot_attempts: '1',
+    });
+    await redis.hset(keys.hash.task('accepted-race-source-repair-1'), {
+      status: 'done',
+      pm_review_status: 'accepted',
+      pm_reviewed_by: 'pm-race',
+      fix_for: 'accepted-race-source',
+      repair_root_task_id: 'accepted-race-source',
+      pm_accept_effects_applied: 'true',
+    });
+    await redis.hset(keys.hash.task('accepted-race-source-repair-2'), {
+      status: 'pending',
+      fix_for: 'accepted-race-source',
+      repair_root_task_id: 'accepted-race-source',
+    });
+
+    const replay = await pmReview(redis, 'accepted-race-source-repair-1', {
+      verdict: 'accept',
+      reviewed_by: 'pm-race',
+    });
+    expect(replay).toMatchObject({ ok: true, data: { review_status: 'accepted' } });
+    expect(await redis.hgetall(keys.hash.task('accepted-race-source'))).toMatchObject({
+      resolution_status: 'resolved',
+      resolution_task_id: 'accepted-race-source-repair-1',
+      resolved_by_task: 'accepted-race-source-repair-1',
+      resolution_continue_owner: '',
+      resolution_continue_snapshot_generation: '',
+      resolution_continue_snapshot_reason: '',
+    });
+
+    expect(await redis.hgetall(keys.hash.task('accepted-race-source-repair-2'))).toMatchObject({
+      status: 'cancelled',
+      resolution_decision_reason: 'superseded_by_accepted_repair:accepted-race-source-repair-1',
+    });
+    expect(await redis.zscore(keys.zset.status.pending, 'accepted-race-source-repair-2')).toBeNull();
+    expect(await redis.zscore(keys.zset.status.cancelled, 'accepted-race-source-repair-2')).not.toBeNull();
+    expect(await redis.hget(keys.hash.task('accepted-race-source'), 'resolution_status')).toBe('resolved');
+  });
+
   it('pending 前置任务仍有 blocked 依赖者时拒绝取消', async () => {
     await seedTask('cancel-blocked-dependency-source');
     await seedTask('cancel-blocked-dependency-waiter', {
@@ -484,7 +551,7 @@ describe('状态机断点恢复', () => {
       blocked_at: String(now),
     });
 
-    const cancelled = await cancelTask(redis, 'cancel-blocked-dependency-source');
+    const cancelled = await cancelTask(redis, 'cancel-blocked-dependency-source', { reason: '验证阻塞依赖的取消门控' });
 
     expect(cancelled).toMatchObject({
       ok: false,
