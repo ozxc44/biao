@@ -75,12 +75,24 @@ Biao 将完成链路固化为：
 
 ## 产品亮点
 
-Biao 不和任何 harness 竞争，它补的是 harness 之间的空白：**当不同模型的 Agent 必须在同一个真实项目里分工时，谁来定边界、谁来验收、失败谁来收口。** 下面是 Biao 把这层协作平台做实的几个支柱。
+Biao 解决的核心问题是：**不同 harness 的多个 Agent，怎么安全地协作开发同一个项目。** 每个 harness 自己就是最好的执行者，缺的是它们之间的协作层——谁来定边界、谁来验收、失败谁来收口。Biao 不和任何 harness 竞争，只把这层协作平台做实。
+
+### 异构 Agent 编队 · Bring Your Own Harness（核心）
+
+不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、自定义 Agent 做调研；PM 同样可以是任意 harness。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
+
+> 对比单 harness 的多 Agent 方案：它们只能编排同一个厂商的 Agent。Biao 让你为每个任务选最合适的模型，再让异构 Agent 互相制衡——实现者、验收者、PM 天然来自不同 harness。
+
+### 文件级 Ownership 与并发安全 · Ownership Isolation
+
+任务以文件 glob 声明可改范围；`claim` 时取得 ownership，写文件前对每个路径再校验一次 `proceed / wait`。两个 Agent 同时改同一个文件会被显式阻塞或冲突记录，而不是默默互相覆盖。
+
+> 这是异构 Agent 真正能并行的前提：没有 ownership 边界，并发就是竞态。
 
 ### 可信完成链路 · Verifiable Completion
 
 - **Verify 必跑、逐项上报**：任务声明的验证命令必须按序执行并回传每条命令的退出码与输出；任一失败不能进入成功状态。
-- **执行者 ≠ 验收者**：`acceptance` 任务禁止由原实现 Agent 领取，必须由独立 Agent 复核，再经 PM Review。
+- **执行者 ≠ 验收者**：`acceptance` 任务禁止由原实现 Agent 领取，必须由独立 Agent 复核，再经 PM Review——异构编队下这天然意味着“另一个 harness 来证伪”。
 - **`done` 不等于完成**：只有 PM Review 为 `accepted`（或失败经 repair `resolved`）才计入项目完成进度。Worker 心跳、退出码 0、生成了文件、上报了 `done`，都不能单独代表验收完成。
 
 > 对比单个 Coding Agent：它会"说完成了"，但没有独立验收层帮你证伪。
@@ -90,16 +102,6 @@ Biao 不和任何 harness 竞争，它补的是 harness 之间的空白：**当�
 Worker 失败、Verify 失败或 PM 拒绝不会被丢进一个需要人盯的故障桶。Biao **保留原始失败/拒绝审计**，再生成一条受限的 repair 链：repair 继承原 ownership 与 Verify，交付后仍须经 PM Review；独立 `acceptance` 失败时 repair 指向**被验收的原实现**，避免"修复任务依赖失败验收"的死锁；达到 `max_retries` 才升级为 `needs_pm_decision`，不会无限盲目重跑。
 
 > 对比通用编排框架：多数只到"重试 N 次"为止，Biao 给出的是**可审计、可终止、可由 PM 收口**的闭环。
-
-### 文件级 Ownership 与并发安全 · Ownership Isolation
-
-任务以文件 glob 声明可改范围；`claim` 时取得 ownership，写文件前对每个路径再校验一次 `proceed / wait`。两个 Agent 同时改同一个文件会被显式阻塞或冲突记录，而不是默默互相覆盖。
-
-> 这是多 Agent 真正能并行的前提：没有 ownership 边界，并发就是竞态。
-
-### 异构 Agent 中立 · Bring Your Own Harness
-
-不绑定厂商或模型。内置 Codex、Kimi、通用 CLI Worker，也能通过标准 HTTP API 接入任意语言/平台的 Agent——Claude Code、ZCode、自研执行器都可以直接编进同一支队伍。同一个计划里可以让 Codex 写实现、Claude Code 做验收、Kimi 跑回归、自定义 Agent 做调研。Biao 只负责调度、约束和验收，绝不替换你已经在用的 harness。
 
 ### 双层可恢复性 · Redis + SQLite
 
