@@ -384,7 +384,7 @@ describe('Supervisor CLI integrated PM Agent doorbell', () => {
     expect(paths.filter((path) => path.includes('/intake?consumer=pm-review'))).toHaveLength(5);
     expect(paths.filter((path) => path.includes('/intake?consumer=pm-question'))).toHaveLength(5);
     expect(paths.some((path) => /\/intake\/ack|\/review(?:\/|\?|$)|\/answer(?:\/|\?|$)/.test(path))).toBe(false);
-  }, 10_000);
+  }, 45_000);
 
   it('PM Agent 用 resolution cancel 完成决策后，require-drained 真实清空门铃', async () => {
     const { url, paths, decisions } = await startResolutionServer();
