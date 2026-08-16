@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -10,7 +10,7 @@ afterEach(() => {
 });
 
 describe('bootstrap Supervisor launcher', () => {
-  it('reloads owner slot configuration before each Supervisor child starts', async () => {
+  it.skipIf(!existsSync(join(process.cwd(), 'web', 'dist', 'index.html')))('reloads owner slot configuration before each Supervisor child starts', async () => {
     const { bootstrap } = await import('./bootstrap.mjs');
     const root = mkdtempSync(join(tmpdir(), 'biao-bootstrap-supervisor-reload-'));
     tempRoots.push(root);
