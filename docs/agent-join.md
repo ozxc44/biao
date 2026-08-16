@@ -2,6 +2,8 @@
 
 新 Agent 加入 Biao 项目只需一条命令：注册、自动绑定、派生 Worker Token、写入本地配置。
 
+> 本指南面向单机 V1（`--project-scope` 是服务器本地路径）。分布式 V2（中央服务区 + Git 远端 + Worker 节点）的项目注册与节点授权见 [V2 项目接入](v2-project-onboarding.md)——V2 用 `biao project create --repo <git-url>`，不要把代码副本手工放进服务器工作区。
+
 ## 快速开始
 
 ```bash

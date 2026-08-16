@@ -286,7 +286,7 @@ describe('LAN stdio MCP adapter', () => {
     expect(names).toEqual([
       'health', 'plan_list', 'plan_status', 'task_list', 'task_get', 'ownership_check',
       'pm_review_list', 'pm_review_read', 'task_claim', 'task_heartbeat', 'task_report',
-      'task_block', 'question_ask',
+      'task_block', 'question_ask', 'project_create', 'project_list',
     ]);
     expect(names.some((name) => /review_(?:accept|reject|write)/.test(name))).toBe(false);
   });

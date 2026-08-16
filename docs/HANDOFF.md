@@ -7,7 +7,7 @@
 Biao 是本地优先、局域网多机的多 Agent 研发控制台：
 - **单机 V1**：调度、Ownership、Question、PM 验收、灾难恢复
 - **分布式 V2**：中央服务区（NAS）+ 多 Worker 节点 + Git 工作空间 + 合并队列
-- **MCP 接口**：`biao-mcp`（13 个 AI 工具）
+- **MCP 接口**：`biao-mcp`（15 个 AI 工具）
 - **Web 控制台**：远程用户名密码登录
 
 ## 核心文档导航
@@ -15,6 +15,7 @@ Biao 是本地优先、局域网多机的多 Agent 研发控制台：
 | 文档 | 内容 |
 |---|---|
 | [分布式多节点方案](distributed-multi-node-development-plan.md) | 架构设计全文（v0.8.0，7 轮评审） |
+| [V2 项目接入](v2-project-onboarding.md) | 新项目五步接入（project create → authorize） |
 | [验收审计](distributed-multi-node-acceptance-audit.md) | §22 矩阵 99 项逐项判定与证据 |
 | [评审日志](distributed-multi-node-review-log.md) | 每阶段实施记录（含所有修复轮） |
 | [NAS 部署指南](../deploy/nas/README.md) | Docker 一键部署 |
@@ -69,6 +70,17 @@ deploy/nas/                 NAS Docker 部署
 web/                        Web 控制台（React）
 tests/distributed/          分布式 E2E 测试（40 文件）
 ```
+
+## 新项目 / 新 Agent 接入（V2 一等入口）
+
+```bash
+# 项目注册（原来是 curl-only；现在 CLI/MCP 均可）
+biao project create <name> --repo <git-url> --branch main
+biao project nodes && biao project authorize <project_id> <node_id>
+# MCP：project_create / project_list
+```
+
+完整五步序列见 [V2 项目接入](v2-project-onboarding.md)。注意 `biao plan create --project`（V1 plan 归属，服务端本地路径）与 `biao project create --repo`（V2 项目，Git 远端）是两个概念，勿混用。
 
 ## 开发工作流
 

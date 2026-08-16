@@ -482,6 +482,38 @@ const tools: McpToolSpec[] = [
       return projectEnvelope(response);
     },
   },
+  {
+    name: 'project_create',
+    description: '注册 V2 项目（name + Git 远端 + 默认分支）；Worker 工作区按任务从该远端 clone。需要 Owner API Token 作用域。',
+    inputSchema: objectSchema({
+      name: nonEmptyString,
+      repo_path: nonEmptyString,
+      default_branch: nonEmptyString,
+      read_only: { type: 'boolean' },
+    }, ['name', 'repo_path']),
+    handler: async (args, runtime) => {
+      assertExactKeys(args, ['name', 'repo_path', 'default_branch', 'read_only']);
+      const body: Record<string, unknown> = {
+        name: stringArg(args, 'name'),
+        repo_path: stringArg(args, 'repo_path'),
+        default_branch: optionalString(args, 'default_branch') ?? 'main',
+        execution_mode: optionalBoolean(args, 'read_only') ? 'read_only' : 'full',
+      };
+      return projectEnvelope(await runtime.client.request('/v2/projects', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }));
+    },
+  },
+  {
+    name: 'project_list',
+    description: '列出中央 Biao 的 V2 项目（project_id、Git 远端、默认分支、执行模式）；不返回服务端本地路径之外的敏感字段。',
+    inputSchema: objectSchema(),
+    handler: async (args, runtime) => {
+      assertExactKeys(args, []);
+      return projectEnvelope(await runtime.client.request('/v2/projects'));
+    },
+  },
 ];
 
 const byName = new Map(tools.map((tool) => [tool.name, tool]));
