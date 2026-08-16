@@ -25,7 +25,7 @@ Biao 是本地优先、局域网多机的多 Agent 研发控制台：
 ## 当前部署拓扑
 
 ```
-Mac .82 (PM + 本机 V1 栈)     NAS .119 (中央服务区)     .25 WSL2 (Worker)
+Mac <MAC_IP> (PM + 本机 V1 栈)     NAS <NAS_IP> (中央服务区)     <WORKER_IP> WSL2 (Worker)
   z/z 远程登录控制台    ←→     Biao Server + Redis       bvn2 → V2 claim → bva2
   bin/biao.js CLI             + Gitea :23000             → SSE 推送唤醒
   scripts/supervisor.mjs      + Artifact Store            → RealExecutor 全链
@@ -39,7 +39,7 @@ Mac .82 (PM + 本机 V1 栈)     NAS .119 (中央服务区)     .25 WSL2 (Worker
 |---|---|
 | NAS Owner API Token | `/data_n004/biao/src/deploy/nas/.env`（NAS 上） |
 | NAS z/z 登录账户 | SQLite `human_accounts` 表 |
-| .25 Worker bvn2 | `~/biao-node/node-credential.json`（.25 上） |
+| <WORKER_IP> Worker bvn2 | `~/biao-node/node-credential.json`（Worker 上） |
 | V2 密钥环 | NAS `.env` 中 `BIAO_V2_CREDENTIAL_KEY` |
 | enrollment ticket | NAS `.env` 中 `BIAO_V2_ENROLLMENT_TICKET` |
 
@@ -84,8 +84,8 @@ npm --prefix web test       # Web 测试
 
 ```bash
 # SSH（密码从 Mac Keychain 取）
-nas_secret=$(security find-generic-password -s mac-nas -a 18950509383 -w)
-SSHPASS="$nas_secret" sshpass -e ssh -p 10000 18950509383@192.168.31.119
+nas_secret=$(security find-generic-password -s <KEYCHAIN_SERVICE> -a <KEYCHAIN_ACCOUNT> -w)
+SSHPASS="$nas_secret" sshpass -e ssh -p 10000 <NAS_SSH_USER>@<NAS_IP>
 
 # 更新部署
 cd /data_n004/biao/src/deploy/nas
@@ -111,7 +111,7 @@ docker logs biao-server --tail 20
 
 ### 🔴 高优先级
 
-1. **真实 harness 执行**：在 .25 上配置 `BIAO_EXEC_CMD` 指向真实 `codex exec` 或 `kimi -p`，让 Worker 真正修改代码并走完 workspace → delivery → merge 链
+1. **真实 harness 执行**：在 Worker 上配置 `BIAO_EXEC_CMD` 指向真实 `codex exec` 或 `kimi -p`，让 Worker 真正修改代码并走完 workspace → delivery → merge 链
 2. **.25 daemon 替换轮询脚本**：停掉 `worker-wake.mjs`，改用 `biao-node run`（内置 SSE + RealExecutor 全链）
 3. **service.ts 继续拆分**：剩余 6 个域（Delivery/Merge/Incident/Reconcile/Project/Node），台账见 `src/server/v2/SERVICE_MAP.md`
 
@@ -141,7 +141,7 @@ docker logs biao-server --tail 20
 | 机器 | IP | 系统 | SSH | 用途 |
 |---|---|---|---|---|
 | Mac | .82 | macOS | 本机 | PM + 开发 |
-| NAS | .119 | Linux | `ssh -p 10000 18950509383@192.168.31.119` | 中央服务区 |
-| Worker | .25 | WSL2 | `ssh z@192.168.31.25` | Worker 节点 |
+| NAS | .119 | Linux | `ssh -p 10000 <NAS_SSH_USER>@<NAS_IP>` | 中央服务区 |
+| Worker | .25 | WSL2 | `ssh <WORKER_USER>@<WORKER_IP>` | Worker 节点 |
 
 密码获取方式见 `~/.zcode/skills/lan-cloud-topology/api.md`。

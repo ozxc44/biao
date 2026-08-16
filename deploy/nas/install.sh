@@ -243,7 +243,7 @@ print_info() {
     info "  grep BIAO_API_TOKEN $ENV_FILE | cut -d= -f2"
     echo
     info "Mac 连接方式："
-    info "  BIAO_URL=http://192.168.31.119:7331"
+    info "  BIAO_URL=http://${BIAO_NAS_IP:-<NAS_IP>}:7331"
     echo
     info "日志查看："
     info "  cd $SCRIPT_DIR && docker compose logs -f"
