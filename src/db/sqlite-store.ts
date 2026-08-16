@@ -28,6 +28,8 @@ import type {
   V2CredentialKeyRecordRow,
   V2CredentialStateRow,
   IncidentRow,
+  WebhookRegistrationRow,
+  WebhookDeliveryRow,
 } from '../types/v2-infra.js';
 import type {
   ProjectRow,
@@ -914,6 +916,15 @@ export class SqliteStore {
     ).get(backupRunId) as BackupRunRow | undefined;
   }
 
+  updateBackupRun(backupRunId: string, fields: Partial<BackupRunRow>): void {
+    const cols = Object.keys(fields).filter((k) => k !== 'backup_run_id');
+    if (cols.length === 0) return;
+    const sets = cols.map((c) => `${c} = @${c}`).join(', ');
+    this.db.prepare(
+      `UPDATE backup_runs SET ${sets} WHERE backup_run_id = @backup_run_id`,
+    ).run({ ...fields, backup_run_id: backupRunId });
+  }
+
   listBackupRuns(restorePointId?: string): BackupRunRow[] {
     if (restorePointId) {
       return this.db.prepare(
@@ -923,6 +934,101 @@ export class SqliteStore {
     return this.db.prepare(
       'SELECT * FROM backup_runs ORDER BY started_at',
     ).all() as BackupRunRow[];
+  }
+
+  // ── webhook_registrations / webhook_deliveries / webhook_dispatcher_state（P12 §9） ──
+
+  insertWebhookRegistration(row: WebhookRegistrationRow): void {
+    this.db.prepare(`INSERT INTO webhook_registrations
+      (webhook_id, url, secret, events, status, failure_count, last_delivered_at, created_by, created_at, updated_at)
+      VALUES (@webhook_id, @url, @secret, @events, @status, @failure_count, @last_delivered_at, @created_by, @created_at, @updated_at)`
+    ).run(row);
+  }
+
+  getWebhookRegistration(webhookId: string): WebhookRegistrationRow | undefined {
+    return this.db.prepare(
+      'SELECT * FROM webhook_registrations WHERE webhook_id = ?',
+    ).get(webhookId) as WebhookRegistrationRow | undefined;
+  }
+
+  listWebhookRegistrations(status?: string): WebhookRegistrationRow[] {
+    if (status) {
+      return this.db.prepare(
+        'SELECT * FROM webhook_registrations WHERE status = ? ORDER BY created_at',
+      ).all(status) as WebhookRegistrationRow[];
+    }
+    return this.db.prepare(
+      'SELECT * FROM webhook_registrations ORDER BY created_at',
+    ).all() as WebhookRegistrationRow[];
+  }
+
+  updateWebhookRegistration(webhookId: string, fields: Partial<WebhookRegistrationRow>): void {
+    const cols = Object.keys(fields).filter((k) => k !== 'webhook_id');
+    if (cols.length === 0) return;
+    const sets = cols.map((c) => `${c} = @${c}`).join(', ');
+    this.db.prepare(
+      `UPDATE webhook_registrations SET ${sets} WHERE webhook_id = @webhook_id`,
+    ).run({ ...fields, webhook_id: webhookId });
+  }
+
+  deleteWebhookRegistration(webhookId: string): void {
+    this.db.prepare('DELETE FROM webhook_registrations WHERE webhook_id = ?').run(webhookId);
+  }
+
+  insertWebhookDelivery(row: WebhookDeliveryRow): void {
+    this.db.prepare(`INSERT INTO webhook_deliveries
+      (delivery_id, webhook_id, event_type, event_id, payload, signature, attempt_count,
+       status, last_error, next_attempt_at, created_at, delivered_at, response_status)
+      VALUES (@delivery_id, @webhook_id, @event_type, @event_id, @payload, @signature, @attempt_count,
+       @status, @last_error, @next_attempt_at, @created_at, @delivered_at, @response_status)`
+    ).run(row);
+  }
+
+  getWebhookDelivery(deliveryId: string): WebhookDeliveryRow | undefined {
+    return this.db.prepare(
+      'SELECT * FROM webhook_deliveries WHERE delivery_id = ?',
+    ).get(deliveryId) as WebhookDeliveryRow | undefined;
+  }
+
+  listWebhookDeliveriesByStatus(status: string, limit = 100): WebhookDeliveryRow[] {
+    return this.db.prepare(
+      'SELECT * FROM webhook_deliveries WHERE status = ? ORDER BY next_attempt_at LIMIT ?',
+    ).all(status, limit) as WebhookDeliveryRow[];
+  }
+
+  listDueWebhookDeliveries(now: number, limit = 50): WebhookDeliveryRow[] {
+    return this.db.prepare(
+      'SELECT * FROM webhook_deliveries WHERE status = ? AND next_attempt_at <= ? ORDER BY next_attempt_at LIMIT ?',
+    ).all('pending', now, limit) as WebhookDeliveryRow[];
+  }
+
+  listWebhookDeliveriesByWebhook(webhookId: string, limit = 100): WebhookDeliveryRow[] {
+    return this.db.prepare(
+      'SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC LIMIT ?',
+    ).all(webhookId, limit) as WebhookDeliveryRow[];
+  }
+
+  updateWebhookDelivery(deliveryId: string, fields: Partial<WebhookDeliveryRow>): void {
+    const cols = Object.keys(fields).filter((k) => k !== 'delivery_id');
+    if (cols.length === 0) return;
+    const sets = cols.map((c) => `${c} = @${c}`).join(', ');
+    this.db.prepare(
+      `UPDATE webhook_deliveries SET ${sets} WHERE delivery_id = @delivery_id`,
+    ).run({ ...fields, delivery_id: deliveryId });
+  }
+
+  getWebhookDispatcherState(key: string): string | undefined {
+    const row = this.db.prepare(
+      'SELECT value FROM webhook_dispatcher_state WHERE state_key = ?',
+    ).get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  setWebhookDispatcherState(key: string, value: string, now: number): void {
+    this.db.prepare(`INSERT INTO webhook_dispatcher_state (state_key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(state_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(key, value, now);
   }
 
   // ── project_mode_transitions（insert + query + list-by-status） ──
@@ -1566,6 +1672,19 @@ export class SqliteStore {
     return this.db.prepare(
       'SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at',
     ).all(projectId) as TaskRow[];
+  }
+
+  /**
+   * V2/V1 桥接回退（v2-routes claim）：第一个未归属 project 的 pending task。
+   * 走 idx_tasks_status 索引 + LIMIT 1，替代旧 getAllTasks() 全表扫描的
+   * `find(status==='pending' && !project_id)`——行序语义等价（status 索引内
+   * 同状态按 rowid 升序，与全表扫描取到的首条一致）。空串视同未归属，
+   * 与旧 JS 判定 `!project_id` 对齐。
+   */
+  getFirstPendingTaskWithoutProject(): TaskRow | undefined {
+    return this.db.prepare(
+      "SELECT * FROM tasks WHERE status = 'pending' AND (project_id IS NULL OR project_id = '') LIMIT 1",
+    ).get() as TaskRow | undefined;
   }
 
   // ── tasks 辅助查询 ──

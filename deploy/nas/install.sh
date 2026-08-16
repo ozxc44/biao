@@ -124,6 +124,110 @@ deploy() {
     fi
 }
 
+# ─── P12 §12：每小时自动备份 cron ──────────────────────────────────────
+# 生成一个 wrapper 脚本（从 .env 读 token，避免把明文 token 写进 crontab 命令行，
+# 进程列表可见）。幂等：先删旧条目再装新条目。
+install_backup_cron() {
+    local api_token
+    api_token="$(grep '^BIAO_API_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+    if [ -z "$api_token" ]; then
+        warn "未读取到 BIAO_API_TOKEN，跳过备份 cron 安装"
+        return
+    fi
+
+    local cron_dir="$DATA_ROOT/cron"
+    mkdir -p "$cron_dir"
+    cat > "$cron_dir/backup.sh" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+ENV_FILE="$ENV_FILE"
+DATA_ROOT="$DATA_ROOT"
+TOKEN="\$(grep '^BIAO_API_TOKEN=' "\$ENV_FILE" | head -1 | cut -d= -f2-)"
+TS="\$(date '+%Y-%m-%d %H:%M:%S')"
+if ! curl -sf -X POST http://127.0.0.1:7331/v2/backup/run -H "Authorization: Bearer \$TOKEN" >/dev/null 2>&1; then
+    echo "\$TS backup_failed" >> "\$DATA_ROOT/backup-cron.log"
+fi
+EOF
+    chmod 700 "$cron_dir/backup.sh"
+
+    local cron_line="0 * * * * $cron_dir/backup.sh >/dev/null 2>&1 # biao-backup-cron"
+    if command -v crontab >/dev/null 2>&1; then
+        # 幂等：移除旧 biao-backup-cron 行，再追加新行
+        ( crontab -l 2>/dev/null | grep -v '# biao-backup-cron' ; echo "$cron_line" ) | crontab -
+        info "已安装每小时备份 cron（POST /v2/backup/run → webhook/incident 留痕）"
+    else
+        warn "未找到 crontab，请手动添加：$cron_line"
+    fi
+}
+
+# ─── P12 §13：可选监控（prometheus + node_exporter → Biao metrics） ─────
+# docker compose override：新增 prometheus 与 node_exporter 服务，Prometheus
+# scrape 指向 biao-server 的 /v2/metrics/prometheus（job=biao）。
+install_monitoring() {
+    info "安装可选监控：prometheus + node_exporter → Biao metrics"
+    local MON_FILE="$SCRIPT_DIR/docker-compose.monitoring.yml"
+    mkdir -p "$DATA_ROOT/docker/prometheus"
+
+    cat > "$DATA_ROOT/docker/prometheus/prometheus.yml" <<EOF
+global:
+  scrape_interval: 30s
+scrape_configs:
+  - job_name: 'biao'
+    metrics_path: /v2/metrics/prometheus
+    static_configs:
+      - targets: ['biao-server:7331']
+        labels:
+          source: biao
+  - job_name: 'node'
+    static_configs:
+      - targets: ['biao-node-exporter:9100']
+        labels:
+          source: nas-host
+EOF
+    chmod 644 "$DATA_ROOT/docker/prometheus/prometheus.yml"
+
+    cat > "$MON_FILE" <<EOF
+# P12 §13：可选监控服务（docker compose override，与 docker-compose.yml 合并）
+services:
+  biao-node-exporter:
+    image: prom/node-exporter:latest
+    container_name: biao-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    ports:
+      - "9100:9100"
+    networks:
+      - biao-net
+
+  biao-prometheus:
+    image: prom/prometheus:latest
+    container_name: biao-prometheus
+    restart: unless-stopped
+    volumes:
+      - $DATA_ROOT/docker/prometheus:/etc/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "9090:9090"
+    networks:
+      - biao-net
+    depends_on:
+      - biao-node-exporter
+EOF
+
+    if $DOCKER_CMD compose -f "$SCRIPT_DIR/docker-compose.yml" -f "$MON_FILE" up -d biao-node-exporter biao-prometheus >/dev/null 2>&1; then
+        info "监控已启动：Prometheus http://<host>:9090；node_exporter :9100；Biao job=biao（/v2/metrics/prometheus）"
+    else
+        warn "监控服务启动失败，请检查 docker compose 日志（$MON_FILE）"
+    fi
+}
+
 # ─── 打印部署信息 ──────────────────────────────────────────────────────
 print_info() {
     echo
@@ -159,6 +263,15 @@ main() {
     setup_data_dirs
     generate_env
 
+    local with_monitoring=0
+    for arg in "$@"; do
+        case "$arg" in
+            --with-monitoring) with_monitoring=1 ;;
+            --build-only) ;;
+            *) warn "未知参数：$arg（支持 --build-only、--with-monitoring）" ;;
+        esac
+    done
+
     if [ "${1:-}" = "--build-only" ]; then
         info "仅构建模式，不启动服务"
         cd "$SCRIPT_DIR"
@@ -168,6 +281,12 @@ main() {
     fi
 
     deploy
+    # P12 §12：每小时自动备份（POST /v2/backup/run → backup_runs + 失败开 incident）
+    install_backup_cron
+    # P12 §13：可选监控（--with-monitoring → prometheus + node_exporter 指向 Biao metrics）
+    if [ "$with_monitoring" = "1" ]; then
+        install_monitoring
+    fi
     print_info
 }
 

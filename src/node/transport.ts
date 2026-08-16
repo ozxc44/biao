@@ -259,4 +259,100 @@ export class NodeApiClient {
   reportAttempt(attemptId: string, input: Record<string, unknown>): Promise<ApiCallResult<Record<string, unknown>>> {
     return this.call('POST', `/v2/attempts/${encodeURIComponent(attemptId)}/report`, input);
   }
+
+  /**
+   * GET /v2/events/stream（P12 车道 B）：Worker SSE 唤醒通道的客户端。
+   *
+   * 拉起一条长连接并增量解析 text/event-stream（data 行 JSON 优先解析）；
+   * 鉴权头与 call() 同源（bvn2 Node credential / 过渡期 owner 回退）。
+   * 连接由调用方持有：close() 主动断开；done 在连接结束（服务端关闭、
+   * 网络错误或 close()）后 resolve，由 daemon 侧决定重连/降级轮询。
+   */
+  streamEvents(options: {
+    /** 断线续读游标（上一次事件的 stream id）；缺省由服务端 '$' 只推新事件。 */
+    lastId?: string;
+    onEvent: (event: WorkerStreamEvent) => void;
+    /** 收到 2xx 响应头且 body 可读时回调一次（重连退避归零的依据）。 */
+    onOpen?: () => void;
+  }): WorkerEventStreamHandle {
+    const controller = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const query = options.lastId ? `?last_id=${encodeURIComponent(options.lastId)}` : '';
+    const done = (async (): Promise<void> => {
+      try {
+        const res = await this.fetchImpl(`${this.baseUrl}/v2/events/stream${query}`, {
+          method: 'GET',
+          headers: { ...this.buildHeaders(), Accept: 'text/event-stream' },
+          signal: controller.signal,
+        });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        options.onOpen?.();
+        reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { done: finished, value } = await reader.read();
+          if (finished) break;
+          buffer += decoder.decode(value, { stream: true });
+          let separator = buffer.indexOf('\n\n');
+          while (separator >= 0) {
+            const block = buffer.slice(0, separator);
+            buffer = buffer.slice(separator + 2);
+            const parsed = parseEventStreamBlock(block);
+            if (parsed) options.onEvent(parsed);
+            separator = buffer.indexOf('\n\n');
+          }
+        }
+      } catch {
+        // 网络/中止/非 2xx：结束流，由上层 done.then() 走重连或轮询降级。
+      }
+    })();
+    return {
+      close: () => {
+        try {
+          void reader?.cancel().catch(() => undefined);
+        } catch {
+          /* already cancelled */
+        }
+        controller.abort();
+      },
+      done,
+    };
+  }
+}
+
+/** SSE 单事件（data 为 JSON 对象；非 JSON data 以 { raw } 透传）。 */
+export interface WorkerStreamEvent {
+  event: string;
+  data: Record<string, unknown>;
+  id: string | null;
+}
+
+/** streamEvents 的连接句柄：close 主动断开，done 等待连接结束。 */
+export interface WorkerEventStreamHandle {
+  close(): void;
+  done: Promise<void>;
+}
+
+/** 解析一个以空行分隔的 SSE 块（event:/data:/id: 字段；`:注释` 忽略）。 */
+function parseEventStreamBlock(block: string): WorkerStreamEvent | null {
+  let event = 'message';
+  let data = '';
+  let id: string | null = null;
+  for (const line of block.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') event = value;
+    else if (field === 'data') data += (data ? '\n' : '') + value;
+    else if (field === 'id') id = value;
+  }
+  if (!data) return null;
+  try {
+    return { event, data: JSON.parse(data) as Record<string, unknown>, id };
+  } catch {
+    return { event, data: { raw: data }, id };
+  }
 }

@@ -96,6 +96,13 @@ export interface BiaoNodeRuntimeConfig extends Required<Omit<BiaoNodeConfigFile,
 
 export const BIAO_NODE_OWNER_TOKEN_ENV = 'BIAO_NODE_OWNER_TOKEN';
 export const BIAO_NODE_INJECTED_CLOCK_OFFSET_ENV = 'BIAO_NODE_INJECTED_CLOCK_OFFSET_MS';
+/**
+ * P12 车道 B：真执行器的执行命令模板 env（RealExecutor.execCommand）。
+ * 支持 ${workspace} ${goal_md_file} ${task_id} 变量；示例：
+ * BIAO_EXEC_CMD='claude -p "$(cat ${goal_md_file})"'。显式传入
+ * realExecutorOptions.execCommand 时以选项为准。
+ */
+export const BIAO_EXEC_CMD_ENV = 'BIAO_EXEC_CMD';
 
 /** 默认周期参数（毫秒）。测试用更小值直接写进配置文件，不新增 env。 */
 export const DEFAULTS = {

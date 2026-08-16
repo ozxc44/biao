@@ -105,33 +105,7 @@ export function HumanLoginPage({
         <section className="detail-section review-form">
           <h3>{t('humanLogin.localSectionTitle')}</h3>
           <p className="field-message">{t('humanLogin.localSectionDescription')}</p>
-          
-              {isPasswordMode && (
-                <>
-                  <label htmlFor="login-username">{t('humanLogin.username')}</label>
-                  <input
-                    id="login-username"
-                    type="text"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    autoComplete="username"
-                    disabled={remoteBusy}
-                  />
-                  <label htmlFor="login-password">{t('humanLogin.password')}</label>
-                  <input
-                    id="login-password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    autoComplete="current-password"
-                    disabled={remoteBusy}
-                  />
-                </>
-              )}
-              {!isPasswordMode && (
-                <label htmlFor="enrollment-code">{t('humanLogin.enrollmentCode')}</label>
-              )}
-              <div className="button-row">
+          <div className="button-row">
             <button type="button" className="btn primary" disabled={localBusy} onClick={() => void enterLocal()}>
               {localBusy ? t('localOwnerSession.entering') : t('localOwnerSession.entryAction')}
             </button>
@@ -144,26 +118,56 @@ export function HumanLoginPage({
           <h3>{t('humanLogin.remoteSectionTitle')}</h3>
           <p className="field-message">{t('humanLogin.remoteSectionDescription')}</p>
           <form onSubmit={(event) => void submitCode(event)}>
-            <label htmlFor="human-enrollment-code">{t('humanLogin.codeLabel')}</label>
-            <input
-              id="human-enrollment-code"
-              name="enrollment_code"
-              autoComplete="off"
-              spellCheck={false}
-              value={enrollmentCode}
-              onChange={(event) => setEnrollmentCode(event.target.value)}
-              placeholder={t('humanLogin.codePlaceholder')}
-              disabled={remoteBusy}
-            />
+            {isPasswordMode ? (
+              <>
+                <label htmlFor="login-username">{t('humanLogin.username')}</label>
+                <input
+                  id="login-username"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="username"
+                  disabled={remoteBusy}
+                />
+                <label htmlFor="login-password">{t('humanLogin.password')}</label>
+                <input
+                  id="login-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  disabled={remoteBusy}
+                />
+              </>
+            ) : (
+              <>
+                <label htmlFor="human-enrollment-code">{t('humanLogin.codeLabel')}</label>
+                <input
+                  id="human-enrollment-code"
+                  name="enrollment_code"
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={enrollmentCode}
+                  onChange={(event) => setEnrollmentCode(event.target.value)}
+                  placeholder={t('humanLogin.codePlaceholder')}
+                  disabled={remoteBusy}
+                />
+              </>
+            )}
             <div className="button-row">
               <button
-            type="button"
-            className="btn secondary small"
-            onClick={() => setIsPasswordMode(!isPasswordMode)}
-          >
-            {isPasswordMode ? (t('humanLogin.useCode') || '使用登录码') : (t('humanLogin.usePassword') || '使用账号密码')}
-          </button>
-          <button type="submit" className="btn primary" disabled={remoteBusy || !enrollmentCode.trim()}>
+                type="button"
+                className="btn secondary small"
+                onClick={() => setIsPasswordMode(!isPasswordMode)}
+              >
+                {isPasswordMode ? (t('humanLogin.useCode') || '使用登录码') : (t('humanLogin.usePassword') || '使用账号密码')}
+              </button>
+              <button
+                type="submit"
+                className="btn primary"
+                disabled={remoteBusy || (isPasswordMode ? !username.trim() || !password : !enrollmentCode.trim())}
+              >
                 {remoteBusy ? t('humanLogin.submitting') : t('humanLogin.submitAction')}
               </button>
             </div>

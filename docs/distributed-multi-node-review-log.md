@@ -289,3 +289,14 @@ v0.8.0 方案 Phase 0a-1 → 0a-2 → 0b → 1 → 2 ∥ 3 → 2+3 统一门禁 
 | 同步预检体系 | ✅ 完成 | scripts/sync-preflight.sh（6 段门禁：构建/安全扫描/全量测试/git 状态/平台健康/PM 台账）+ scripts/setup-git-hooks.sh（pre-push hook 自动跑 --quick）。NAS 119 部署验收：health/version/五旗/AOF/LAN 连通 |
 | 方案 E：Web 控制台远程人类登录 | ✅ 完成 | bhe2 enrollment 一次性登录码（hash 存储、24h/7d 上限、并发安全烧码）→ bvh2 Cookie 会话（HttpOnly/SameSite=Strict/30d）→ V1+V2 双面放行（与 loopback 并行）；014 迁移；登录页+顶栏身份+登出（中英双语）；16+2 用例+真实服务实证（enroll→code→Cookie→API 全通→登出即时失效）。全量 134 文件/1676 用例全绿 |
 | NAS 119 + .25 多机部署 | ✅ 完成 | NAS：Docker 化 Server+Redis（AOF）、五旗 3/5 开启、enrollment ticket 配置；.25（WSL2）：biao-node 部署+enroll+daemon 运行、心跳持续到达 NAS（win25-wsl2-worker-v1 online）。跨机 Worker-Server 链路首次真实运行 |
+
+## P12 全面完善（2026-08-16）
+
+| 车道 | 内容 | 状态 |
+| --- | --- | --- |
+| A 核心功能 | 真实 Harness 执行器（execCommand 模板+变量替换+超时）、Redis/SQLite 状态同步、attempt cancel API、daemon bva2 token 缓存 | ✅ |
+| B 架构优化 | service.ts 14357→10912 行（AttemptService 17 函数迁出）、claim 桥接索引优化（LIMIT 1）、SSE 推送唤醒（daemon 自动降级轮询）、daemon 全链自动领取 | ✅ |
+| C 产品+安全 | Webhook 通知（HMAC+Slack+重试）、前端 SSE 实时更新、API 速率限制（@fastify/rate-limit）、备份 cron 调度、Prometheus 指标、安全头+CORS+Cookie Secure | ✅ |
+| 登录修复 | 用户名密码表单移到 remoteAvailable 条件块；移除不必要的同源校验 | ✅ |
+
+全量基线：**139 文件 / 1744 用例全绿**（较 P12 前 +4 文件 +35 用例）

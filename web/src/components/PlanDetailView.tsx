@@ -8,7 +8,6 @@ import {
   fetchTaskReview,
   resetTask,
   reviewTask,
-  subscribeToEvents,
   type ExecutionReceiptData,
   type PlanData,
   type ProjectAgentOnlineCandidateData,
@@ -57,7 +56,16 @@ const BOARD_COLUMNS: ReadonlyArray<{ key: string; groups: readonly BoardGroupKey
 
 const COLLAPSED_GROUP_LIMIT = 5;
 
-export function PlanDetailView({ planId, authRevision }: { planId: string; authRevision: number }) {
+export function PlanDetailView({
+  planId,
+  authRevision,
+  refreshRevision,
+}: {
+  planId: string;
+  authRevision: number;
+  /** P12 §10：SSE 事件到达递增的 revision，变化即触发重载。 */
+  refreshRevision: number;
+}) {
   const { locale, t } = useI18n();
   const [plan, setPlan] = useState<PlanData | null>(null);
   const [agentRoster, setAgentRoster] = useState<ProjectAgentRosterData | null>(null);
@@ -103,15 +111,15 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
       await load();
     };
     void guardedLoad();
-    const unsubscribe = subscribeToEvents(() => void guardedLoad());
+    // P12 §10：SSE 事件由 App 级 useEventStream 订阅并递增 refreshRevision，
+    // 这里不再直接 subscribeToEvents（避免双订阅重复刷新）。
     return () => {
       active = false;
       loadGeneration.current += 1;
-      unsubscribe();
     };
-    // load is intentionally recreated; planId/authRevision define the subscription lifecycle.
+    // load is intentionally recreated; planId/authRevision/refreshRevision define the reload lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planId, authRevision]);
+  }, [planId, authRevision, refreshRevision]);
 
   useEffect(() => {
     setExpandedGroups(new Set());

@@ -21,7 +21,9 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import type Redis from 'ioredis';
 import type { BiaoConfig } from '../types/index.js';
+import fastifyRateLimit from '@fastify/rate-limit';
 import {
+  cookieSecureFlag,
   isLoopbackHost,
   isValidLocalOwnerSession,
   readCookie,
@@ -76,11 +78,11 @@ function isLocalOwnerSessionPath(pathname: string): boolean {
 }
 
 export function humanSessionSetCookie(value: string): string {
-  return `${HUMAN_SESSION_COOKIE}=${value}; Path=/; Max-Age=${HUMAN_WEB_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict`;
+  return `${HUMAN_SESSION_COOKIE}=${value}; Path=/; Max-Age=${HUMAN_WEB_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict${cookieSecureFlag()}`;
 }
 
 export function humanSessionClearCookie(): string {
-  return `${HUMAN_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict`;
+  return `${HUMAN_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${cookieSecureFlag()}`;
 }
 
 /**
@@ -377,3 +379,126 @@ export const crossCuttingApiPlugin: FastifyPluginAsync<CrossCuttingApiPluginOpti
     await releaseRequestPermit(req).catch(() => undefined);
   });
 };
+
+/* ------------------------------------------------------------------ */
+/* P12 §11/§14：速率限制 + 安全头 + CORS 白名单                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * §11：速率限制配置（env 可调）。
+ * - BIAO_RATE_LIMIT_GLOBAL_MAX：全局每秒上限（默认 100 req/s）；
+ * - BIAO_RATE_LIMIT_LOGIN_MAX：/auth/human-login 每分钟上限（默认 10，防暴力破解）；
+ * - BIAO_RATE_LIMIT_ENROLLMENT_MAX：enrollment code 消费每分钟上限（默认 5，IP 级冷却）；
+ * - BIAO_RATE_LIMIT_ENABLED：显式开关（1/true/yes/on）；未设置时 test runtime 默认关
+ *   （不干扰测试），生产（NODE_ENV≠test）默认开。
+ */
+export interface RateLimitConfig {
+  enabled: boolean;
+  globalMax: number;
+  loginMax: number;
+  enrollmentMax: number;
+}
+
+function parseOn(value: string | undefined): boolean | null {
+  if (value === undefined) return null;
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const raw = Number(value);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+export function resolveRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateLimitConfig {
+  const explicit = parseOn(env.BIAO_RATE_LIMIT_ENABLED);
+  const enabled = explicit ?? (env.NODE_ENV !== 'test' && env.VITEST !== 'true');
+  return {
+    enabled,
+    globalMax: positiveInt(env.BIAO_RATE_LIMIT_GLOBAL_MAX, 100),
+    loginMax: positiveInt(env.BIAO_RATE_LIMIT_LOGIN_MAX, 10),
+    enrollmentMax: positiveInt(env.BIAO_RATE_LIMIT_ENROLLMENT_MAX, 5),
+  };
+}
+
+/**
+ * §11：注册全局速率限制（@fastify/rate-limit，Redis 分布式 store）。
+ * 在 app 级别调用（覆盖全部路由包括 /v2 与 /auth）；test runtime 默认不启用。
+ * 登录/ enrollment 端点的更严限制在路由声明处以 config.rateLimit 覆盖
+ * （http.ts 对应路由 + v2-routes.ts enrollment 面）。
+ */
+export async function configureRateLimiting(
+  app: FastifyInstance,
+  options: { redis: Redis; env?: NodeJS.ProcessEnv },
+): Promise<RateLimitConfig> {
+  const config = resolveRateLimitConfig(options.env);
+  if (!config.enabled) return config;
+  await app.register(fastifyRateLimit, {
+    global: true,
+    max: config.globalMax,
+    timeWindow: 1000, // 每秒窗口
+    redis: options.redis,
+    skipOnError: true,
+    keyGenerator: (request) => {
+      // 按 IP 限流；X-Forwarded-For 不信任（只有直接信任的代理才可设置）。
+      return request.ip;
+    },
+  });
+  return config;
+}
+
+/** 登录端点限流默认值（10 req/min；env BIAO_RATE_LIMIT_LOGIN_MAX 可调）。 */
+export const LOGIN_RATE_LIMIT_DEFAULT_MAX = 10;
+
+/** enrollment code 消费限流默认值（5 req/min/IP；env BIAO_RATE_LIMIT_ENROLLMENT_MAX 可调）。 */
+export const ENROLLMENT_RATE_LIMIT_DEFAULT_MAX = 5;
+
+/**
+ * §14：安全响应头。挂 app 级 onSend——所有 API 与静态响应统一加：
+ * X-Content-Type-Options: nosniff（防 MIME 嗅探）、X-Frame-Options: DENY（防点击劫持）。
+ */
+export function addSecurityHeadersOnSend(app: FastifyInstance): void {
+  app.addHook('onSend', async (_req, reply, payload) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Frame-Options', 'DENY');
+    return payload;
+  });
+}
+
+/**
+ * §14：CORS 白名单。BIAO_CORS_ORIGINS（逗号分隔）配置允许的前端 origin；
+ * 未配置时不改变现状（同源部署，无跨域头，浏览器按同源策略）。
+ * - 请求携带 Origin 且不在白名单 → 403 CORS_ORIGIN_DENIED（fail-closed）；
+ * - 请求携带 Origin 且在白名单 → 响应加 Access-Control-Allow-* 头；
+ * - 无 Origin 的请求（curl/Worker/Node 客户端）不设 CORS 头、不拦截。
+ */
+export function corsWhitelistOnRequest(app: FastifyInstance, allowedOrigins: readonly string[]): void {
+  if (allowedOrigins.length === 0) return;
+  app.addHook('onRequest', async (req, reply) => {
+    const origin = req.headers.origin;
+    if (!origin || typeof origin !== 'string') return;
+    if (allowedOrigins.includes(origin)) return;
+    return reply.status(403).send({
+      ok: false,
+      data: null,
+      error: { code: 'CORS_ORIGIN_DENIED', message: `Origin ${origin} 不在 CORS 白名单内` },
+    });
+  });
+  app.addHook('onSend', async (req, reply, payload) => {
+    const origin = req.headers.origin;
+    if (origin && typeof origin === 'string' && allowedOrigins.includes(origin)) {
+      reply.header('Access-Control-Allow-Origin', origin);
+      reply.header('Access-Control-Allow-Credentials', 'true');
+      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Correlation-Id');
+      reply.header('Vary', 'Origin');
+    }
+    return payload;
+  });
+}
+
+/** 解析 BIAO_CORS_ORIGINS（逗号分隔）为白名单数组。 */
+export function resolveCorsOrigins(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.BIAO_CORS_ORIGINS?.trim();
+  if (!raw) return [];
+  return raw.split(',').map((origin) => origin.trim()).filter(Boolean);
+}

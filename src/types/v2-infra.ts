@@ -138,6 +138,45 @@ export interface IdempotencyRecordRow {
   expires_at: number; // 毫秒
 }
 
+/** §9（P12）webhook_registrations.status */
+export type V2WebhookStatus = 'active' | 'failed' | 'disabled';
+
+/** §9（P12）webhook_deliveries.status */
+export type V2WebhookDeliveryStatus = 'pending' | 'delivered' | 'failed';
+
+/** §9（P12）webhook_registrations — PM 事件推送到外部系统的注册 */
+export interface WebhookRegistrationRow {
+  webhook_id: string;
+  url: string;
+  /** HMAC-SHA256 签名密钥（注册时明文落库，投递签名与验签共用）。 */
+  secret: string;
+  /** 订阅事件类型 JSON 数组（task_done / review_requested / conflict_detected / incident_opened）。 */
+  events: string;
+  status: V2WebhookStatus;
+  failure_count: number;
+  last_delivered_at: number | null;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** §9（P12）webhook_deliveries — 单次投递尝试的持久化记录 */
+export interface WebhookDeliveryRow {
+  delivery_id: string;
+  webhook_id: string;
+  event_type: string;
+  event_id: string;
+  payload: string;
+  signature: string;
+  attempt_count: number;
+  status: V2WebhookDeliveryStatus;
+  last_error: string;
+  next_attempt_at: number;
+  created_at: number;
+  delivered_at: number | null;
+  response_status: number | null;
+}
+
 /** §20.1 restore_points — 恢复点 */
 export interface RestorePointRow {
   restore_point_id: string;

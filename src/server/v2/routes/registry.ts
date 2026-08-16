@@ -633,6 +633,21 @@ export const V2_ROUTES: readonly V2RouteRegistryEntry[] = [
     credentialBinding: { verifier: 'verifyAttemptToken', attemptScope: 'report' },
     description: 'Attempt 收口（Artifact 引用替代本地路径，D-005）',
   },
+  {
+    id: 'POST /v2/attempts/:attempt_id/cancel',
+    method: 'POST',
+    path: '/v2/attempts/:attempt_id/cancel',
+    service: 'AttemptService',
+    handler: 'AttemptService.cancelTask',
+    schema: {
+      params: idParam('attempt_id'),
+      body: { type: 'object', additionalProperties: false },
+    },
+    credentialScopes: ['task_attempt', 'human_owner'],
+    mutation: true,
+    credentialBinding: { verifier: 'verifyAttemptToken', attemptScope: 'claim' },
+    description: '取消 attempt（attempt → cancelled，task → pending 允许重试）',
+  },
 
   /* ---- §15.4 Artifact ---- */
   {

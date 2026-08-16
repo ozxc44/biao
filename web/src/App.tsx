@@ -12,6 +12,8 @@ import { ProjectListView } from './components/ProjectListView';
 import { LanguageSwitcher } from './i18n/LanguageSwitcher';
 import { useI18n } from './i18n/I18nContext';
 import { planSelectionUrl, selectedPlanFromSearch } from './navigation';
+// P12 §10：SSE 实时事件订阅 → 收到任务状态变更/新门铃/冲突即刷新对应视图。
+import { ignorePollEvents, useEventStream } from './hooks/useEventStream';
 
 /** 认证通道：本机 Owner 会话 / auth_disabled 直通 / 远程人类 Cookie 会话。 */
 type AuthKind = 'none' | 'local_owner' | 'auth_disabled' | 'human';
@@ -46,6 +48,13 @@ export default function App() {
   const [authRevision, setAuthRevision] = useState(0);
   const [auth, setAuth] = useState<AuthState>(initialAuthState);
   const { t } = useI18n();
+
+  // P12 §10：SSE 实时事件订阅。认证完成后开始消费事件流；忽略后台 fallback 轮询。
+  // 返回的 revision 每次有业务事件到达时递增，作为视图重载依赖（无需手动刷新）。
+  const refreshRevision = useEventStream({
+    enabled: !auth.loading && auth.kind !== 'none',
+    filter: ignorePollEvents,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -173,9 +182,9 @@ export default function App() {
           onEnteredHuman={enterHumanSession}
         />
       ) : selectedPlanId ? (
-        <PlanDetailView planId={selectedPlanId} authRevision={authRevision} />
+        <PlanDetailView planId={selectedPlanId} authRevision={authRevision} refreshRevision={refreshRevision} />
       ) : (
-        <ProjectListView onSelectPlan={(planId) => selectPlan(planId)} authRevision={authRevision} />
+        <ProjectListView onSelectPlan={(planId) => selectPlan(planId)} authRevision={authRevision} refreshRevision={refreshRevision} />
       )}
     </div>
   );

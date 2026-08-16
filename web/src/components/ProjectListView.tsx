@@ -3,7 +3,6 @@ import {
   createPlan,
   fetchPlan,
   fetchStatus,
-  subscribeToEvents,
   type AgentInfo,
   type PlanSummary,
   type StatusData,
@@ -43,9 +42,12 @@ const EMPTY_REVIEWS = { pending: 0, accepted: 0, rejected: 0 };
 export function ProjectListView({
   onSelectPlan,
   authRevision,
+  refreshRevision,
 }: {
   onSelectPlan: (planId: string) => void;
   authRevision: number;
+  /** P12 §10：SSE 事件到达递增的 revision，变化即触发重载。 */
+  refreshRevision: number;
 }) {
   const { locale, t } = useI18n();
   const [status, setStatus] = useState<StatusData | null>(null);
@@ -118,14 +120,12 @@ export function ProjectListView({
     };
 
     void load();
-    const unsubscribe = subscribeToEvents(() => {
-      if (!cancelled) void load();
-    });
+    // P12 §10：SSE 事件由 App 级 useEventStream 订阅并递增 refreshRevision，
+    // 这里不再直接 subscribeToEvents（避免双订阅重复刷新）。
     return () => {
       cancelled = true;
-      unsubscribe();
     };
-  }, [reloadTick, authRevision]);
+  }, [reloadTick, authRevision, refreshRevision]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);

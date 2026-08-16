@@ -1,23 +1,24 @@
 /**
- * biao-node 真执行器（Phase 8 · §10.1 替换占位）
+ * biao-node 真执行器（Phase 8 · §10.1 替换占位 → P12 真实执行）
  *
  * 收到 task attempt 后真实执行全链：
  * 1. workspace prepare（HTTP → 服务端 clone + 创建 attempt 分支）
- * 2. 在 attempt 工作区执行（可配置命令模板，默认占位 shell 写文件 + exit 0）
- * 3. workspace finalize（HTTP → 服务端 commit + push）
- * 4. report（HTTP → 服务端生成 delivery）
+ * 2. 拉取 task goal_md → 写入工作区 goal.md
+ * 3. 在 attempt 工作区执行可配置命令（codex exec / kimi -p / claude -p / 自定义 shell）
+ * 4. workspace finalize（HTTP → 服务端 commit + push）
+ * 5. report（HTTP → 服务端生成 delivery）
  *
- * 重点是把 prepare/commit/push/artifact/report 全链从 daemon 侧真实走通。
  * 执行器配置面：
- * - commandTemplate：执行命令模板（默认 'echo "placeholder" > ${workspace}/output.txt'）
+ * - execCommand：执行命令（默认 'echo "placeholder"'；支持 ${workspace} ${goal_md_file} ${task_id} 变量）
  * - workspaceDir：工作区目录根
  * - biaoApiUrl：服务端 API 地址
  * - attemptToken：bva2 token（从 claim 响应获取）
  */
 
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import type { AttemptIntake } from './slots.js';
 import type { WatchdogAttempt, AttemptStopReason } from './lease-watchdog.js';
 
@@ -26,14 +27,23 @@ export interface RealExecutorOptions {
   biaoApiUrl: string;
   /** 工作区目录根（默认 <tmp>/biao-executor-workspaces） */
   workspaceDir?: string;
-  /** 执行命令模板（${workspace} 会被替换为工作区路径） */
-  commandTemplate?: string;
+  /**
+   * 执行命令（支持 ${workspace} ${goal_md_file} ${task_id} 变量替换）。
+   * 示例：
+   * - 'codex exec --quiet < ${goal_md_file}'
+   * - 'kimi -p "$(cat ${goal_md_file})"'
+   * - 'claude -p "$(cat ${goal_md_file})"'
+   * - '/path/to/custom-script.sh ${task_id} ${goal_md_file} ${workspace}'
+   */
+  execCommand?: string;
   /** HTTP fetch 实现（测试注入） */
   fetchImpl?: typeof fetch;
   /** bva2 token 获取函数（从 claim 响应缓存） */
   getAttemptToken?: (attemptId: string) => string | undefined;
   /** bvn2 node credential */
   nodeCredential?: string;
+  /** 执行超时（毫秒，默认 600000 = 10 分钟） */
+  execTimeoutMs?: number;
 }
 
 export interface AttemptExecutionRecord {
@@ -48,6 +58,11 @@ export interface AttemptExecutionRecord {
   finalize_state: 'pending' | 'started' | 'delivered' | 'failed';
   report_state: 'pending' | 'sent' | 'failed';
   workspace_path?: string;
+  goal_md_file?: string;
+  exec_command?: string;
+  exec_exit_code?: number | null;
+  exec_stdout?: string;
+  exec_stderr?: string;
   error?: string;
   stopped_at?: number;
   stop_reason?: string;
@@ -55,7 +70,8 @@ export interface AttemptExecutionRecord {
 
 export class RealExecutor {
   private readonly workspaceDir: string;
-  private readonly commandTemplate: string;
+  private readonly execCommand: string;
+  private readonly execTimeoutMs: number;
   private readonly biaoApiUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly getAttemptToken: (attemptId: string) => string | undefined;
@@ -65,7 +81,8 @@ export class RealExecutor {
   constructor(options: RealExecutorOptions) {
     this.biaoApiUrl = options.biaoApiUrl;
     this.workspaceDir = options.workspaceDir ?? join(process.env.TMPDIR ?? '/tmp', 'biao-executor-workspaces');
-    this.commandTemplate = options.commandTemplate ?? 'echo "biao placeholder output" > ${workspace}/output.txt';
+    this.execCommand = options.execCommand ?? 'echo "biao placeholder: no execCommand configured"';
+    this.execTimeoutMs = options.execTimeoutMs ?? 600_000;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.getAttemptToken = options.getAttemptToken ?? (() => undefined);
     this.nodeCredential = options.nodeCredential;
@@ -138,22 +155,51 @@ export class RealExecutor {
       return;
     }
 
-    // 2. 执行命令（在工作区中）
-    record.execute_state = 'running';
+    // 2. 拉取 task goal_md → 写入工作区 goal.md
+    const goalMdFile = join(workspacePath, 'goal.md');
+    record.goal_md_file = goalMdFile;
+    let goalMd = '';
     try {
-      const command = this.commandTemplate.replace('${workspace}', workspacePath);
-      // 写执行记录文件（占位执行：写文件 + exit 0）
+      const taskRes = await this.fetchImpl(
+        `${this.biaoApiUrl}/tasks/${record.task_id}`,
+        { method: 'GET', headers: this.headers() },
+      );
+      if (taskRes.ok) {
+        const taskBody = await taskRes.json().catch(() => ({})) as { data?: { goal_md?: string } };
+        goalMd = taskBody?.data?.goal_md ?? '';
+      }
+    } catch {
+      // goal_md 获取失败不阻塞执行——命令可能不需要它
+    }
+    writeFileSync(goalMdFile, goalMd || `task ${record.task_id} (no goal_md available)`, { mode: 0o600 });
+
+    // 3. 执行配置命令（在工作区中）
+    record.execute_state = 'running';
+    record.exec_command = this.execCommand;
+    try {
+      const { exitCode, stdout, stderr } = await this.spawnExecCommand(
+        this.execCommand, workspacePath, goalMdFile, record.task_id, attemptId,
+      );
+      record.exec_exit_code = exitCode;
+      record.exec_stdout = stdout.slice(0, 4096);
+      record.exec_stderr = stderr.slice(0, 4096);
+
       writeFileSync(join(workspacePath, 'execution-record.json'), JSON.stringify({
         attempt_id: attemptId,
         task_id: record.task_id,
-        command,
+        command: this.execCommand,
+        exit_code: exitCode,
+        stdout_bytes: stdout.length,
+        stderr_bytes: stderr.length,
         executed_at: Date.now(),
         executor: 'real-phase8',
       }, null, 2), { mode: 0o600 });
 
-      // 占位执行：直接写 output 文件
-      const outputContent = `biao attempt ${attemptId} placeholder output at ${new Date().toISOString()}\n`;
-      writeFileSync(join(workspacePath, 'output.txt'), outputContent, { mode: 0o600 });
+      if (exitCode !== 0) {
+        record.execute_state = 'failed';
+        record.error = `execute: command exited with code ${exitCode}`;
+        return;
+      }
       record.execute_state = 'done';
     } catch (err) {
       record.execute_state = 'failed';
@@ -161,7 +207,7 @@ export class RealExecutor {
       return;
     }
 
-    // 3. workspace finalize
+    // 4. workspace finalize
     record.finalize_state = 'started';
     try {
       const finalizeRes = await this.fetchImpl(
@@ -183,7 +229,7 @@ export class RealExecutor {
       return;
     }
 
-    // 4. report
+    // 5. report
     record.report_state = 'sent';
     try {
       const reportRes = await this.fetchImpl(
@@ -202,6 +248,52 @@ export class RealExecutor {
       record.report_state = 'failed';
       record.error = `report: ${err instanceof Error ? err.message : String(err)}`;
     }
+  }
+
+  /**
+   * 执行配置的命令。支持 ${workspace} ${goal_md_file} ${task_id} ${attempt_id} 变量。
+   * 命令通过 shell（/bin/sh -c）执行，支持管道/重定向等 shell 特性。
+   */
+  private spawnExecCommand(
+    commandTemplate: string,
+    workspace: string,
+    goalMdFile: string,
+    taskId: string,
+    attemptId: string,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const command = commandTemplate
+      .replace(/\$\{workspace\}/g, workspace)
+      .replace(/\$\{goal_md_file\}/g, goalMdFile)
+      .replace(/\$\{task_id\}/g, taskId)
+      .replace(/\$\{attempt_id\}/g, attemptId);
+
+    return new Promise((resolve) => {
+      const child = spawn('/bin/sh', ['-c', command], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          BIAO_WORKSPACE: workspace,
+          BIAO_GOAL_MD_FILE: goalMdFile,
+          BIAO_TASK_ID: taskId,
+          BIAO_ATTEMPT_ID: attemptId,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: this.execTimeoutMs,
+      });
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      child.on('close', (code) => {
+        resolve({ exitCode: code ?? 1, stdout, stderr });
+      });
+
+      child.on('error', (err) => {
+        resolve({ exitCode: 1, stdout, stderr: `spawn error: ${err.message}` });
+      });
+    });
   }
 
   /** 停止后记录状态。 */

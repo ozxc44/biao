@@ -66,6 +66,15 @@ credential_generation），quarantine 等同安全撤权并立即 fencing（D-03
 
 ## AttemptService（claim / lease / Question / 任务生命周期 / Ownership）
 
+> **第一批已迁移（P12 车道 B，2026-08-16）**：本节 17 个函数的实现已迁至
+> `src/server/v2/attempt-service.ts`，service.ts 以
+> `export { ... } from './v2/attempt-service.js'` 保留兼容 re-export（零破坏）。
+> 迁移随行的私有助手（claim 预约/Question CAS/supersede 批提交/block-resume
+> 重排队/task 列表投影等 ~47 项）一并迁出；service.ts 剩余函数仍引用的 12 项
+> 由 facade 引回。跨域私有助手（repair lineage / review doorbell / intake 投影
+> 读取等 37 函数 + 3 常量/接口）为供 attempt-service 引用临时加 export，见文末
+> 「SharedSupportService（迁移期）」小节——后续批次随所属域迁出后回收。
+
 V2 核心差异：Task 与 Attempt 分离（§5.1），claim 签发短期 Attempt Token，renew/
 question/artifact/delivery 全部校验 attempt_generation + node_session_generation
 （§13.5）；ownership 按 project 命名空间（D-011）且活跃 Attempt 不被盲目 preempt
@@ -140,6 +149,57 @@ restore point 水印编排（D-029/§14.6）；V1 的事件/intake/conflicts/own
 | `supervisorTick` | `ReconcileService`（运维聚合读面） | plans+intake+events+reconcile 聚合 |
 | `setSqliteStore` | （组合根基础设施，不进接口） | DI 注入 |
 | `getSqliteStore` | （组合根基础设施，不进接口） | DI 读取 |
+
+## SharedSupportService（迁移期：service.ts 内跨域私有助手加 export 供 attempt-service 引用）
+
+AttemptService 第一批迁移的伴生变更：下列 service.ts 私有助手被
+`src/server/v2/attempt-service.ts` 引用而临时加 `export`。它们不是 V1 facade 的
+API 面（不在 58 函数台账内），计入本节仅为让同步门禁显式跟踪这批过渡导出；
+后续批次（Delivery/Reconcile/NodeService 迁移）随所属域迁出后，此节清空。
+
+| 函数 | 归属去向 | 备注 |
+| --- | --- | --- |
+| `configuredWorkspaceRoots` | ProjectService | env 工作区根解析 |
+| `normalizePmConsumer` | ReconcileService | PM consumer 归一化 |
+| `projectAgentReservationKey` | ProjectService | reservation key 拼接 |
+| `publicBinding` | ProjectService | binding 行投影 |
+| `persistTaskFromRedis` | ReconcileService | Redis→SQLite 耐久副本 |
+| `withMutationPermit` | ReconcileService | 全局 mutation permit |
+| `acquireMutationSection` | ReconcileService | claim/report 提交段 |
+| `withAgentEpochCommit` | NodeService | agent epoch 提交互斥（共享 Map 状态在 service.ts） |
+| `durableAgentEpochIsCurrent` | NodeService | epoch 持久水位校验 |
+| `isDependencySatisfied` | AttemptService | 依赖满足判定 |
+| `checkDependencies` | AttemptService | 依赖检查 |
+| `summarizeVerifyFailures` | AttemptService | report 验收摘要 |
+| `failureReasonForReport` | AttemptService | report 失败原因 |
+| `normalizeRepairOwnership` | DeliveryService | repair ownership 归一 |
+| `splitOwnership` | AttemptService | ownership 列表拆分 |
+| `ownershipUnion` | AttemptService | ownership 并集 |
+| `parseRepairOwnershipAudit` | DeliveryService | repair ownership 审计解析 |
+| `markResolutionNeedsPmDecision` | DeliveryService | resolution 积压标记 |
+| `ensureRepairTask` | DeliveryService | repair 任务派生 |
+| `terminalizeSupersededPendingRepair` | DeliveryService | superseded repair 终态化 |
+| `markRepairAwaitingReview` | DeliveryService | repair 待审标记 |
+| `acceptanceSourceIds` | DeliveryService | 验收来源 ID |
+| `acceptanceReviewerConflictTask` | AttemptService | 领取阶段自验收冲突 |
+| `markAcceptanceFailureResolution` | DeliveryService | 验收失败 resolution |
+| `resolvePmConsumer` | ReconcileService | plan→consumer 解析 |
+| `finalizeReclaimedTasks` | ReconcileService | 回收任务收口 |
+| `acquirePmReviewLock` | DeliveryService | PM 决策锁 |
+| `runWithPmDecisionLockCleanup` | DeliveryService | 决策锁清理包装 |
+| `pendingMember` | ReconcileService | intake pending 成员拼接 |
+| `parseIndexedPendingEvent` | ReconcileService | pending 事件解析 |
+| `isUnreviewedDoneTask` | ReconcileService | 未复核 done 判定 |
+| `removeStalePendingReviews` | ReconcileService | 陈旧 pending review 清理 |
+| `ensureLegacyReviewIndexes` | ReconcileService | 旧复核索引补建 |
+| `readConsumerPending` | ReconcileService | consumer pending 读取 |
+| `findEventForAck` | ReconcileService | ack 事件定位 |
+| `scanKeys` | ReconcileService | SCAN 封装 |
+| `getGitHeadSha` | AttemptService | git HEAD 读取（ownership base） |
+
+另有非函数导出不进门禁统计：`AGENT_REGISTRATION_ID_PATTERN`/`PREFIX`（常量）、
+`PmDecisionLock`（接口）、`sqliteStore`（组合根 `let`，attempt-service 以只读
+live binding 引用，唯一写入口仍是 `setSqliteStore`）。
 
 ## maintenance.ts re-export（0a-1 已抽出的维护屏障，归 ReconcileService restore 面）
 

@@ -15,6 +15,7 @@ import * as incidentSlaRecurrence from './migrations/011_incident_sla_recurrence
 import * as evidenceAcceptances from './migrations/012_evidence_acceptances.js';
 import * as recoveryDecisions from './migrations/013_recovery_decisions.js';
 import * as humanEnrollments from './migrations/014_human_enrollments.js';
+import * as webhooks from './migrations/016_webhooks.js';
 
 export interface Migration {
   version: string;
@@ -119,6 +120,11 @@ const DEFAULT_MIGRATIONS: readonly Migration[] = Object.freeze([
     version: humanAccounts.version,
     checksumMaterial: humanAccounts.checksumMaterial,
     up: humanAccounts.up,
+  },
+  {
+    version: webhooks.version,
+    checksumMaterial: webhooks.checksumMaterial,
+    up: webhooks.up,
   },
 ]);
 
