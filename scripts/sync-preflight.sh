@@ -70,12 +70,16 @@ fi
 # ─── 3. 全量测试（--quick 跳过）───────────────────────────────
 if [ "$QUICK" != "--quick" ]; then
   section "全量测试"
-  TEST_OUTPUT=$(npx vitest run 2>&1 | tail -5)
-  TEST_FILES=$(echo "$TEST_OUTPUT" | grep -oE '[0-9]+ passed \([0-9]+\)' | head -1)
-  TEST_FAILED=$(echo "$TEST_OUTPUT" | grep -oE '[0-9]+ failed' | head -1)
+  # 注意：grep 无匹配返回 1，在 set -euo pipefail 下会杀死整段脚本——
+  # 所有"可能无匹配"的命令替换必须带 || true。
+  TEST_OUTPUT=$(npx vitest run 2>&1 | tail -5 || true)
+  # 兼容 vitest 两种摘要："141 passed (142)" 与 "141 passed | 1 skipped (142)"
+  TEST_FILES=$(echo "$TEST_OUTPUT" | grep -oE '[0-9]+ passed( \| [0-9]+ skipped)? \([0-9]+\)' | head -1 || true)
+  # 只把非零 failed 当失败；"0 failed" 字面量（部分 vitest 版本会打印）不算
+  TEST_FAILED=$(echo "$TEST_OUTPUT" | grep -oE '[1-9][0-9]* failed' | head -1 || true)
 
-  if echo "$TEST_OUTPUT" | grep -q "0 failed" || [ -z "$TEST_FAILED" ]; then
-    ok "全量测试通过：$TEST_FILES"
+  if [ -z "$TEST_FAILED" ]; then
+    ok "全量测试通过：${TEST_FILES:-摘要未解析，见上方 vitest 输出}"
   else
     # 已知 flaky 单独复跑
     FLAKY_FILE="tests/supervisor-pm-agent-cli.test.ts"
@@ -88,8 +92,8 @@ if [ "$QUICK" != "--quick" ]; then
     fi
   fi
 
-  # Web 测试
-  WEB_TEST=$(npm --prefix web test 2>&1 | tail -3)
+  # Web 测试（vitest 摘要后面还有 Start at/Duration/空行，截 8 行确保覆盖摘要行）
+  WEB_TEST=$(npm --prefix web test 2>&1 | tail -8 || true)
   if echo "$WEB_TEST" | grep -q "passed"; then
     ok "Web 测试通过"
   else
@@ -123,7 +127,7 @@ if curl -s --max-time 3 http://127.0.0.1:7331/health 2>/dev/null | grep -q '"ok"
   ok "本机 Biao 栈健康"
 
   # 检查是否有卡住的 running 任务（超 30 分钟无心跳）
-  TOKEN=$(grep BIAO_API_TOKEN .biao/config.env 2>/dev/null | cut -d= -f2 | tr -d "'" )
+  TOKEN=$(grep BIAO_API_TOKEN .biao/config.env 2>/dev/null | cut -d= -f2 | tr -d "'" || true)
   if [ -n "$TOKEN" ]; then
     STATUS_JSON=$(curl -s --max-time 5 http://127.0.0.1:7331/status -H "Authorization: Bearer $TOKEN" 2>/dev/null)
     RUNNING=$(echo "$STATUS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const s=JSON.parse(d).data;console.log(s.tasks?.running??0)}catch{console.log(0)}})" 2>/dev/null || echo 0)
@@ -151,7 +155,7 @@ fi
 section "PM Worker 台账"
 if command -v zcode-pm >/dev/null 2>&1 || [ -f "$HOME/.zcode/skills/zcode-pm-workers/scripts/zcode-pm" ]; then
   ZPM="${HOME}/.zcode/skills/zcode-pm-workers/scripts/zcode-pm"
-  UNACKED=$("$ZPM" events --project "$PROJECT_ROOT" --unacked 2>/dev/null | grep -c "open" 2>/dev/null)
+  UNACKED=$("$ZPM" events --project "$PROJECT_ROOT" --unacked 2>/dev/null | grep -c "open" 2>/dev/null || true)
   UNACKED=${UNACKED:-0}
   UNACKED=$(echo "$UNACKED" | head -1 | tr -d '[:space:]')
   if [ "$UNACKED" = "0" ] || [ -z "$UNACKED" ]; then
@@ -160,7 +164,7 @@ if command -v zcode-pm >/dev/null 2>&1 || [ -f "$HOME/.zcode/skills/zcode-pm-wor
     warn "PM Worker 有 $UNACKED 个未确认完成事件（可能有 worker 完成但未验收）"
   fi
 
-  RUNNING=$("$ZPM" status --project "$PROJECT_ROOT" 2>/dev/null | grep -c "running" 2>/dev/null)
+  RUNNING=$("$ZPM" status --project "$PROJECT_ROOT" 2>/dev/null | grep -c "running" 2>/dev/null || true)
   RUNNING=${RUNNING:-0}
   RUNNING=$(echo "$RUNNING" | head -1 | tr -d '[:space:]')
   if [ "$RUNNING" = "0" ] || [ -z "$RUNNING" ]; then
