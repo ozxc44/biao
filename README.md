@@ -1294,6 +1294,7 @@ Biao 当前定位是本地优先、局域网多机的多 Agent 研发控制台�
 | [Git Workspace](docs/runbooks/git-workspace.md) | 每 attempt 独立 clone、分支命名、signed marker、BranchCleanup |
 | [Merge Queue](docs/runbooks/merge-queue.md) | 串行队列、默认分支 CAS、conflict/integration_failed |
 | [同步预检](scripts/sync-preflight.sh) | git push 前的六段门禁（构建/安全/测试/git/平台健康/PM 台账） |
+| [快速接手指南](docs/HANDOFF.md) | 当前状态、部署拓扑、凭据、剩余工作 |
 | [docs/README.md](docs/README.md) | 文档目录总览 |
 
 ### 源码开放与软件包发布
