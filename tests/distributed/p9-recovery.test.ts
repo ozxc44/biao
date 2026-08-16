@@ -1122,7 +1122,7 @@ describe('22.4-34 canary fail-closed', () => {
 /* HTTP：advance 单步驱动 / auto 自动推进 / 服务重启续跑               */
 /* ================================================================ */
 
-const REDIS_URL = process.env.P9R_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/15';
+const REDIS_URL = process.env.P9R_TEST_REDIS_URL ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`);
 const OWNER_TOKEN = 'p9r-owner-token';
 const TEST_KEY_HEX = '3141'.repeat(16); // 64 hex = 32 bytes
 

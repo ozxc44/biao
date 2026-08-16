@@ -29,7 +29,7 @@ import {
   type V2RouteRegistryEntry,
 } from '../../src/server/v2/routes/registry.js';
 
-const REDIS_URL = process.env.P0A2_REGISTRY_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/15';
+const REDIS_URL = process.env.P0A2_REGISTRY_TEST_REDIS_URL ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`);
 
 let redis: Redis;
 

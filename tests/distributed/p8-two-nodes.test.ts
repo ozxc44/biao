@@ -33,7 +33,7 @@ import {
 import { loadNodeConfig } from '../../src/node/config.js';
 
 const execFileAsync = promisify(execFile);
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 15;
 const OWNER_TOKEN = 'p8-two-nodes-owner';
 const ENROLLMENT_TICKET = 'p8-two-nodes-ticket';

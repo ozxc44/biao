@@ -62,7 +62,7 @@ import {
   resetClockSkew,
 } from './fixtures/fault-injector.js';
 
-const REDIS_URL = process.env.P1_CREDENTIALS_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/15';
+const REDIS_URL = process.env.P1_CREDENTIALS_TEST_REDIS_URL ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`);
 const FIXTURES = join(import.meta.dirname, '..', 'fixtures');
 const PROJECT_PATH = '/tmp/biao-test';
 const OTHER_PROJECT_PATH = '/tmp/biao-p1-other-project';

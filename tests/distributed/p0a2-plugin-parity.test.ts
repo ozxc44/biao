@@ -26,7 +26,7 @@ import {
 } from '../../src/server/maintenance.js';
 import { keys } from '../../src/redis/keys.js';
 
-const REDIS_URL = process.env.P0A2_PARITY_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/15';
+const REDIS_URL = process.env.P0A2_PARITY_TEST_REDIS_URL ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`);
 const TOKEN = 'p0a2-plugin-parity-owner-token';
 const WORKER_TOKEN = createHmac('sha256', TOKEN).update('biao-worker-api-token-v1').digest('hex');
 

@@ -54,7 +54,7 @@ import type { ProjectRow } from '../../src/types/v2-identity.js';
 /* 常量与 env 纪律                                                    */
 /* ---------------------------------------------------------------- */
 
-const REDIS_URL = process.env.P11_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/15';
+const REDIS_URL = process.env.P11_TEST_REDIS_URL ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`);
 const TOKEN = 'p11-hotfix-owner-token';
 const WORKER_TOKEN = deriveWorkerApiToken(TOKEN);
 const PROJECT_PATH = '/tmp/biao-p11-test';

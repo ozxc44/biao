@@ -34,7 +34,7 @@ import {
   V2_FEATURE_FLAG_ENV_KEYS,
 } from '../../src/server/v2/feature-flags.js';
 
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 15;
 const OWNER_TOKEN = 'p9-redis-rebuild-owner';
 const TEST_KEY_HEX = '9a9a9a9a'.repeat(8); // 32 bytes hex

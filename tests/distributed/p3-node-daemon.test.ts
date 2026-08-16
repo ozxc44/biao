@@ -46,7 +46,7 @@ import {
 } from '../../src/node/templates.js';
 import { addFaultRoute, clearFaultRoutes, resetAllFaults, wrapFetchWithFaults } from './fixtures/fault-injector.js';
 
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 15;
 const OWNER_TOKEN = 'test-owner-token';
 const P3_CREDENTIAL_KEY = 'aabbccdd'.repeat(8);

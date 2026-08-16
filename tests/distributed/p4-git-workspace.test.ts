@@ -774,7 +774,7 @@ describe('Phase 4: Delivery 状态机与 BranchCleanup 到期执行', () => {
 
 describe('Phase 4: HTTP 接线冒烟（真实 createHttpServer）', () => {
   it('POST /v2 workspace prepare/finalize 全链路（owner bearer）', { timeout: 60_000 }, async () => {
-    const redis = new Redis('redis://127.0.0.1:6380/15', { maxRetriesPerRequest: null });
+    const redis = new Redis(process.env.BIAO_DISTRIBUTED_TEST_REDIS_URL?.replace(/\/d+$/, '') ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/15`), { maxRetriesPerRequest: null });
     const savedKey = process.env[V2_CREDENTIAL_KEY_ENV];
     const savedFlagEnv: Record<string, string | undefined> = {};
     for (const key of V2_FEATURE_FLAG_ENV_KEYS) {

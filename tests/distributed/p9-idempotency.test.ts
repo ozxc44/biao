@@ -28,7 +28,7 @@ import {
 import { createMergeQueue } from '../../src/server/v2/merge/queue.js';
 import { GenericGitProvider } from '../../src/server/v2/git/generic-git.js';
 
-const REDIS_URL = process.env.P9_IDEMPOTENCY_REDIS_URL ?? 'redis://127.0.0.1:6380/13';
+const REDIS_URL = process.env.P9_IDEMPOTENCY_REDIS_URL ?? process.env.BIAO_DISTRIBUTED_TEST_REDIS_URL?.replace(/\/d+$/, '') ?? (`redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}/13`);
 const project = '/tmp/biao-p9-idempotency';
 const planId = 'p9-idempotency-plan';
 

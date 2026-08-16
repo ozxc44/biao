@@ -38,7 +38,7 @@ import { BIAO_V2_PROJECTS_ENV } from '../../src/server/v2/v1-isolation.js';
 import { planSubmit, agentRegister, claim as v1Claim, report as v1Report, pmReview } from '../../src/server/service.js';
 
 const execFileAsync = promisify(execFile);
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 15;
 const OWNER_TOKEN = 'p8-rollback-owner';
 const ENROLLMENT_TICKET = 'p8-rollback-ticket';

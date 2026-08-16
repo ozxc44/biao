@@ -37,7 +37,7 @@ import { reconcileThreeWay } from '../../src/server/v2/reconcile-three-way.js';
 import { V2_ROUTES } from '../../src/server/v2/routes/registry.js';
 
 const execFileAsync = promisify(execFile);
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 14;
 const OWNER_TOKEN = 'p9-consistency-owner';
 const TEST_KEY = 'abcd1234'.repeat(8); // 32 bytes hex

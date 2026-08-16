@@ -39,7 +39,7 @@ import {
 } from '../../src/server/v2/routes/registry.js';
 import { HUMAN_ROLE_RANK } from '../../src/server/v2/human-identity.js';
 
-const REDIS_URL = 'redis://127.0.0.1:6380';
+const REDIS_URL = `redis://127.0.0.1:${process.env.BIAO_TEST_REDIS_PORT ?? '6380'}`;
 const TEST_DB = 15;
 const OWNER_TOKEN = 'p6-owner-token';
 const TEST_KEY_HEX = '11223344'.repeat(8); // 32 bytes hex
