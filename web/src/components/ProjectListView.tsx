@@ -173,6 +173,7 @@ export function ProjectListView({
           <div>
             <p className="eyebrow">{t('projectList.agentsEyebrow')}</p>
             <h2>{t('projectList.agentsHeading')}</h2>
+            <p className="global-resource-hint">{t('projectList.agentsGlobalScopeHint')}</p>
           </div>
           <span className="section-summary">
             {t('projectList.agentsSummary', { online: onlineAgents, total: currentAgents.length })}

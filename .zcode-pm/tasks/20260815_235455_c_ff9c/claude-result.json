@@ -1,0 +1,53 @@
+{
+  "is_error": false,
+  "duration_api_ms": 1422232,
+  "num_turns": 127,
+  "stop_reason": "end_turn",
+  "session_id": "73659ed5-7513-4429-aef4-a9a7f8dac2e0",
+  "total_cost_usd": 8.380792999999997,
+  "usage": {
+    "input_tokens": 174463,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 11153600,
+    "output_tokens": 76725,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "glm-5.3": {
+      "inputTokens": 175853,
+      "outputTokens": 76984,
+      "cacheReadInputTokens": 11153856,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 8.380792999999997,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "canonicalModel": "glm-5.3",
+      "provider": "firstParty"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "# Phase 0a-2（车道 C）交付总结\n\n## 变更文件（全部在车道 C 所有权内）\n\n| 文件 | 变更 |\n| --- | --- |\n| `src/server/v2/domain-interfaces.ts` | 新增 1013 行：七服务接口层（只定义接口与类型，不搬实现） |\n| `src/server/v2/SERVICE_MAP.md` | 新增：58 函数台账（函数↔服务归属） |\n| `src/server/v2/routes/registry.ts` | 新增 1082 行：53 条 V2 路由声明式注册表 |\n| `src/server/http-plugins.ts` | 新增 225 行：共享横切 Fastify plugin |\n| `src/server/http.ts` | 装配化：1688 → 1537 行（-151 / -8.9%） |\n| `src/server/service.ts` | 仅顶部 facade 边界注释块（冻结声明） |\n| `tests/distributed/p0a2-route-registry.test.ts` | 新增：registry 生成式门禁（9 用例） |\n| `tests/distributed/p0a2-plugin-parity.test.ts` | 新增：plugin 等价性（8 用例） |\n| `tests/distributed/p0a2-service-map.test.ts` | 新增：台账同步门禁（3 用例） |\n\n未触碰 `src/db/**`、`src/types/**`、`src/migration/**`、`src/mcp/**`、`web/`、`scripts/`。会话期间出现的 `src/server/v2/outbox.ts` 是其他车道并行交付，与我的导出无冲突。\n\n## 交付要点\n\n1. **七服务接口**（`domain-interfaces.ts` 单文件）：`ProjectService`/`NodeService`/`AttemptService`/`DeliveryService`/`MergeService`/`IncidentService`/`ReconcileService` + 共享 V2 原语（幂等键/correlation ID/actor 上下文/cursor 分页）。每方法注明 V1 对照函数与 V2 语义差异（attempt_generation fencing、durable-first+outbox、project_id 身份、Merge Bot 单写等，对应 §13.1/§14.5/§24 决策）。\n2. **SERVICE_MAP 统计**（脚本校验 58/58 全覆盖、无重复）：Project 14｜Node 5｜Attempt 17｜Delivery 7｜Merge 0｜Incident 0｜Reconcile 15（另 9 个 maintenance.ts re-export），并有测试防止台账腐烂。\n3. **共享 plugin**：三个横切钩子（onRequest 鉴权 / preHandler permit+restore gate / preSerialization barrier + permit 释放）逐行搬出，参数化 config；在目标作用域内直接调用而非 `app.register`（避免 Fastify 封装上下文把钩子隔离出同级路由，文件头有说明）。\n4. **Registry 门禁**：handler 引用 `Service.method` 由类型层编译期校验（开发中真实拦到 `updatePolicy` 缺失）；运行期门禁覆盖 schema 必填、§13.1 凭据作用域（V1 owner/worker/mcp 禁入）、`/v2/` 前缀、与真实 V1 路由表（`printRoutes`+`hasRoute`）零冲突、Fastify 实装无重复。\n\n## 验证\n\n- `npm run build:server` ✅\n- 新增 3 个测试文件 20 用例全绿 ✅\n- 全量 `npx vitest run`：**101 文件 / 1102 用例，1100 通过，2 失败** —— 与基线（98/1063，2 失败）持平不劣化。两个失败均非本车道：① `project-agent-binding-core.test.ts` 期望 schema `002`，但其他车道新增的 `003_v2_infra_minimal.ts` 迁移已把版本推到 `003`（`src/db/**` 不属于我）；② `supervisor-pm-agent-cli.test.ts` 的 SIGINT/SIGTERM 孙进程时序断言，即任务说明中的已知 flaky（基线同样失败）。\n\n## 残余风险\n\n- http.ts 缩减幅度受文件所有权约束（V1 request schema 无合法去处，只能留在原文件）；真正的路由/schema 分离随 Phase 1 `routes/v2/*` 落地。\n- Registry 的 handler 目前是编译期校验的符号引用，无实现（0a-2 按方案只交接口层）；凭据作用域声明待 Phase 1 鉴权中间件实际消费。\n- `project-agent-binding-core.test.ts` 的 schema 版本断言需要 owning lane 随 003 迁移更新，否则会持续红。",
+  "ttft_ms": 7113,
+  "ttft_stream_ms": 288,
+  "time_to_request_ms": 26,
+  "type": "result",
+  "duration_ms": 1436562,
+  "uuid": "a0f3dc17-a8fe-41b4-b296-4194c62ed6b7"
+}

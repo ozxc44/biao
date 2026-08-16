@@ -18,6 +18,13 @@ import {
   type ParsedPlan,
 } from '../plan/parser.js';
 import type { TaskFrontmatter, TaskType, VerifyCommand } from '../types/index.js';
+import {
+  analyzeDag,
+  parallelismWarnings,
+  type DagAnalysis,
+  type DagAnalysisWarning,
+  type DagTaskFact,
+} from './dag-analysis.js';
 
 export type CliApi = (path: string, init?: RequestInit) => Promise<unknown>;
 
@@ -35,7 +42,7 @@ type ParsedOptions = {
   json: boolean;
 };
 
-type PlanTaskSummary = { task_id?: string; status?: string };
+type PlanTaskSummary = DagTaskFact & { task_id: string };
 type PlanRead = {
   plan_id?: string;
   project_path?: string;
@@ -165,10 +172,58 @@ function validateParsedPlan(parsed: ParsedPlan, expectedPlanId: string): void {
   const ids = parsed.tasks.map((task) => task.fm.task_id);
   const duplicate = ids.find((id, index) => ids.indexOf(id) !== index);
   if (duplicate) throw new CliUsageError('DUPLICATE_TASK_ID', `本地 plan 中 task_id 重复：${duplicate}`);
-  const cycle = detectCycle(parsed.tasks.map((task) => task.fm));
+  let cycle: string[] | null;
+  try {
+    cycle = detectCycle(parsed.tasks.map((task) => task.fm));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const missing = message.match(/^任务 (.+) 依赖不存在的任务 (.+)$/);
+    if (missing) {
+      throw new CliUsageError(
+        'PLAN_DEPENDENCY_NOT_FOUND',
+        message,
+        { task_id: missing[1], dependency_id: missing[2] },
+      );
+    }
+    throw error;
+  }
   if (cycle) throw new CliUsageError('PLAN_CYCLE_DETECTED', `DAG 有环：${cycle.join(', ')}`);
+  const knownIds = new Set(ids);
+  for (const task of parsed.tasks) {
+    const missing = (task.fm.depends_on ?? []).find((dependencyId) => !knownIds.has(dependencyId));
+    if (missing) {
+      throw new CliUsageError(
+        'PLAN_DEPENDENCY_NOT_FOUND',
+        `任务 ${task.fm.task_id} 的 depends_on 引用了不存在的任务：${missing}`,
+        { task_id: task.fm.task_id, dependency_id: missing },
+      );
+    }
+  }
   validatePhases(parsed.plan, parsed.tasks.map((task) => task.fm));
   validateAcceptanceFor(parsed.tasks.map((task) => task.fm));
+}
+
+/** 把已解析的 plan 投影成 DAG 事实并做并行度分析（CLI preview 与 biao-mcp 共用）。 */
+export function analyzeParsedPlan(parsed: ParsedPlan): DagAnalysis {
+  return analyzeDag(parsed.tasks.map((task): DagTaskFact => ({
+    task_id: task.fm.task_id,
+    type: task.fm.type,
+    status: 'pending',
+    depends_on: task.fm.depends_on ?? [],
+    ownership_files: task.fm.ownership?.files ?? [],
+  })));
+}
+
+function printParallelismSummary(analysis: DagAnalysis, warnings: DagAnalysisWarning[]): void {
+  console.log(
+    `  并行度：首波 ${analysis.first_wave_width} / 后续峰值 ${analysis.later_fan_out.max_width} / ` +
+    `关键路径 ${analysis.critical_path.length} / 建议 Worker 槽位 ${analysis.recommended_worker_slots}`,
+  );
+  if (analysis.top_blockers.length > 0) {
+    const blocker = analysis.top_blockers[0];
+    console.log(`  最大瓶颈：${blocker.task_id}（阻塞 ${blocker.blocked_tasks} 个下游任务）`);
+  }
+  for (const warning of warnings) console.log(`\n⚠ 并行度告警 [${warning.code}]：${warning.message}`);
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -290,6 +345,62 @@ function taskHelp(command: 'add' | 'edit'): void {
 
 三种编辑来源互斥。每项需要不同 expect_exit/scope 时用 --from-file 提供完整 MD。
 无 TTY 且没有编辑来源、EDITOR/VISUAL 时会明确失败，不会偷偷启动 vi。提交失败会恢复原文件。`);
+}
+
+export async function runPlanSubmit(args: string[], api: CliApi): Promise<void> {
+  const json = args.includes('--json');
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`用法：biao plan submit <plan_dir> [--preview] [--json]
+
+  --preview  只读分析 DAG 的首波宽度、后续 fan-out、关键路径、瓶颈和建议 Worker 槽位；不提交。
+  --json     输出稳定 JSON。循环或不存在依赖在 preview 中仍为硬失败。`);
+    return;
+  }
+  try {
+    const options = parseOptions(args, { preview: 'boolean', json: 'boolean' });
+    assertNoExtraPositionals(options, 1, '用法：biao plan submit <plan_dir> [--preview] [--json]');
+    const requestedPlanDir = options.positionals[0];
+    const planDir = resolve(requestedPlanDir);
+    const parsed = parsePlanDir(planDir);
+    validateParsedPlan(parsed, parsed.plan.plan_id);
+    const parallelism = analyzeParsedPlan(parsed);
+    const warnings = parallelismWarnings(parallelism);
+
+    if (!boolFlag(options, 'preview')) {
+      for (const warning of warnings) {
+        console.error(`⚠ 并行度告警 [${warning.code}]：${warning.message}`);
+      }
+      const result = await api('/plan/submit', {
+        method: 'POST',
+        body: JSON.stringify({ plan_dir: requestedPlanDir }),
+      });
+      console.log(JSON.stringify(result, null, 2));
+      if (!apiResult(result).ok) process.exitCode = 1;
+      return;
+    }
+
+    outputSuccess(options.json, {
+      operation: 'plan_submit_preview',
+      plan_id: parsed.plan.plan_id,
+      plan_dir: planDir,
+      submitted: false,
+      parallelism,
+      warnings,
+    }, () => {
+      console.log(`plan ${parsed.plan.plan_id}（submit preview，只读）`);
+      console.log(`  根任务：${parallelism.root_task_count}`);
+      printParallelismSummary(parallelism, warnings);
+      console.log(`\n确认 DAG 后运行：biao plan submit ${planDir}`);
+    });
+  } catch (error) {
+    const failure = error instanceof CliUsageError
+      ? error
+      : new CliUsageError(
+          args.includes('--preview') ? 'PLAN_SUBMIT_PREVIEW_FAILED' : 'PLAN_SUBMIT_FAILED',
+          error instanceof Error ? error.message : String(error),
+        );
+    outputFailure(json, failure.code, failure.message, failure.details);
+  }
 }
 
 export async function runPlanIntake(args: string[], api: CliApi): Promise<void> {
@@ -856,12 +967,15 @@ function printRevisionHuman(data: {
   status: Record<string, number>;
   summary: Record<RevisionAction, number>;
   changes: RevisionChange[];
+  parallelism: DagAnalysis;
+  warnings: DagAnalysisWarning[];
   submit?: Record<string, unknown>;
 }): void {
   console.log(`plan ${data.plan_id}（${data.mode}）`);
   console.log(`  状态：pending ${data.status.pending ?? 0} / running ${data.status.running ?? 0} / blocked ${data.status.blocked ?? 0} / done ${data.status.done ?? 0} / failed ${data.status.failed ?? 0} / cancelled ${data.status.cancelled ?? 0} / superseded ${data.status.superseded ?? 0}`);
   console.log(`  动作：新增 ${data.summary.create} / 更新 pending ${data.summary.update} / 跳过 running ${data.summary.skip_running} / 跳过 blocked ${data.summary.skip_blocked} / 跳过 done/failed ${data.summary.skip_terminal} / 跳过 cancelled ${data.summary.skip_cancelled} / 跳过 superseded ${data.summary.skip_superseded} / 磁盘缺失 ${data.summary.missing_local} / 谱系审计 ${data.summary.audit_only} / 无变化 ${data.summary.unchanged}`);
   console.log(`  源目录：${data.plan_dir}`);
+  printParallelismSummary(data.parallelism, data.warnings);
 
   if (data.mode === 'diff') {
     for (const change of data.changes.filter((item) => item.action !== 'unchanged')) {
@@ -1000,6 +1114,8 @@ export async function runPlanRevise(args: string[], api: CliApi): Promise<void> 
       submitted: boolean;
       submit?: Record<string, unknown>;
       limitations: string[];
+      parallelism: DagAnalysis;
+      warnings: DagAnalysisWarning[];
     } = {
       operation: 'plan_revise',
       mode,
@@ -1009,12 +1125,15 @@ export async function runPlanRevise(args: string[], api: CliApi): Promise<void> 
       summary,
       changes,
       submitted: false,
+      parallelism: analyzeParsedPlan(parsed),
+      warnings: [],
       limitations: [
         '平台不保存 index.md 原文；preview/diff 只能比较平台 task 投影与本地 task MD。',
         '磁盘缺失的任务不会被 plan submit 删除；请显式执行 task cancel。',
         'plan submit 只更新 pending；running、blocked、done、failed、cancelled、superseded 会保留当前状态和历史。',
       ],
     };
+    data.warnings = parallelismWarnings(data.parallelism);
 
     if (mode === 'submit') {
       const submitResult = apiResult<Record<string, unknown>>(await api('/plan/submit', {

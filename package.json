@@ -27,8 +27,10 @@
     "scripts/codex-pm-agent.mjs",
     "scripts/adapter-kit.mjs",
     "scripts/worker-agent.mjs",
+    "scripts/agent-join.mjs",
     "scripts/supervisor-config.mjs",
     "scripts/supervisor.mjs",
+    "scripts/mcp-server.mjs",
     "scripts/install.sh",
     "docs",
     "AGENTS.md",
@@ -41,6 +43,7 @@
   ],
   "bin": {
     "biao": "bin/biao.js",
+    "biao-mcp": "scripts/mcp-server.mjs",
     "biao-bootstrap": "bin/biao-bootstrap.js",
     "biao-adapter-kit": "bin/biao-adapter-kit.js",
     "biao-worker-agent": "bin/biao-worker-agent.js",
@@ -48,7 +51,9 @@
     "biao-worker": "bin/biao-worker.js",
     "cli-worker": "bin/cli-worker.js",
     "codex-worker": "bin/codex-worker.js",
-    "kimi-worker": "bin/kimi-worker.js"
+    "kimi-worker": "bin/kimi-worker.js",
+    "biao-agent-join": "bin/biao-agent-join.js",
+    "biao-node": "bin/biao-node.js"
   },
   "scripts": {
     "bootstrap": "node scripts/bootstrap.mjs",
@@ -58,10 +63,12 @@
     "build:web": "npm --prefix web run build",
     "start": "node dist/server/main.js",
     "dev": "tsx src/server/main.ts",
+    "mcp:stdio": "node scripts/mcp-server.mjs",
     "pretest": "npm run build:server",
     "test": "vitest run",
     "test:web": "npm --prefix web test",
     "verify:package": "node scripts/verify-package.mjs",
+    "docker:nas": "cd deploy/nas && ./install.sh",
     "prepack": "npm run build"
   },
   "engines": {

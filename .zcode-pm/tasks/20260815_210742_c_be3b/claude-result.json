@@ -1,0 +1,53 @@
+{
+  "is_error": false,
+  "duration_api_ms": 686156,
+  "num_turns": 63,
+  "stop_reason": "end_turn",
+  "session_id": "ee3d80fd-3865-4c07-86c4-66cf1912488a",
+  "total_cost_usd": 2.783124,
+  "usage": {
+    "input_tokens": 93413,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 3036352,
+    "output_tokens": 31523,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "glm-5.2[1m]": {
+      "inputTokens": 95199,
+      "outputTokens": 31553,
+      "cacheReadInputTokens": 3036608,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 2.783124,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 32000,
+      "canonicalModel": "glm-5.2[1m]",
+      "provider": "firstParty"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "任务完成。两个关键决策：\n\n**1. 字段命名：snake_case。** `buildWakePayload` 的 `binding` 块改为 `binding_id/agent_id/harness_kind/wake_mode/adapter_id`，与 HTTP API、`ProjectAgentBinding` 类型一致。同步修正了 external-stub、adapter-kit 脚手架模板与契约 JSON；全仓无 camelCase 载荷读取方残留。\n\n**2. reservation 回带：worker-agent 透传并校验，supervisor 终校验不放宽。** 理由：reservation 是重启栅栏 attempt_id 的来源，两层独立校验尽早拒绝串扰回执；适配器契约保持唯一无例外分支；安全规则不放松（回带值来自经 `validateSelector` 的 argv）。配套新增 `--reservation-id/--task-id/--reservation-expires-at` 三参（同给或同缺）与 payload `reservation` 块，supervisor.mjs 透传。\n\n**变更文件**：`scripts/worker-agent.mjs`、`scripts/supervisor.mjs`、`src/worker/harness/external-stub.mjs`（通用参考实现：结构化校验、退出码 2、探测保留、reservation 回带）、`scripts/adapter-kit.mjs`、`tests/worker-agent-binding-wake.test.ts`（真实 spawn 端到端，8 用例）、`tests/supervisor-project-agent-binding.test.ts`（dispatcher 级 reserved 用例）、`docs/worker-integration.md`（字段表+回执表+回带规则+最小适配器示例）。\n\n**验证**：`npm run build:server` 通过；验收指定的 4 个测试文件 25/25 全绿；邻近回归（ready-reservation、adapter-kit、supervisor-config、cli-invocation、release-readiness、pm-cli、codex-pm-adapter、bootstrap）全绿；手工 `echo 载荷 | node external-stub.mjs` 输出单行回执且含 reservation 回带字段。\n\n**残余风险**：旧 camelCase 适配器升级后会失效，但旧链路本就因协议矛盾从未成功过，实际无回退面。未触碰禁改路径，未启动生产栈，未新增 Redis 套件。交付说明已写入 `.zcode-pm/tasks/20260815_210742_c_be3b/final-summary.md`。",
+  "ttft_ms": 12685,
+  "ttft_stream_ms": 293,
+  "time_to_request_ms": 20,
+  "type": "result",
+  "duration_ms": 724324,
+  "uuid": "73801f4d-a323-4f05-8183-bc152a48ae30"
+}

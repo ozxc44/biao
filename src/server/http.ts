@@ -5,11 +5,13 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type Redis from 'ioredis';
+import { createMcpHttpRoutes } from '../mcp/http-route.js';
 import {
   planSubmit,
   planCreate,
@@ -53,23 +55,42 @@ import {
   unackedEvents,
   ackEvent,
   pmIntake,
-  acquireMutationPermit,
-  releaseMutationPermit,
   getRestoreMaintenanceGate,
-  beginLocalMutation,
+  appendExecutionReceipt,
+  supervisorTick,
+  connectProjectAgent,
+  deleteProjectAgentBinding,
+  getProjectAgentBinding,
+  getProjectAgentRoster,
+  listExecutionReceipts,
+  listProjectAgentBindings,
+  reserveProjectAgentTask,
 } from './service.js';
 import { keys } from '../redis/keys.js';
 import type { BiaoConfig } from '../types/index.js';
+import type { SqliteStore } from '../db/sqlite-store.js';
 import { resolveAndValidateWorkspacePath } from './security.js';
 import {
-  isLoopbackHost,
-  isValidLocalOwnerSession,
   issueLocalOwnerSession,
   localOwnerClearCookie,
   localOwnerSetCookie,
   readCookie,
-  LOCAL_OWNER_COOKIE,
 } from './human-session.js';
+// 共享横切 plugin（鉴权/permit/barrier）——Phase 0a-2 起 V1/V2 路由面复用同一基础设施。
+import {
+  crossCuttingApiPlugin,
+  hasLocalOwnerSession,
+  humanSessionClearCookie,
+  humanSessionSetCookie,
+  HUMAN_SESSION_COOKIE,
+  localOwnerSessionAvailable,
+  resolveHumanSessionCredential,
+} from './http-plugins.js';
+// 方案 E：远程人类 Cookie 会话（bvh2）+ 一次性 enrollment（bhe2）。
+import { createHumanIdentityService, type HumanIdentityService } from './v2/human-identity.js';
+import { CredentialKeyringAuthority, loadV2CredentialKeyring, type V2CredentialKey } from './v2/credentials.js';
+// V2 路由插件（Phase 1）
+import { v2RoutesPlugin } from './v2/routes/v2-routes.js';
 import {
   QUESTION_ANSWER_MAX_CHARS,
   QUESTION_BODY_MAX_CHARS,
@@ -83,24 +104,6 @@ const WORKER_TOKEN_CONTEXT = 'biao-worker-api-token-v1';
 /** Derive a one-way, scope-specific bearer without persisting a second secret. */
 export function deriveWorkerApiToken(ownerToken: string): string {
   return createHmac('sha256', ownerToken).update(WORKER_TOKEN_CONTEXT).digest('hex');
-}
-
-/**
- * Worker credentials are deliberately limited to the execution data plane.
- * Identity-looking fields such as reviewed_by/consumer are audit metadata, not
- * authorization, so they must never promote a Worker request into a PM request.
- */
-function workerRequestAllowed(method: string, pathname: string): boolean {
-  const path = pathname.replace(/^\/api(?=\/)/, '');
-  if (method === 'GET' || method === 'HEAD') {
-    // Read access is also fail-closed: a future PM endpoint must not become Worker-readable
-    // merely because it was not added to a denylist. These are the only reads used by BiaoClient.
-    // Worker 需要当前 ownership roster 才能把共享工作树中的并发改动归给真正
-    // 持有者；该只读数据面不包含 PM token、结果正文或控制面能力。
-    return path === '/ownership' || path === '/ownership/active' || /^\/task\/[^/]+$/.test(path);
-  }
-  if (method !== 'POST') return false;
-  return /^(?:\/register|\/heartbeat|\/agent\/offline|\/claim|\/report|\/question|\/lease\/renew|\/ownership\/(?:declare|release)|\/task\/[^/]+\/block)$/.test(path);
 }
 
 const INSTALL_PACKAGE_PLACEHOLDER = '__BIAO_PKG_POSIX__';
@@ -129,6 +132,14 @@ const API_ENDPOINTS: Record<string, string> = {
   plan_create: 'POST /plan/create',
   plan_status: 'GET /plan/:plan_id',
   plans_list: 'GET /plans',
+  project_agent_binding_list: 'GET /project/agent-bindings?project_scope=',
+  project_agent_binding_get: 'GET /project/agent-bindings/:binding_id?project_scope=',
+  project_agent_binding_delete: 'DELETE /project/agent-bindings/:binding_id?project_scope=',
+  project_agent_connection_create: 'POST /project/agent-connections',
+  project_agent_roster: 'GET /project/agent-roster?project_scope=',
+  project_agent_reserve: 'POST /project/agent-reservations',
+  execution_receipt_append: 'POST /execution-receipts',
+  execution_receipt_list: 'GET /execution-receipts?project_scope=&binding_id=&task_id=',
   claim: 'POST /claim',
   report: 'POST /report',
   register: 'POST /register',
@@ -164,11 +175,24 @@ const API_ENDPOINTS: Record<string, string> = {
   intake_ack: 'POST /intake/ack (按 consumer 幂等确认事件)',
   conflicts: 'GET /conflicts?limit=',
   runtime_reconcile: 'POST /reconcile',
+  supervisor_tick: 'GET /supervisor/tick?consumers=&events_after=&binding_aware=1&plan_ids=',
   plan_supersede_preview: 'GET /plan/:plan_id/supersede-preview',
   plan_supersede: 'POST /plan/:plan_id/supersede',
   watchdog: 'GET /watchdog?auto_fix=',
   install: 'GET /install (shell script)',
   frontend: 'GET / (Accept: text/html)',
+  // 方案 E：Web 控制台远程人类登录（enrollment code → bvh2 Cookie 会话）
+  auth_human_session: 'POST /auth/human-session (enrollment_code 换 Cookie 会话) | GET /auth/human-session (会话状态) | DELETE /auth/human-session (登出+吊销)',
+  v2_human_enrollments: 'POST /v2/human-enrollments (owner-only：生成一次性 enrollment_code，仅创建响应返回一次)',
+  // V2 路由（Phase 1）
+  v2_projects: 'POST /v2/projects | GET /v2/projects | GET /v2/projects/:project_id',
+  v2_mode_transitions: 'POST /v2/projects/:project_id/mode-transitions',
+  v2_nodes_enroll: 'POST /v2/nodes/enroll',
+  v2_nodes_register: 'POST /v2/nodes/register',
+  v2_nodes_heartbeat: 'POST /v2/nodes/:node_id/heartbeat',
+  v2_nodes_drain: 'POST /v2/nodes/:node_id/drain',
+  v2_nodes_revoke: 'POST /v2/nodes/:node_id/revoke',
+  v2_nodes_authorize: 'POST /v2/projects/:project_id/nodes/:node_id/authorize',
 };
 
 const API_HINT = 'API 路径在根路径（无 /api 前缀，也兼容 /api 前缀）。curl http://localhost:7331/health 验证。';
@@ -184,22 +208,6 @@ export async function resolveEventStreamCursor(redis: Redis, requested: string):
   return latest[0]?.[0] ?? '0-0';
 }
 
-function isLocalOwnerSessionPath(pathname: string): boolean {
-  return /^(?:\/api)?\/auth\/(?:session|local-session)$/.test(pathname);
-}
-
-function localOwnerSessionAvailable(config: BiaoConfig): boolean {
-  return Boolean(config.apiToken) && isLoopbackHost(config.host);
-}
-
-function hasLocalOwnerSession(cookieHeader: string | undefined, config: BiaoConfig): boolean {
-  return Boolean(
-    config.apiToken &&
-    localOwnerSessionAvailable(config) &&
-    isValidLocalOwnerSession(readCookie(cookieHeader, LOCAL_OWNER_COOKIE), config.apiToken),
-  );
-}
-
 /**
  * Session 的创建只能来自控制台自己的同源浏览器请求。loopback 绑定保证请求来自本机，
  * Origin + Sec-Fetch-Site 再阻断第三方页面把访问者静默登录为本机 Owner（login CSRF）。
@@ -209,6 +217,19 @@ function isSameOriginBrowserRequest(headers: Record<string, string | string[] | 
   const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
   const fetchSite = typeof headers['sec-fetch-site'] === 'string' ? headers['sec-fetch-site'] : undefined;
   return Boolean(host && origin === `http://${host}` && fetchSite === 'same-origin');
+}
+
+/**
+ * 方案 E：远程人类会话的同源校验。与 isSameOriginBrowserRequest 同语义，但
+ * 额外接受 https Origin——NAS 常见部署是反向代理做 TLS 终止（浏览器 https、
+ * 服务收到 http Host），Origin 与 Host 仅 scheme 差异仍视为同源；第三方
+ * Origin（不同 host）依旧拒绝。
+ */
+function isHumanSessionSameOriginRequest(headers: Record<string, string | string[] | undefined>): boolean {
+  const host = typeof headers.host === 'string' ? headers.host : undefined;
+  const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
+  const fetchSite = typeof headers['sec-fetch-site'] === 'string' ? headers['sec-fetch-site'] : undefined;
+  return Boolean(host && (origin === `http://${host}` || origin === `https://${host}`) && fetchSite === 'same-origin');
 }
 
 const nonEmptyString = { type: 'string', minLength: 1 } as const;
@@ -293,6 +314,52 @@ function validateExactRequestKeys(body: unknown, allowed: readonly string[]): st
 }
 
 const requestSchemas = {
+  projectAgentConnectionCreate: {
+    body: {
+      type: 'object',
+      required: ['project_scope', 'agent_id'],
+      additionalProperties: false,
+      properties: { project_scope: absolutePath, agent_id: safeIdentifier },
+    },
+  },
+  projectAgentReservation: {
+    body: {
+      type: 'object',
+      required: ['project_scope', 'binding_id'],
+      additionalProperties: false,
+      properties: {
+        project_scope: absolutePath,
+        binding_id: safeIdentifier,
+        task_id: safeIdentifier,
+        preferred_plan_ids: { type: 'array', uniqueItems: true, items: safeIdentifier },
+      },
+    },
+  },
+  executionReceiptCreate: {
+    body: {
+      type: 'object',
+      required: [
+        'project_scope', 'attempt_id', 'task_id', 'binding_id', 'agent_id', 'registration_id',
+        'harness_kind', 'wake_mode', 'adapter_id', 'status', 'started_at',
+      ],
+      additionalProperties: false,
+      properties: {
+        project_scope: absolutePath,
+        attempt_id: safeIdentifier,
+        task_id: safeIdentifier,
+        binding_id: safeIdentifier,
+        agent_id: safeIdentifier,
+        registration_id: safeIdentifier,
+        harness_kind: safeIdentifier,
+        wake_mode: { type: 'string', enum: ['visible_session', 'background_executor', 'external_worker'] },
+        adapter_id: { anyOf: [safeIdentifier, { type: 'null' }] },
+        status: { type: 'string', enum: ['requested', 'succeeded', 'failed'] },
+        started_at: { type: 'integer', minimum: 0 },
+        session_ref: { type: 'string', minLength: 1, maxLength: 256 },
+        visible_url: { type: 'string', minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
   planCreate: {
     body: {
       type: 'object',
@@ -313,7 +380,32 @@ const requestSchemas = {
       type: 'object',
       required: ['plan_dir'],
       additionalProperties: false,
-      properties: { plan_dir: nonEmptyString },
+      properties: {
+        plan_dir: nonEmptyString,
+        expected_preview: {
+          type: 'object',
+          required: ['plan_id', 'plan_revision', 'tasks'],
+          additionalProperties: false,
+          properties: {
+            plan_id: safeIdentifier,
+            plan_revision: { type: 'string', pattern: '^[0-9]+$' },
+            tasks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['task_id', 'status', 'revision', 'lease_present'],
+                additionalProperties: false,
+                properties: {
+                  task_id: safeIdentifier,
+                  status: { type: 'string', minLength: 1, maxLength: 32 },
+                  revision: { type: 'string', pattern: '^(?:missing|[a-f0-9]{64})$' },
+                  lease_present: { type: 'boolean' },
+                },
+              },
+            },
+          },
+        },
+      },
     },
   },
   claim: {
@@ -335,6 +427,7 @@ const requestSchemas = {
         preferred_phases: { type: 'array', uniqueItems: true, items: nonEmptyString },
         preferred_project: nonEmptyString,
         preferred_plan_ids: { type: 'array', uniqueItems: true, items: safeIdentifier },
+        reservation_id: { type: 'string', pattern: '^reservation_[a-f0-9]{32}$' },
       },
     },
   },
@@ -352,6 +445,21 @@ const requestSchemas = {
         // 兼容旧自定义 Worker：register 可以不传，平台生成后返回；
         // 但后续 heartbeat/offline 必须携带返回值。
         registration_id: registrationIdentifier,
+        // 注册即自动绑定：Agent 声明要加入的项目列表，平台自动创建绑定
+        project_bindings: {
+          type: 'array',
+          maxItems: 32,
+          items: {
+            type: 'object',
+            required: ['project_scope'],
+            additionalProperties: false,
+            properties: {
+              project_scope: absolutePath,
+              wake_mode: { type: 'string', enum: ['visible_session', 'background_executor', 'external_worker'] },
+              policy: { type: 'string', enum: ['manual', 'on_demand', 'automatic'] },
+            },
+          },
+        },
       },
     },
   },
@@ -605,6 +713,31 @@ const requestSchemas = {
       },
     },
   },
+  // 方案 E：enrollment_code 换远程人类 Cookie 会话
+  humanSessionCreate: {
+    body: {
+      type: 'object',
+      required: ['enrollment_code'],
+      additionalProperties: false,
+      properties: {
+        enrollment_code: { type: 'string', minLength: 8, maxLength: 256 },
+      },
+    },
+  },
+  // 方案 E：Owner 预登记人类身份（一次性 enrollment_code）
+  humanEnrollmentCreate: {
+    body: {
+      type: 'object',
+      required: ['subject', 'role'],
+      additionalProperties: false,
+      properties: {
+        subject: safeIdentifier,
+        role: { type: 'string', enum: ['owner', 'project_admin', 'reviewer', 'auditor'] },
+        project_id: safeIdentifier,
+        expires_in_hours: { type: 'integer', minimum: 1, maximum: 168 },
+      },
+    },
+  },
 } as const;
 
 /** 推断 web/dist 路径（packages/biao/web/dist） */
@@ -624,11 +757,16 @@ function findWebDist(): string | null {
 export async function createHttpServer(
   redis: Redis,
   config: ScopedBiaoConfig,
-  options: { webDist?: string | null } = {},
+  options: { webDist?: string | null; sqliteStore?: SqliteStore; artifactRoot?: string } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: 'info' },
     ajv: { customOptions: { coerceTypes: false } },
+  });
+
+  // V2 Artifact 上传接受 application/octet-stream（三段式上传 PUT content）
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => {
+    done(null, body);
   });
 
   // 子插件会继承注册时已存在的错误处理器，因此必须在挂载 API 路由前配置。
@@ -656,131 +794,44 @@ export async function createHttpServer(
 
   // API 路由（根路径 + /api 前缀各注册一次，内容一致）
   const apiRoutes = async (app: FastifyInstance) => {
-    const maintenancePermits = new WeakMap<object, {
-      owner: string;
-      leaveLocalMutation: () => void;
-    }>();
+    // 方案 E：远程人类会话身份服务。密钥环权威与 v2-routes.ts 同源构造
+    // （env ∪ DB 轮换密钥，按 min_key_version 水位过滤）——两个实例共享同一
+    // SQLite store，吊销/撤销对彼此立即可见（每请求复核）。
+    const identityStore = options.sqliteStore;
+    const humanIdentityKeyring = identityStore
+      ? new CredentialKeyringAuthority({
+          loadEnvKeys: (): V2CredentialKey[] => {
+            try {
+              return loadV2CredentialKeyring();
+            } catch {
+              return [];
+            }
+          },
+          loadPersistedKeys: () => identityStore.listCredentialKeyRecords(),
+          loadMinKeyVersion: () => identityStore.getCredentialState().min_key_version,
+        })
+      : null;
+    const humanIdentity: HumanIdentityService | undefined = identityStore && humanIdentityKeyring
+      ? createHumanIdentityService(identityStore, { keyring: (): V2CredentialKey[] => humanIdentityKeyring.resolve() })
+      : undefined;
 
-    const releaseRequestPermit = async (req: object): Promise<void> => {
-      const permit = maintenancePermits.get(req);
-      if (!permit) return;
-      maintenancePermits.delete(req);
-      try {
-        await releaseMutationPermit(redis, permit.owner);
-      } finally {
-        permit.leaveLocalMutation();
-      }
-    };
-
-    const maintenanceDiagnosticPath = (pathname: string): boolean =>
-      /^(?:\/api)?\/(?:health|version|db\/status|db\/restore)$/.test(pathname);
-
-    const maintenanceStatus = (code: 'RESTORE_IN_PROGRESS' | 'RESTORE_FAILED'): number =>
-      code === 'RESTORE_FAILED' ? 503 : 409;
-
-    app.addHook('onRequest', async (req, reply) => {
-      if (!config.apiToken) return;
-
-      const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
-      const publicReadMethod = req.method === 'GET' || req.method === 'HEAD';
-      const publicApiPath =
-        publicReadMethod &&
-        ['/health', '/version', '/api/health', '/api/version'].includes(requestUrl.pathname);
-      const publicFrontendEntry =
-        publicReadMethod &&
-        requestUrl.pathname === '/' &&
-        (req.headers.accept ?? '').includes('text/html') &&
-        !(req.headers.accept ?? '').includes('application/json');
-      if (publicApiPath || publicFrontendEntry || isLocalOwnerSessionPath(requestUrl.pathname)) return;
-
-      const bearerAuthenticated = req.headers.authorization === `Bearer ${config.apiToken}`;
-      const workerAuthenticated = Boolean(
-        config.workerApiToken &&
-        req.headers.authorization === `Bearer ${config.workerApiToken}`,
-      );
-      const humanAuthenticated = hasLocalOwnerSession(req.headers.cookie, config);
-      if (!bearerAuthenticated && !workerAuthenticated && !humanAuthenticated) {
-        return reply.status(401).send({
-          ok: false,
-          data: null,
-          error: { code: 'UNAUTHORIZED', message: '需要有效的 Bearer API token' },
-        });
-      }
-      if (workerAuthenticated && !workerRequestAllowed(req.method, requestUrl.pathname)) {
-        return reply.status(403).send({
-          ok: false,
-          data: null,
-          error: { code: 'WORKER_SCOPE_DENIED', message: 'Worker 凭据无权执行 PM/Owner 控制面操作' },
-        });
-      }
+    // 横切关注点（onRequest 鉴权 / preHandler 维护屏障+mutation permit /
+    // preSerialization 二次门控 + permit 释放）由共享 plugin 提供——Phase 0a-2
+    // 抽出，V1/V2 路由面复用同一基础设施；行为与旧内联实现逐行等价。
+    await crossCuttingApiPlugin(app, {
+      redis,
+      apiToken: config.apiToken,
+      workerApiToken: config.workerApiToken,
+      host: config.host,
+      humanIdentity,
     });
 
-    // 所有 HTTP 状态写入口共用同一个 Redis 分布式 permit。db restore 自己取得独占锁；
-    // watchdog 只有 auto_fix=true 时才是 writer。preHandler 位于鉴权/校验之后，避免为
-    // 被拒请求制造无意义 permit；onResponse/onError 都按 owner 精确释放。
-    app.addHook('preHandler', async (req, reply) => {
-      const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
-      if (isLocalOwnerSessionPath(requestUrl.pathname)) return;
-      const isRestore = /^(?:\/api)?\/db\/restore$/.test(requestUrl.pathname);
-      const watchdogAutoFix = /^(?:\/api)?\/watchdog$/.test(requestUrl.pathname) &&
-        ['true', '1'].includes(requestUrl.searchParams.get('auto_fix') ?? '');
-      // intake/unacked 名义上是 GET，但会耐久更新 consumer cursor/pending 投影与门铃
-      // 索引；恢复过程中放行会把旧 generation 再写回新快照，因此也属于 writer。
-      const statefulProjectionRead = (req.method === 'GET' || req.method === 'HEAD') &&
-        /^(?:\/api)?\/(?:intake(?:\/unacked)?|ownership)$/.test(requestUrl.pathname);
-      if (isRestore) return;
-
-      // 任意普通读在 failed/restoring barrier 下都不得暴露 Redis 半投影。
-      // health/db status 是诊断口，health 自身会以 503 表达 not-ready。
-      if ((req.method === 'GET' || req.method === 'HEAD') && !maintenanceDiagnosticPath(requestUrl.pathname)) {
-        const gate = await getRestoreMaintenanceGate(redis);
-        if (gate) {
-          return reply.status(maintenanceStatus(gate.code)).send({ ok: false, data: null, error: gate });
-        }
-      }
-      if (req.method !== 'POST' && !watchdogAutoFix && !statefulProjectionRead) return;
-
-      const leaveLocalMutation = beginLocalMutation();
-      let permit: Awaited<ReturnType<typeof acquireMutationPermit>>;
-      try {
-        permit = await acquireMutationPermit(redis);
-      } catch (error) {
-        leaveLocalMutation();
-        throw error;
-      }
-      if (!permit.ok) {
-        leaveLocalMutation();
-        return reply.status(maintenanceStatus(permit.error.code === 'RESTORE_FAILED' ? 'RESTORE_FAILED' : 'RESTORE_IN_PROGRESS'))
-          .send({ ok: false, data: null, error: permit.error });
-      }
-      // restore 不会根据 score 越过 permit，因此不需要每请求定时续期。
-      // owner 一直保留到 handler settle；连接 abort 也不会提前开门。
-      maintenancePermits.set(req, { owner: permit.owner, leaveLocalMutation });
-    });
-
-    // 二次门控关闭“读先开始、restore 后进入”的窗口；同时使 permit
-    // 仍在 settle 后才释放。
-    app.addHook('preSerialization', async (req, reply, payload) => {
-      const requestUrl = new URL(req.raw.url ?? req.url, 'http://biao.local');
-      if (!maintenanceDiagnosticPath(requestUrl.pathname) && !isLocalOwnerSessionPath(requestUrl.pathname)) {
-        const gate = await getRestoreMaintenanceGate(redis);
-        if (gate) {
-          reply.status(maintenanceStatus(gate.code));
-          return { ok: false, data: null, error: gate };
-        }
-      }
-      return payload;
-    });
-
-    // abort 后 Fastify handler/底层 promise 仍可能继续写，不能提前 release permit。
-    // 真正释放只由 onResponse/onError（业务 settle 后）执行。
-
-    app.addHook('onError', async (req) => {
-      await releaseRequestPermit(req).catch(() => undefined);
-    });
-    app.addHook('onResponse', async (req) => {
-      await releaseRequestPermit(req).catch(() => undefined);
-    });
+    // MCP 装配点：P0 LAN MVP 只提供各开发机本地 stdio 适配器（scripts/mcp-server.mjs），
+    // 中央 Streamable HTTP MCP 等 RBAC 后以独立变更启用；当前插件有意不注册路由。
+    await app.register(createMcpHttpRoutes(redis, {
+      biaoUrl: `http://${config.host}:${config.port}`,
+      lockDir: process.env.BIAO_LOCK_DIR?.trim() || tmpdir(),
+    }));
 
     // 人类 PM 使用 HttpOnly 的本机 Owner 会话；Agent 继续走 Bearer Token。Cookie 从不携带
     // BIAO_API_TOKEN，本机服务重启也可用同一配置密钥验证；旋转 API Token 会立即失效全部会话。
@@ -819,6 +870,70 @@ export async function createHttpServer(
       return { ok: true, data: { authenticated: true, mode: 'local_owner', local_session_available: true } };
     });
 
+    // 方案 E 增补：用户名+密码登录（同一账户可反复登录）
+    app.post('/auth/human-login', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      const body = req.body as { username?: string; password?: string };
+      if (!body?.username || !body?.password) {
+        return reply.status(400).send({
+          ok: false, data: null,
+          error: { code: 'INVALID_REQUEST', message: '需要 username 和 password' },
+        });
+      }
+      if (!isHumanSessionSameOriginRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false, data: null,
+          error: { code: 'HUMAN_SESSION_ORIGIN_DENIED', message: '远程登录必须从控制台同源页面发起' },
+        });
+      }
+      const { verifyHumanAccount, issueHumanSessionToken } = await import('./v2/human-identity.js');
+      const { getSqliteStore } = await import('./service.js');
+      const sqliteStoreInstance = getSqliteStore();
+      if (!sqliteStoreInstance) {
+        return reply.status(503).send({ ok: false, data: null, error: { code: 'CONTROL_PLANE_UNAVAILABLE', message: '控制面不可用' } });
+      }
+      const verified = await verifyHumanAccount(sqliteStoreInstance, body.username, body.password);
+      if (!verified.ok || !verified.data) {
+        return reply.status(401).send(verified);
+      }
+      const keyring = loadV2CredentialKeyring();
+      if (!keyring || keyring.length === 0) {
+        return reply.status(503).send({ ok: false, data: null, error: { code: 'V2_CREDENTIAL_KEY_MISSING', message: '服务端未配置 BIAO_V2_CREDENTIAL_KEY' } });
+      }
+      // 用 issueSession 正确写 human_sessions 行（否则 resolveCredential 会因无会话记录而拒绝）
+      if (!humanIdentity) {
+        return reply.status(503).send({ ok: false, data: null, error: { code: 'HUMAN_IDENTITY_UNAVAILABLE', message: '人类身份服务不可用' } });
+      }
+      const session = humanIdentity.issueSession(
+        { subject: verified.data.username, role: verified.data.role as 'owner', project_id: verified.data.project_id || '' },
+        { actor_id: verified.data.username, correlation_id: 'human-login-' + Date.now() },
+      );
+      if (!session.ok || !session.data) {
+        return reply.status(500).send({ ok: false, data: null, error: session.error ?? { code: 'SESSION_ISSUE_FAILED', message: '会话签发失败' } });
+      }
+      const ttl = 30 * 24 * 60 * 60;
+      reply.header('Set-Cookie', 'biao_human_session=' + session.data.token + '; Path=/; Max-Age=' + ttl + '; HttpOnly; SameSite=Strict');
+      return {
+        ok: true,
+        data: { authenticated: true, subject: verified.data.username, role: verified.data.role },
+      };
+    });
+
+    // Owner 创建用户账户
+    app.post('/auth/human-accounts', async (req, reply) => {
+      if (req.headers.authorization !== 'Bearer ' + config.apiToken && !hasLocalOwnerSession(req.headers.cookie, config)) {
+        return reply.status(401).send({ ok: false, data: null, error: { code: 'UNAUTHORIZED', message: '需要 Owner 权限' } });
+      }
+      const body = req.body as { username: string; password: string; role: string; project_id?: string };
+      const { createHumanAccount } = await import('./v2/human-identity.js');
+      const { getSqliteStore } = await import('./service.js');
+      const sqliteStoreInstance = getSqliteStore();
+      if (!sqliteStoreInstance) {
+        return { ok: false, data: null, error: { code: 'CONTROL_PLANE_UNAVAILABLE', message: '控制面不可用' } };
+      }
+      return createHumanAccount(sqliteStoreInstance, body);
+    });
+
     app.delete('/auth/local-session', async (req, reply) => {
       reply.header('Cache-Control', 'no-store');
       if (!isSameOriginBrowserRequest(req.headers)) {
@@ -837,6 +952,110 @@ export async function createHttpServer(
           local_session_available: localOwnerSessionAvailable(config),
         },
       };
+    });
+
+    // ── 方案 E：Web 控制台远程人类登录（bvh2 Cookie 会话 + 一次性 enrollment） ──
+    // 公开会话端点（同 /auth/local-session）：不鉴权进入，靠 enrollment_code
+    // 本身的持有证明 + 同源校验防 login CSRF。
+    app.get('/auth/human-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!humanIdentity) {
+        return { ok: true, data: { authenticated: false, available: false, expired: false } };
+      }
+      const session = resolveHumanSessionCredential(req.headers.cookie, humanIdentity);
+      if (session) {
+        return {
+          ok: true,
+          data: {
+            authenticated: true,
+            available: true,
+            expired: false,
+            subject: session.claims.subject,
+            role: session.claims.role,
+            project_id: session.claims.project_id,
+            session_id: session.claims.session_id,
+            expires_at: session.claims.expires_at,
+          },
+        };
+      }
+      // Cookie 存在但复核失败时仅提示过期语义（不回传 token、不区分其他失败原因）
+      const rawCookie = readCookie(req.headers.cookie, HUMAN_SESSION_COOKIE);
+      let expired = false;
+      if (rawCookie) {
+        const resolved = humanIdentity.resolveCredential(rawCookie);
+        expired = !resolved.ok && resolved.reason === 'EXPIRED';
+      }
+      return { ok: true, data: { authenticated: false, available: true, expired } };
+    });
+
+    app.post('/auth/human-session', { schema: requestSchemas.humanSessionCreate }, async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!humanIdentity) {
+        return reply.status(503).send({
+          ok: false,
+          data: null,
+          error: { code: 'HUMAN_SESSION_UNAVAILABLE', message: '远程人类会话未启用（服务需要 SQLite 持久化与 BIAO_V2_CREDENTIAL_KEY）' },
+        });
+      }
+      if (!isHumanSessionSameOriginRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'HUMAN_SESSION_ORIGIN_DENIED', message: '远程人类会话必须从控制台同源页面创建' },
+        });
+      }
+      const { enrollment_code } = req.body as { enrollment_code: string };
+      const result = humanIdentity.consumeEnrollment(enrollment_code, {
+        used_by_ip: req.ip,
+        correlation_id: `corr-${Date.now()}`,
+      });
+      if (!result.ok || !result.data) {
+        const code = result.ok ? 'INTERNAL_ERROR' : (result.error?.code ?? 'LOGIN_FAILED');
+        const status = code === 'ENROLLMENT_ALREADY_USED' ? 409
+          : code === 'ENROLLMENT_EXPIRED' ? 403
+            : code === 'ENROLLMENT_NOT_FOUND' ? 401
+              : 400;
+        return reply.status(status).send({
+          ok: false,
+          data: null,
+          error: result.error ?? { code, message: '登录失败' },
+        });
+      }
+      reply.header('Set-Cookie', humanSessionSetCookie(result.data.token));
+      return {
+        ok: true,
+        data: {
+          authenticated: true,
+          subject: result.data.subject,
+          role: result.data.role,
+          project_id: result.data.project_id,
+          session_id: result.data.session_id,
+          expires_at: result.data.expires_at,
+          // 主通道是 HttpOnly Cookie；token 同时放响应体供需要时存 sessionStorage 备用
+          token: result.data.token,
+        },
+      };
+    });
+
+    app.delete('/auth/human-session', async (req, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      if (!isHumanSessionSameOriginRequest(req.headers)) {
+        return reply.status(403).send({
+          ok: false,
+          data: null,
+          error: { code: 'HUMAN_SESSION_ORIGIN_DENIED', message: '远程人类会话必须从控制台同源页面创建' },
+        });
+      }
+      // 吊销即时生效：human_sessions 落 revoked 行（R1C-013），再清 Cookie。
+      const session = humanIdentity && resolveHumanSessionCredential(req.headers.cookie, humanIdentity);
+      if (session) {
+        humanIdentity!.revokeSession(session.claims.session_id, { reason: 'web_console_logout' }, {
+          actor_id: session.claims.subject,
+          correlation_id: `corr-${Date.now()}`,
+        });
+      }
+      reply.header('Set-Cookie', humanSessionClearCookie());
+      return { ok: true, data: { authenticated: false } };
     });
 
     // GET / → JSON 返回 API 目录；Accept: text/html 时返回前端看板
@@ -868,7 +1087,7 @@ export async function createHttpServer(
     });
 
     app.get('/version', async () => {
-      return { ok: true, data: { version: '0.1.0', name: 'biao' } };
+      return { ok: true, data: { version: '0.1.0', name: 'biao', protocol_version: 2 } };
     });
 
     app.get('/health', async (_req, reply) => {
@@ -888,21 +1107,27 @@ export async function createHttpServer(
       schema: requestSchemas.register,
       preValidation: async (req, reply) => {
         const message = validateExactRequestKeys(req.body, [
-          'agent_id', 'agent_type', 'capabilities', 'endpoint', 'projects', 'registration_id',
+          'agent_id', 'agent_type', 'capabilities', 'endpoint', 'projects', 'registration_id', 'project_bindings',
         ]);
         if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
       },
     }, async (req) => {
-      const { agent_id, agent_type, capabilities, endpoint, projects, registration_id } = req.body as {
+      const { agent_id, agent_type, capabilities, endpoint, projects, registration_id, project_bindings } = req.body as {
         agent_id: string;
         agent_type: string;
         capabilities?: string[];
         endpoint?: string;
         projects?: string[];
         registration_id?: string;
+        project_bindings?: Array<{ project_scope: string; wake_mode?: string; policy?: string }>;
       };
       const validatedProjects = projects?.map((project) => resolveAndValidateWorkspacePath(project, config.workspaceRoots));
-      return agentRegister(redis, agent_id, agent_type, capabilities ?? [], endpoint, validatedProjects, registration_id);
+      const validatedBindings = project_bindings?.map((pb) => ({
+        project_scope: resolveAndValidateWorkspacePath(pb.project_scope, config.workspaceRoots),
+        ...(pb.wake_mode ? { wake_mode: pb.wake_mode as 'visible_session' | 'background_executor' | 'external_worker' } : {}),
+        ...(pb.policy ? { policy: pb.policy as 'manual' | 'on_demand' | 'automatic' } : {}),
+      }));
+      return agentRegister(redis, agent_id, agent_type, capabilities ?? [], endpoint, validatedProjects, registration_id, validatedBindings);
     });
 
     app.post('/heartbeat', {
@@ -940,7 +1165,7 @@ export async function createHttpServer(
       preValidation: async (req, reply) => {
         const message = validateExactRequestKeys(req.body, [
           'agent_id', 'registration_id', 'claim_request_id', 'blocking', 'timeout_ms', 'preferred_types',
-          'preferred_phases', 'preferred_project', 'preferred_plan_ids',
+          'preferred_phases', 'preferred_project', 'preferred_plan_ids', 'reservation_id',
         ]);
         if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
       },
@@ -1177,8 +1402,15 @@ export async function createHttpServer(
     });
 
     app.post('/plan/submit', { schema: requestSchemas.planSubmit }, async (req) => {
-      const { plan_dir } = req.body as { plan_dir: string };
-      return planSubmit(redis, resolveAndValidateWorkspacePath(plan_dir, config.workspaceRoots));
+      const { plan_dir, expected_preview } = req.body as {
+        plan_dir: string;
+        expected_preview?: Parameters<typeof planSubmit>[2];
+      };
+      return planSubmit(
+        redis,
+        resolveAndValidateWorkspacePath(plan_dir, config.workspaceRoots),
+        expected_preview,
+      );
     });
 
     app.post('/plan/create', { schema: requestSchemas.planCreate }, async (req) => {
@@ -1201,6 +1433,132 @@ export async function createHttpServer(
     app.get('/plan/:plan_id', async (req) => {
       const { plan_id } = req.params as { plan_id: string };
       return getPlan(redis, plan_id);
+    });
+
+    app.post('/project/agent-connections', {
+      schema: requestSchemas.projectAgentConnectionCreate,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, ['project_scope', 'agent_id']);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { project_scope, agent_id } = req.body as { project_scope: string; agent_id: string };
+      return connectProjectAgent(
+        redis,
+        resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots),
+        agent_id,
+      );
+    });
+
+    app.get('/project/agent-bindings', {
+      schema: {
+        querystring: {
+          type: 'object', required: ['project_scope'], additionalProperties: false,
+          properties: { project_scope: absolutePath },
+        },
+      },
+    }, async (req) => {
+      const { project_scope } = req.query as { project_scope: string };
+      return listProjectAgentBindings(resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots));
+    });
+
+    app.get('/project/agent-bindings/:binding_id', {
+      schema: {
+        params: { type: 'object', required: ['binding_id'], properties: { binding_id: safeIdentifier } },
+        querystring: {
+          type: 'object', required: ['project_scope'], additionalProperties: false,
+          properties: { project_scope: absolutePath },
+        },
+      },
+    }, async (req) => {
+      const { binding_id } = req.params as { binding_id: string };
+      const { project_scope } = req.query as { project_scope: string };
+      return getProjectAgentBinding(resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots), binding_id);
+    });
+
+    app.delete('/project/agent-bindings/:binding_id', {
+      schema: {
+        params: { type: 'object', required: ['binding_id'], properties: { binding_id: safeIdentifier } },
+        querystring: {
+          type: 'object', required: ['project_scope'], additionalProperties: false,
+          properties: { project_scope: absolutePath },
+        },
+      },
+    }, async (req) => {
+      const { binding_id } = req.params as { binding_id: string };
+      const { project_scope } = req.query as { project_scope: string };
+      return deleteProjectAgentBinding(resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots), binding_id);
+    });
+
+    app.get('/project/agent-roster', {
+      schema: {
+        querystring: {
+          type: 'object', required: ['project_scope'], additionalProperties: false,
+          properties: { project_scope: absolutePath },
+        },
+      },
+    }, async (req) => {
+      const { project_scope } = req.query as { project_scope: string };
+      return getProjectAgentRoster(redis, resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots));
+    });
+
+    app.post('/project/agent-reservations', {
+      schema: requestSchemas.projectAgentReservation,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, [
+          'project_scope', 'binding_id', 'task_id', 'preferred_plan_ids',
+        ]);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { project_scope, binding_id, task_id, preferred_plan_ids } = req.body as {
+        project_scope: string;
+        binding_id: string;
+        task_id?: string;
+        preferred_plan_ids?: string[];
+      };
+      const projectScope = resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots);
+      const reserved = await reserveProjectAgentTask(redis, projectScope, { binding_id, task_id, preferred_plan_ids });
+      return reserved.ok
+        ? { ok: true, data: { reservation: reserved.data } }
+        : reserved;
+    });
+
+    app.post('/execution-receipts', {
+      schema: requestSchemas.executionReceiptCreate,
+      preValidation: async (req, reply) => {
+        const message = validateExactRequestKeys(req.body, [
+          'project_scope', 'attempt_id', 'task_id', 'binding_id', 'agent_id', 'registration_id',
+          'harness_kind', 'wake_mode', 'adapter_id', 'status', 'started_at', 'session_ref', 'visible_url',
+        ]);
+        if (message) return reply.status(400).send({ ok: false, data: null, error: { code: 'INVALID_REQUEST', message } });
+      },
+    }, async (req) => {
+      const { project_scope, ...body } = req.body as {
+        project_scope: string;
+      } & Parameters<typeof appendExecutionReceipt>[1];
+      return appendExecutionReceipt(
+        resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots),
+        body,
+        redis,
+      );
+    });
+
+    app.get('/execution-receipts', {
+      schema: {
+        querystring: {
+          type: 'object', required: ['project_scope'], additionalProperties: false,
+          properties: { project_scope: absolutePath, binding_id: safeIdentifier, task_id: safeIdentifier },
+        },
+      },
+    }, async (req) => {
+      const { project_scope, binding_id, task_id } = req.query as {
+        project_scope: string; binding_id?: string; task_id?: string;
+      };
+      return listExecutionReceipts(
+        resolveAndValidateWorkspacePath(project_scope, config.workspaceRoots),
+        { binding_id, task_id },
+      );
     });
 
     // Plan 批量退出采用 preview token 乐观门控；状态变化时 POST 会 fail closed。
@@ -1306,6 +1664,20 @@ export async function createHttpServer(
     // POST /reconcile —— Supervisor 的低频、幂等运行态补偿；不领取任务、不处理 PM Question。
     app.post('/reconcile', async () => reconcileRuntimeState(redis));
 
+    // GET /supervisor/tick —— Supervisor 聚合快照：一轮 plans+intake+events+reconcile+binding 合成一次往返。
+    // 心跳不并入 tick（各 slot 心跳保持独立节流语义），详见 docs/runbooks/supervisor-tick.md。
+    app.get('/supervisor/tick', async (req) => {
+      const { consumers, events_after, binding_aware, plan_ids } = req.query as {
+        consumers?: string; events_after?: string; binding_aware?: string; plan_ids?: string;
+      };
+      return supervisorTick(redis, {
+        consumers: consumers ? consumers.split(',').map((value) => value.trim()).filter(Boolean) : [],
+        events_after: events_after || undefined,
+        binding_aware: binding_aware === '1' || binding_aware === 'true',
+        plan_ids: plan_ids ? plan_ids.split(',').map((value) => value.trim()).filter(Boolean) : undefined,
+      });
+    });
+
     // GET /watchdog?auto_fix=<bool> —— PM 巡检（对应 biao watchdog）
     app.get('/watchdog', async (req) => {
       const { auto_fix } = req.query as { auto_fix?: string };
@@ -1387,6 +1759,71 @@ export async function createHttpServer(
         if (heartbeat) clearInterval(heartbeat);
       });
     });
+
+    // 方案 E：Owner 预登记人类身份（一次性 enrollment_code）。
+    // 注册在 apiRoutes 作用域（routes/v2/** 不动）：RBAC 守卫不覆盖本路由，
+    // owner-only 判定在 handler 内 fail-closed 完成。仅在配置 SQLite store 时
+    // 注册（远程登录依赖人类身份持久化；无 store 的纯 V1 实例保持路由树不变）。
+    if (humanIdentity) {
+      /** owner 凭据判定：owner bearer / 本机 Owner 会话 / owner 角色远程会话。 */
+      const isOwnerCredential = (headers: { cookie?: string; authorization?: string }): boolean => {
+        if (!config.apiToken) return true; // auth_disabled：与 RBAC 分类一致，全部视为 owner
+        if (headers.authorization === `Bearer ${config.apiToken}`) return true;
+        if (hasLocalOwnerSession(headers.cookie, config)) return true;
+        const session = resolveHumanSessionCredential(headers.cookie, humanIdentity);
+        return Boolean(session && session.claims.role === 'owner');
+      };
+
+      app.post('/v2/human-enrollments', { schema: requestSchemas.humanEnrollmentCreate }, async (req, reply) => {
+        reply.header('Cache-Control', 'no-store');
+        if (!isOwnerCredential(req.headers)) {
+          return reply.status(403).send({
+            ok: false,
+            data: null,
+            error: { code: 'OWNER_REQUIRED', message: 'enrollment 创建仅限 Owner（Bearer token / 本机会话 / owner 角色远程会话）' },
+          });
+        }
+        const body = req.body as {
+          subject: string;
+          role: 'owner' | 'project_admin' | 'reviewer' | 'auditor';
+          project_id?: string;
+          expires_in_hours?: number;
+        };
+        const actorId = config.apiToken && req.headers.authorization === `Bearer ${config.apiToken}`
+          ? 'owner'
+          : 'local-owner';
+        const result = humanIdentity.createEnrollment(
+          {
+            subject: body.subject,
+            role: body.role,
+            project_id: body.project_id,
+            expires_in_hours: body.expires_in_hours,
+          },
+          { actor_id: actorId, correlation_id: `corr-${Date.now()}` },
+        );
+        // enrollment_code 仅本次响应返回一次（后续不可查）；响应体不可缓存。
+        if (!result.ok || !result.data) {
+          return reply.status(400).send({
+            ok: false,
+            data: null,
+            error: result.error ?? { code: 'ENROLLMENT_FAILED', message: 'enrollment 创建失败' },
+          });
+        }
+        return result;
+      });
+    }
+
+    // V2 路由装配（Phase 1 + Phase 6 RBAC）：/v2/* 路由，走 registry 声明 + 共享 plugin
+    // 必须在 apiRoutes 闭包内注册，以继承 crossCuttingApiPlugin 的鉴权钩子；
+    // apiToken/host 传入供 RBAC 守卫做凭据分类（owner bearer / local-owner 会话）。
+    if (options.sqliteStore) {
+      await app.register(v2RoutesPlugin, {
+        store: options.sqliteStore,
+        apiToken: config.apiToken,
+        host: config.host,
+        ...(options.artifactRoot ? { artifactRoot: options.artifactRoot } : {}),
+      });
+    }
   };
 
   await app.register(apiRoutes);            // 根路径（spec 标准）

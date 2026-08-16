@@ -6,6 +6,12 @@
 [`agent-kit contract → scaffold → check`](agent-adapter-kit.md) 生成并离线验证单文件适配器，
 再把它登记为 Supervisor 的 custom Worker slot 或 Plan PM 路由。
 
+已有 Biao 凭据的新 Agent 想最快加入：一条命令完成注册、自动绑定与 Worker Token 落盘，详见 [agent-join 一站式加入](agent-join.md)：
+
+```bash
+biao-agent-join --agent-id <id> --agent-type <type> --capabilities code --project-scope /abs/project
+```
+
 ## 先决条件
 
 在 clone 后先完成一次显式配置：
@@ -69,6 +75,101 @@ bootstrap 生成的单 Worker 入口默认在队列为空后退出，适合一�
 `agentId` 在同一台机器上必须唯一；`project` 是传给 claim 的 `preferred_project`，只会领取完全匹配该项目路径的任务。每个 slot 的 `types` 只限制可领取任务类型，不会绕过依赖、独立验收或 ownership 规则。
 
 Supervisor 只有一个本机锁和一个共享低频主循环。它本身就是 Worker slot 的生命周期所有者，不要求 Codex/Kimi 先常驻在线：出现 pending、repair 或 reverify 时由 Supervisor 领取，领到后才启动实际 Agent CLI。空闲 slot 不创建独立 timer，也不各自轮询 claim；每个共享轮次只为每个空闲 slot 至多发送一次 presence heartbeat，避免服务端误判 stale。slot 一旦运行任务，presence heartbeat 停止，改由 Worker 自己维护带当前任务的 heartbeat 与 lease；任务结束后同一 Supervisor 立即检测下一项。所有受管 Plan 闭环后，Supervisor 自动退出。
+
+## Harness 自带的一次性唤醒脚本
+
+已有自己会话、运行时或远程节点的 harness，不应常驻一个 Worker 每隔数秒调用 `/claim`。每种 harness 只需提供一个可执行的、一次性的“心跳/唤醒脚本”：Supervisor 发现匹配任务时才调用它，脚本唤醒自己的 harness，然后立即返回安全回执。
+
+这里的“心跳”是被 Supervisor 触发的 one-shot hook，不是 harness 自建 cron、launchd 或定时轮询。Supervisor 是唯一等待者，同一个进程同时负责 Worker 任务和 PM 门铃。
+
+```bash
+# 1. 让 harness 生成自己的脚本骨架并完成实际唤醒逻辑。
+.biao/agent-kit scaffold --role project-agent --mode external_worker \
+  --output /absolute/path/glm53-wake
+
+# 2. 无凭据验证协议和可执行性。
+.biao/agent-kit check --role project-agent --mode external_worker \
+  --adapter /absolute/path/glm53-wake
+
+# 3. 登记 harness 级 slot。binding-id 可省略：用户在项目界面点“添加”后，
+#    Supervisor 会按 agent-id + harness-kind + wake-mode 匹配动态项目连接。
+.biao/supervisor-config worker add --id glm5.3 --kind custom \
+  --project /absolute/path/project --types code,docs,review \
+  --command /absolute/path/glm53-wake \
+  --harness-kind glm --wake-mode external_worker --adapter-id glm53-wake-v1
+```
+
+Supervisor 通过 stdin 向脚本传入一行 `biao.worker-wake/v1` JSON 载荷，不传 Biao API Token、claim token 或 PM 目标。脚本唤醒成功后必须在 stdout 输出一行 JSON 回执。真实的 harness 随后使用它自己的本机授权去 register/claim。脚本返回非零、超时、输出多行或缺合法回执时，Supervisor 记录失败并留待后续重试，不把“已启动进程”当作已执行任务。
+
+### 唤醒载荷字段
+
+顶层字段（`biaoUrl`、`slotId` 保持 camelCase，属于脚本间内部约定）；`binding` 与 `reservation` 的字段一律 **snake_case**，与 HTTP API 和 `ProjectAgentBinding` 类型一致：
+
+| 位置 | 字段 | 说明 |
+| --- | --- | --- |
+| 顶层 | `protocol` | 固定 `biao.worker-wake/v1` |
+| 顶层 | `biaoUrl` | Biao 服务地址（无凭据） |
+| 顶层 | `slotId` | 发起唤醒的 Supervisor slot |
+| `binding` | `binding_id` / `agent_id` / `harness_kind` | 项目连接身份 |
+| `binding` | `wake_mode` | `visible_session` 或 `external_worker` |
+| `binding` | `adapter_id` | 回执中必须原样返回 |
+| `selector` | `project` / `capability` / `kind` / `model` / `planIds` | 命中该唤醒的工作范围 |
+| `reservation?` | `reservation_id` / `task_id` / `expires_at` | 仅带预留的唤醒出现；`expires_at` 是毫秒时间戳 |
+
+载荷绝不包含 `taskId` 明文任务详情以外的凭据类字段：出现 `claim_token`、`command`、`target`、`authorization`、`bearer`、`secret` 等 marker 会立即被适配器与契约测试拒绝；传给适配器的环境变量也只保留 `PATH` 等白名单与 `BIAO_RUNTIME_DIR`。
+
+### 回执字段
+
+stdout 必须只有一行 JSON：
+
+| 字段 | 必填 | 规则 |
+| --- | --- | --- |
+| `protocol` / `ok` | 是 | `biao.worker-wake/v1` / `true` |
+| `adapter_id` | 是 | 与载荷 `binding.adapter_id` 一致，`[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}` |
+| `registration_id` | 是 | 适配器自选的安全 ID，同上正则 |
+| `harness_kind` / `wake_mode` | 是 | 与 binding 一致 |
+| `task_id` / `reservation_id` | 条件 | **载荷带 `reservation` 时必填**，且必须与载荷原样一致 |
+| `session_ref` | 否 | 安全字符集，不含凭据 marker |
+| `visible_url` | 否 | http(s) 绝对 URL 或站内绝对路径，禁止查询串、hash 与凭据 |
+
+**reservation 回带规则**：唤醒载荷提供过 `reservation` 时，回执必须原样回带 `task_id` 与 `reservation_id`；缺失或不一致（包括带回别的任务的 ID）都会被判失败。该规则在 worker-agent 与 Supervisor 终校验两层独立执行——worker-agent 会先拒绝一次，坏回执不会进入 Supervisor 进程；reservation 是重启栅栏的 `attempt_id` 来源，两层校验共同防止串扰回执落库。
+
+### 最小适配器示例
+
+```js
+#!/usr/bin/env node
+// biao.worker-wake/v1 最小外部适配器：stdin 一行载荷进、stdout 一行回执出。
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+const protocol = 'biao.worker-wake/v1';
+if (process.env.BIAO_ADAPTER_PROBE === '1') {
+  // 离线探测：adapter-kit check 用它验证协议与可执行性。
+  console.log(JSON.stringify({ ok: true, protocol, role: 'project-agent', wake_mode: 'external_worker' }));
+  process.exit(0);
+}
+
+const wake = JSON.parse(readFileSync(0, 'utf8'));
+if (wake?.protocol !== protocol || wake?.binding?.wake_mode !== 'external_worker') process.exit(2);
+
+// TODO: 在这里唤醒真实 harness；它随后用本机授权 runtime 自行 register/claim。
+// 成功才输出回执；失败时以非零退出让 Supervisor 下一轮重试。
+
+console.log(JSON.stringify({
+  protocol, ok: true,
+  adapter_id: wake.binding.adapter_id,
+  registration_id: `my-harness-${randomUUID()}`,
+  harness_kind: wake.binding.harness_kind,
+  wake_mode: wake.binding.wake_mode,
+  // 带 reservation 的唤醒必须原样回带，否则两层校验都会拒绝。
+  ...(wake.reservation ? {
+    task_id: wake.reservation.task_id,
+    reservation_id: wake.reservation.reservation_id,
+  } : {}),
+}));
+```
+
+仓库内 `src/worker/harness/external-stub.mjs` 是该协议的通用参考实现（含凭据断言与协议不匹配退出码 2），可直接对照实现。后台直接执行器仍使用 `background_executor`，它由 Supervisor 代为 claim，不使用上述 harness-owned 唤醒协议。
 
 ## 必经的 Worker 生命周期
 

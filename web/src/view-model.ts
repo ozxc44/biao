@@ -1,6 +1,13 @@
 import type { Locale } from './i18n/translations';
 import { createTranslator } from './i18n/translations';
-import type { AgentInfo, PlanData, PlanSummary, StatusData, TaskSummary } from './api';
+import type {
+  AgentInfo,
+  ExecutionReceiptData,
+  PlanData,
+  PlanSummary,
+  StatusData,
+  TaskSummary,
+} from './api';
 import {
   summarizeResolutions,
   type ResolutionSummary,
@@ -40,6 +47,7 @@ export interface RootAttemptTimelineItem {
   role: RootAttemptRole;
   isCurrent: boolean;
   isResolvedBy: boolean;
+  receipts?: ExecutionReceiptData[];
 }
 export type AcceptedClosureKind = 'original' | 'repair' | 'reverify';
 export type AttemptAuditKind = 'failure' | 'rejected' | 'blocked' | 'cancelled' | 'superseded';
@@ -341,12 +349,20 @@ export function buildRootTaskBoard(tasks: TaskBuckets): RootTaskBoard {
 }
 
 /** 根卡下的完整不可变执行谱系；只改变展示，不改变根任务计数。 */
-export function getRootAttemptTimeline(card: RootTaskCard): RootAttemptTimelineItem[] {
+export function getRootAttemptTimeline(
+  card: RootTaskCard,
+  receipts?: readonly ExecutionReceiptData[],
+): RootAttemptTimelineItem[] {
   return [card.root, ...card.repairs].map((task, index) => ({
     task,
     role: index === 0 ? 'root' : task.type === 'acceptance' ? 'reverify' : 'repair',
     isCurrent: task.task_id === card.actionTask.task_id,
     isResolvedBy: task.task_id === card.root.resolved_by_task,
+    ...(receipts ? {
+      receipts: receipts
+        .filter((receipt) => receipt.task_id === task.task_id)
+        .sort((a, b) => a.started_at - b.started_at || a.attempt_id.localeCompare(b.attempt_id)),
+    } : {}),
   }));
 }
 

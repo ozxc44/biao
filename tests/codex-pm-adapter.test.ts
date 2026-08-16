@@ -58,6 +58,8 @@ function run(input: string, env: NodeJS.ProcessEnv = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      BIAO_PM_TARGET: undefined,
+      BIAO_PM_THREAD_ID: undefined,
       BIAO_API_TOKEN: 'must-not-cross-into-codex',
       BIAO_REDIS_URL: 'redis://secret-host:6379',
       ...env,
@@ -233,6 +235,9 @@ describe('Codex PM Agent adapter', () => {
     expect(invoked.stdin).toContain('不得改用浏览器');
     expect(invoked.stdin).toContain('pm intake 在“无待处理事项”时约定退出码为 2');
     expect(invoked.stdin).toContain('exit 2 是 drained 成功');
+    expect(invoked.stdin).toContain('首波目标 3–4 条互不重叠的实现 lane');
+    expect(invoked.stdin).toContain('不得提交该 DAG');
+    expect(invoked.stdin).toContain('同一文件、模块或共享入口同时只能有一个写入者');
     expect(invoked.apiToken).toBeNull();
     expect(invoked.redisUrl).toBeNull();
   });

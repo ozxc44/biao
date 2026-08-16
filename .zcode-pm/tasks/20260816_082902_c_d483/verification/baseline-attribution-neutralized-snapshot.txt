@@ -1,0 +1,9 @@
+ tests/distributed/p23-integration-gate.test.ts
+ tests/distributed/p3-node-daemon.test.ts
+ tests/distributed/p5-merge-queue.test.ts
+ tests/distributed/p6-rbac.test.ts
+ tests/distributed/p8-fault-matrix.test.ts
+ tests/distributed/p8-loopback-e2e.test.ts
+ tests/distributed/p8-rollback-window.test.ts
+ tests/distributed/p8-two-nodes.test.ts
+ tests/distributed/p9-merge-conflict.test.ts

@@ -552,23 +552,97 @@ export function globMatch(pattern: string, path: string): boolean {
   return re.test(path);
 }
 
+type GlobToken =
+  | { kind: 'literal'; value: string }
+  | { kind: 'star'; slash: boolean }
+  | { kind: 'question' };
+
+function tokenizeGlob(pattern: string): GlobToken[] {
+  const tokens: GlobToken[] = [];
+  for (let index = 0; index < pattern.length; index++) {
+    if (pattern[index] === '*') {
+      const double = pattern[index + 1] === '*';
+      tokens.push({ kind: 'star', slash: double });
+      if (double) index++;
+    } else if (pattern[index] === '?') {
+      tokens.push({ kind: 'question' });
+    } else {
+      tokens.push({ kind: 'literal', value: pattern[index]! });
+    }
+  }
+  return tokens;
+}
+
+function globEpsilonClosure(tokens: GlobToken[], positions: Iterable<number>): Set<number> {
+  const closure = new Set(positions);
+  const queue = [...closure];
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const position = queue[cursor]!;
+    if (tokens[position]?.kind !== 'star' || closure.has(position + 1)) continue;
+    closure.add(position + 1);
+    queue.push(position + 1);
+  }
+  return closure;
+}
+
+function globConsumes(token: GlobToken | undefined, character: string): boolean {
+  if (!token) return false;
+  if (token.kind === 'literal') return token.value === character;
+  if (token.kind === 'question') return true;
+  return token.slash || character !== '/';
+}
+
+function globNextPosition(token: GlobToken, position: number): number {
+  return token.kind === 'star' ? position : position + 1;
+}
+
 /**
- * 对称判定两个路径/glob 是否可能重叠。
- * 先做双向完整匹配，再比较通配符前的静态目录前缀，
- * 使 `src/**` vs `src/app.ts` 和反向声明得到一致结果。
+ * 对称判定两个路径/glob 的语言是否确实相交。
+ *
+ * 旧实现把通配符前的共同目录当前缀冲突，因此两个完全不同的精确文件
+ * `tests/a.test.ts` 与 `tests/b.test.ts` 也会互斥。这里把 `*`/`**`/`?` 编译成
+ * 小型 NFA，并在两个自动机的乘积上检查是否存在共同可接受字符串；没有通配符的
+ * 精确路径自然只会与同一路径冲突。
  */
 export function globsOverlap(a: string, b: string): boolean {
-  if (a === b || globMatch(a, b) || globMatch(b, a)) return true;
-  const staticPrefix = (value: string) => {
-    const wildcardAt = value.search(/[?*]/);
-    const prefix = wildcardAt === -1 ? value : value.slice(0, wildcardAt);
-    const slashAt = prefix.lastIndexOf('/');
-    return slashAt === -1 ? '' : prefix.slice(0, slashAt + 1);
+  if (a === b) return true;
+  const left = tokenizeGlob(a);
+  const right = tokenizeGlob(b);
+  const literals = new Set<string>(['/', '\u0000']);
+  for (const token of [...left, ...right]) {
+    if (token.kind === 'literal') literals.add(token.value);
+  }
+
+  const initialLeft = globEpsilonClosure(left, [0]);
+  const initialRight = globEpsilonClosure(right, [0]);
+  const queue: Array<[number, number]> = [];
+  const visited = new Set<string>();
+  const enqueue = (leftPosition: number, rightPosition: number) => {
+    const key = `${leftPosition}:${rightPosition}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+    queue.push([leftPosition, rightPosition]);
   };
-  const aPrefix = staticPrefix(a);
-  const bPrefix = staticPrefix(b);
-  if (!aPrefix || !bPrefix) return aPrefix === bPrefix;
-  return aPrefix.startsWith(bPrefix) || bPrefix.startsWith(aPrefix);
+  for (const leftPosition of initialLeft) {
+    for (const rightPosition of initialRight) enqueue(leftPosition, rightPosition);
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const [leftPosition, rightPosition] = queue[cursor]!;
+    if (leftPosition === left.length && rightPosition === right.length) return true;
+    const leftToken = left[leftPosition];
+    const rightToken = right[rightPosition];
+    if (!leftToken || !rightToken) continue;
+    for (const character of literals) {
+      if (!globConsumes(leftToken, character) || !globConsumes(rightToken, character)) continue;
+      const nextLeft = globEpsilonClosure(left, [globNextPosition(leftToken, leftPosition)]);
+      const nextRight = globEpsilonClosure(right, [globNextPosition(rightToken, rightPosition)]);
+      for (const nextLeftPosition of nextLeft) {
+        for (const nextRightPosition of nextRight) enqueue(nextLeftPosition, nextRightPosition);
+      }
+    }
+  }
+  return false;
 }
 
 /** 记录冲突日志 */

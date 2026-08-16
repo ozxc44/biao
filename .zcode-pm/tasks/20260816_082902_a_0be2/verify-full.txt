@@ -1,0 +1,10 @@
+    701|       if (child.exitCode === null && child.signalCode === null) child.…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+
+ Test Files  1 failed | 125 passed (126)
+      Tests  2 failed | 1531 passed (1533)
+   Start at  08:45:09
+   Duration  245.38s (transform 819ms, setup 90ms, collect 1.59s, tests 243.45s, environment 0ms, prepare 20ms)
+

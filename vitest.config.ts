@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'scripts/**/*.test.ts'],
     setupFiles: ['tests/setup-guard.ts'],
     testTimeout: 10000,
     hookTimeout: 10000,

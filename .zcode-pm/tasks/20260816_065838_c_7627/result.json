@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "worker": "hermes-c",
+  "backend": "claude_code",
+  "model": "glm-5.3",
+  "returncode": 0,
+  "auth_source": "file:/Users/z/.zcode/skills/zcode-pm-workers/config/auth/anthropic-providers.env",
+  "settings_file": "/Users/z/.zcode/skills/zcode-pm-workers/config/auth/runtime-settings/hermes-c.settings.json",
+  "stdout_log": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_065838_c_7627/stdout.log",
+  "stderr_log": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_065838_c_7627/stderr.log",
+  "claude_result_json": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_065838_c_7627/claude-result.json"
+}

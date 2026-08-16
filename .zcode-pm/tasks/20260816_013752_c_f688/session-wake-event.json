@@ -1,0 +1,20 @@
+{
+  "event_id": "20260816_022002_20260816_013752_c_f688",
+  "type": "pm_worker_completed",
+  "task_id": "20260816_013752_c_f688",
+  "worker": "hermes-c",
+  "session_id": "sess_ebf761ff-39cd-4477-88c2-7cc7c2209ecd",
+  "project": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao",
+  "task_dir": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_013752_c_f688",
+  "goal_file": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/inbox/p3-biao-node-skeleton.md",
+  "result_status": "success",
+  "review_status": "skipped",
+  "result_md": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_013752_c_f688/result.md",
+  "result_json": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_013752_c_f688/result.json",
+  "review_md": "",
+  "review_json": "",
+  "created_at": "2026-08-15T18:20:02+00:00",
+  "acked": false,
+  "session_wake_status": "resume_error:-32022",
+  "session_wake_attempted_at": "2026-08-15T18:20:17+00:00"
+}

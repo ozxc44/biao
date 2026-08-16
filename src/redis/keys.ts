@@ -180,3 +180,30 @@ export function pendingScore(priority: number, ts: number): number {
 export function runningScore(expireAt: number): number {
   return expireAt;
 }
+
+// ──────────────── V2 namespace（§20.4：与 V1 不混用） ────────────────
+
+const V2_PREFIX = 'biao:v2';
+
+export const v2Keys = {
+  /** §20.4: V2 namespace 前缀，与 V1 `biao:v1:` 严格隔离 */
+  prefix: V2_PREFIX,
+  /** node session 会话状态 */
+  nodeSession: (nodeId: string, sessionId: string) =>
+    `${V2_PREFIX}:node:${nodeId}:session:${sessionId}`,
+  /** node 当前活跃 session 指针 */
+  nodeActiveSession: (nodeId: string) =>
+    `${V2_PREFIX}:node:${nodeId}:active_session`,
+  /** attempt token（短期 claim 凭据） */
+  attemptToken: (attemptId: string) =>
+    `${V2_PREFIX}:attempt:${attemptId}:token`,
+  /** ownership snapshot 快照 */
+  ownershipSnapshot: (snapshotId: string) =>
+    `${V2_PREFIX}:ownership_snapshot:${snapshotId}`,
+  /** project 的当前 ownership snapshot 指针 */
+  projectOwnership: (projectId: string) =>
+    `${V2_PREFIX}:project:${projectId}:ownership`,
+  /** node 心跳 TTL */
+  nodeHeartbeat: (nodeId: string) =>
+    `${V2_PREFIX}:node:${nodeId}:heartbeat`,
+} as const;

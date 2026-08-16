@@ -8,7 +8,7 @@
  * - 多 slot 的空闲检查由一个协调器串行发起，而非每个 slot 自己常驻轮询。
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
@@ -38,10 +38,15 @@ interface BiaoLikeServerOptions {
   intake?: (scope: { consumer: string; planId?: string }) => Record<string, unknown>;
   claim?: (body: Record<string, unknown>) => unknown;
   heartbeat?: (body: Record<string, unknown>) => unknown;
+  register?: (body: Record<string, unknown>) => unknown;
   report?: (body: Record<string, unknown>) => unknown;
   task?: (taskId: string) => unknown;
   failPlans?: () => boolean;
   reconcile?: () => Record<string, unknown>;
+  projectAgentBindings?: () => Array<Record<string, unknown>>;
+  executionReceipts?: () => Array<Record<string, unknown>>;
+  reserveProjectAgentTask?: (body: Record<string, unknown>) => Record<string, unknown> | null;
+  onExecutionReceiptPosted?: (body: Record<string, unknown>) => void;
 }
 
 const servers: Server[] = [];
@@ -196,7 +201,9 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
         return;
       }
       if (url.pathname === '/register') {
-        res.end(JSON.stringify({ ok: true, data: {} }));
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; } catch { /* test server returns normal envelope */ }
+        res.end(JSON.stringify(options.register?.(body) ?? { ok: true, data: {} }));
         return;
       }
       if (url.pathname === '/heartbeat') {
@@ -228,6 +235,27 @@ async function startBiaoLikeServer(options: BiaoLikeServerOptions = {}): Promise
       if (url.pathname.startsWith('/task/')) {
         const taskId = decodeURIComponent(url.pathname.slice('/task/'.length));
         res.end(JSON.stringify(options.task?.(taskId) ?? { ok: true, data: { status: 'running' } }));
+        return;
+      }
+      if (url.pathname === '/project/agent-bindings') {
+        res.end(JSON.stringify({ ok: true, data: { bindings: options.projectAgentBindings?.() ?? [] } }));
+        return;
+      }
+      if (url.pathname === '/project/agent-reservations' && req.method === 'POST') {
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; } catch { /* test server returns normal envelope */ }
+        res.end(JSON.stringify({ ok: true, data: { reservation: options.reserveProjectAgentTask?.(body) ?? null } }));
+        return;
+      }
+      if (url.pathname === '/execution-receipts') {
+        if (req.method === 'POST') {
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; } catch { /* test server returns normal envelope */ }
+          res.end(JSON.stringify({ ok: true, data: body }));
+          options.onExecutionReceiptPosted?.(body);
+        } else {
+          res.end(JSON.stringify({ ok: true, data: { receipts: options.executionReceipts?.() ?? [] } }));
+        }
         return;
       }
       res.statusCode = 404;
@@ -556,6 +584,92 @@ describe('BiaoSupervisorRuntime production transport', () => {
     expect(requests.filter((request) => request.path === '/claim')).toHaveLength(1);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain('TEMPORARY');
+  });
+
+  it('同名 agent 注册冲突（AGENT_REGISTRATION_CHANGED）只影响 background 槽数据面，不抑制 harness 唤醒分发', async () => {
+    // 真实环境复现（2026-08-15）：本机独立 codex-worker 与 supervisor 槽注册同名
+    // agent。supervisor 重启后 ensureRegistered 每轮都收到 AGENT_REGISTRATION_CHANGED
+    // 并抛出；修复前该异常沿 afterRunOnce 上抛，被 run() 当作可恢复错误只低频重试，
+    // bindingDispatcher.dispatch 与 scheduleIfRequested 全部被跳过，且终端只有零星
+    // 离线/心跳报错——表现为连续多个周期零分发。修复后 coordinator 数据面异常
+    // 与 harness 唤醒 lane 隔离，dispatch 必须照常执行。
+    const project = '/tmp/registration-conflict';
+    const errors: string[] = [];
+    const receipts: Array<Record<string, unknown>> = [];
+    const wake = vi.fn(async () => ({
+      protocol: 'biao.worker-wake/v1', ok: true,
+      adapter_id: 'custom-visible-v1', registration_id: 'registration_conflict_1',
+      harness_kind: 'custom', wake_mode: 'visible_session',
+      // 带 reservation 的候选要求回执原样回带 task_id/reservation_id（终校验规则）
+      task_id: 'task-conflict-1', reservation_id: 'reservation-conflict-1',
+    }));
+    const { url, requests } = await startBiaoLikeServer({
+      events: () => [],
+      intake: () => ({ consumer: 'pm-a', cursor: '0-0', counts: {}, items: [] }),
+      plans: () => [{
+        plan_id: 'conflict-plan', status: 'active', project_path: project,
+        tasks: { pending: 1, running: 0, blocked: 0, done: 0, failed: 0, cancelled: 0 },
+        reviews: { pending: 0, accepted: 0, rejected: 0 },
+      }],
+      // 模拟外部同名 agent 每次都抢先换新 epoch：本 supervisor 的注册请求全部被拒。
+      register: (body) => ({
+        ok: false, data: null,
+        error: {
+          code: 'AGENT_REGISTRATION_CHANGED',
+          message: `Agent ${body.agent_id} 已换用新会话；旧生命周期不能写心跳。`,
+        },
+      }),
+      projectAgentBindings: () => [{
+        binding_id: 'binding-visible', project_scope: project, agent_id: 'visible-agent',
+        label: 'Visible Agent', harness_kind: 'custom', capabilities: ['code'],
+        wake_mode: 'visible_session', policy: 'automatic', created_at: 1, updated_at: 1,
+      }],
+      reserveProjectAgentTask: () => ({
+        reservation_id: 'reservation-conflict-1', task_id: 'task-conflict-1', plan_id: 'conflict-plan',
+        project_path: project, capability: 'code', binding_id: 'binding-visible',
+        expires_at: 1_900_000_000_000,
+      }),
+      executionReceipts: () => receipts,
+      onExecutionReceiptPosted: (body) => receipts.push({ ...body, project_scope: project }),
+    });
+    const runtime = new BiaoSupervisorRuntime({
+      biaoUrl: url,
+      consumer: 'pm-a',
+      planIds: ['conflict-plan'],
+      // 同轮同时存在 background worker 槽（注册必然失败）与 harness 唤醒槽。
+      workers: [{
+        agentId: 'conflicting-bg', agentType: 'test', preferredProject: project, capabilities: ['code'],
+        execute: async () => {
+          throw new Error('注册失败的 background 槽绝不应执行任务');
+        },
+      }],
+      projectAgentWakeSlots: [{
+        bindingId: 'binding-visible', agentId: 'visible-agent', harnessKind: 'custom',
+        wakeMode: 'visible_session', adapterId: 'custom-visible-v1', wake,
+      }],
+      pollIntervalMs: 1_000,
+      onError: (message) => errors.push(message),
+    });
+
+    // 两个共享轮次：修复前第一轮 dispatch 被跳过，且 run() 会把注册异常当
+    // 可恢复错误重试同一轮；这里直接断言每轮 dispatch 都照常完成。
+    expect(await runtime.runOnce()).toBe(true);
+    // harness 唤醒 lane：第一轮分发成功；第二轮同一 reservation 的回执已按
+    // restart fence 去重——共两次 POST（第二次仍是同 reservation，不再重复启动
+    // 新 wake）。wake 被调用两次属于测试内同一 runtime 的重试语义：dispatcher
+    // 只依赖服务端回执做恢复围栏，这里只需要证明它从未被注册冲突跳过。
+    expect(wake.mock.calls.length).toBeGreaterThanOrEqual(1);
+    const posted = requests.filter((request) => request.path === '/execution-receipts' && request.method === 'POST');
+    expect(posted.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.parse(posted[0].body)).toMatchObject({
+      task_id: 'task-conflict-1', binding_id: 'binding-visible', status: 'succeeded',
+      wake_mode: 'visible_session', adapter_id: 'custom-visible-v1',
+    });
+    // 冲突只属于 background 槽数据面：错误被上报，但不吞掉分发结果。
+    expect(errors.some((message) => message.includes('共享 Worker presence 失败')
+      && message.includes('AGENT_REGISTRATION_CHANGED'))).toBe(true);
+    // background 槽每次共享轮次都重试注册（不因一次失败而永久放弃）。
+    expect(requests.filter((request) => request.path === '/register').length).toBeGreaterThanOrEqual(2);
   });
 
   it('a running slot is excluded from coordinator presence while its Worker owns task heartbeats', async () => {

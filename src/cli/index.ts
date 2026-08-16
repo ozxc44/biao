@@ -7,7 +7,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isPlanTerminalStatus } from '../plan/status.js';
 import { startServer } from '../server/main.js';
-import { runPlanIntake, runPlanRevise, runTaskAdd, runTaskEdit } from './planning.js';
+import { analyzeDag, type ActiveOwnershipFact, type DagTaskFact } from './dag-analysis.js';
+import { runPlanIntake, runPlanRevise, runPlanSubmit, runTaskAdd, runTaskEdit } from './planning.js';
 
 const BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
 const BIAO_API_TOKEN = process.env.BIAO_API_TOKEN;
@@ -40,6 +41,24 @@ function isApiSuccess(value: unknown): boolean {
 function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
   if (!isApiSuccess(value)) process.exitCode = 1;
+}
+
+type PlanParallelismRead = {
+  tasks?: Record<string, DagTaskFact[] | undefined>;
+};
+
+function planTaskFacts(plan: PlanParallelismRead): DagTaskFact[] {
+  const statuses = ['pending', 'running', 'blocked', 'done', 'failed', 'cancelled', 'superseded'];
+  return statuses.flatMap((status) => (plan.tasks?.[status] ?? []).map((task) => ({
+    ...task,
+    status: task.status || status,
+  })));
+}
+
+function activeOwnershipFacts(value: unknown): ActiveOwnershipFact[] {
+  if (!value || typeof value !== 'object') return [];
+  const result = value as { ok?: boolean; data?: { ownership?: ActiveOwnershipFact[] } };
+  return result.ok && Array.isArray(result.data?.ownership) ? result.data.ownership : [];
 }
 
 /** 解析 --since 参数为毫秒时间戳
@@ -317,6 +336,7 @@ const LEAF_COMMAND_USAGE: Record<string, string> = {
 
 const COMMANDS_WITH_DETAILED_HELP = new Set([
   'pm:start',
+  'plan:submit',
   'plan:intake',
   'plan:revise',
   'task:add',
@@ -605,6 +625,7 @@ async function main() {
         attention?: { failed?: number; rejected?: number; needs_pm_decision?: number; stale_running_agents?: number };
         history?: { resolved_failed?: number; resolved_rejected?: number; stale_agents?: number };
         agents?: Array<{ agent_id?: string; status?: string }>;
+        plans?: Array<{ plan_id?: string; status?: string }>;
         hint?: { code?: string; doctor?: string; start_worker?: string } | null;
       };
       type PmStartupIntake = {
@@ -617,6 +638,9 @@ async function main() {
       let health: unknown;
       let status: { ok?: boolean; data?: PmStartupStatus; error?: { message?: string } };
       let intake: { ok?: boolean; data?: PmStartupIntake; error?: { message?: string } };
+      let startupPlanSnapshots: PlanParallelismRead[] = [];
+      let startupOwnership: ActiveOwnershipFact[] = [];
+      let startupOwnershipKnown = false;
       try {
         if (managedPlanIds.length === 0) {
           [health, status, intake] = await Promise.all([
@@ -649,6 +673,9 @@ async function main() {
             status = { ok: false, error: { message: planResults[missingPlanIndex].error?.message ?? `受管 plan 不存在：${managedPlanIds[missingPlanIndex]}` } };
             intake = { ok: false, error: { message: '受管 plan 状态不可用，未合并 intake' } };
           } else {
+            startupPlanSnapshots = planResults.flatMap((result) => (
+              result.data ? [{ tasks: result.data.tasks as PlanParallelismRead['tasks'] }] : []
+            ));
             const countBucket = (value: unknown[] | number | undefined): number => (
               Array.isArray(value) ? value.length : Number(value ?? 0)
             );
@@ -689,6 +716,31 @@ async function main() {
             }
           }
         }
+
+        const ownershipResult = await api('/ownership/active').catch(() => null);
+        startupOwnership = activeOwnershipFacts(ownershipResult);
+        startupOwnershipKnown = Boolean(
+          ownershipResult && typeof ownershipResult === 'object' &&
+          (ownershipResult as { ok?: boolean; data?: { ownership?: unknown } }).ok &&
+          Array.isArray((ownershipResult as { data?: { ownership?: unknown } }).data?.ownership),
+        );
+        if (managedPlanIds.length === 0) {
+          const planList = await api('/plans').catch(() => null) as {
+            ok?: boolean;
+            data?: { plans?: Array<{ plan_id?: string; status?: string }> };
+          } | null;
+          const planIds = (planList?.ok ? planList.data?.plans : status.data?.plans ?? [])
+            ?.filter((plan) => !plan.status || plan.status === 'submitted' || plan.status === 'active')
+            .map((plan) => plan.plan_id)
+            .filter((planId): planId is string => Boolean(planId)) ?? [];
+          const details = await Promise.all(planIds.map((planId) => (
+            api(`/plan/${encodeURIComponent(planId)}`).catch(() => null)
+          )));
+          startupPlanSnapshots = details.flatMap((detail) => {
+            const result = detail as { ok?: boolean; data?: PlanParallelismRead | null } | null;
+            return result?.ok && result.data ? [result.data] : [];
+          });
+        }
       } catch (error) {
         console.error(`✗ PM 启动前检查失败：${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
@@ -703,12 +755,16 @@ async function main() {
       const statusData = status.data;
       const intakeData = intake.data;
       const reviewPending = Number(statusData.reviews?.pending ?? 0);
-      const runnablePending = Number(statusData.tasks?.pending ?? 0);
-      const onlineWorkers = managedPlanIds.length > 0
-        ? null
-        : (statusData.agents ?? []).filter((agent) => (
-            agent.status === 'idle' || agent.status === 'busy' || agent.status === 'online'
-          )).length;
+      const rawPending = Number(statusData.tasks?.pending ?? 0);
+      const analyses = startupPlanSnapshots.map((plan) => analyzeDag(planTaskFacts(plan), startupOwnership));
+      const runnablePending = analyses.reduce((sum, analysis) => sum + analysis.counts.runnable_now, 0);
+      const dependencyWaiting = analyses.reduce((sum, analysis) => sum + analysis.counts.dependency_waiting, 0);
+      const parallelismKnown = startupPlanSnapshots.length > 0 && startupOwnershipKnown;
+      const availableWorkers = (statusData.agents ?? []).filter((agent) => (
+        agent.status === 'idle' || agent.status === 'online'
+      )).length;
+      const busyWorkers = (statusData.agents ?? []).filter((agent) => agent.status === 'busy').length;
+      const staleWorkers = (statusData.agents ?? []).filter((agent) => agent.status === 'stale').length;
       const doorbellItems = intakeData.items ?? [];
       const reviewDoorbells = Number(intakeData.counts?.review_requested ?? doorbellItems.filter((item) => item.kind === 'review_requested').length);
       const doorbellKinds = Object.entries(intakeData.counts ?? {})
@@ -746,12 +802,20 @@ async function main() {
         console.log(`待 PM 验收：${reviewPending} 项${historical}`);
         console.log('  下一步：biao review list，然后逐项 biao review <task_id>；不会自动验收或确认。');
       }
-      if (runnablePending > 0) {
-        console.log(onlineWorkers === null
-          ? `待执行：${runnablePending} 项（受管 Plan 范围）`
-          : `待执行：${runnablePending} 项；在线 Worker：${onlineWorkers}`);
+      if (parallelismKnown) {
+        console.log(`执行诊断：真实可运行 ${runnablePending} 项，等待依赖 ${dependencyWaiting} 项（原始 pending ${rawPending} 项）`);
+        // 保留旧版可检索措辞，但只对分析后的真实可运行任务使用“待执行”。
+        if (runnablePending > 0) console.log(`待执行：${runnablePending} 项${managedPlanIds.length > 0 ? '（受管 Plan 范围）' : ''}`);
+      } else {
+        console.log(`执行诊断：真实可运行未知，等待依赖未知（原始 pending ${rawPending} 项；请运行 biao plan status <plan_id>）`);
       }
-      if (onlineWorkers === 0 && (runnablePending > 0 || statusData.hint?.code === 'NO_ONLINE_WORKERS')) {
+      if (managedPlanIds.length === 0) {
+        console.log(`Worker：在线可用 ${availableWorkers}，忙碌 ${busyWorkers}，失联 ${staleWorkers}`);
+      } else {
+        console.log('Worker：受管 Plan 模式不读取全局 Worker 名册；用 biao status 查看在线/忙碌/失联数量。');
+      }
+      if (managedPlanIds.length === 0 && availableWorkers === 0 && busyWorkers === 0 &&
+          (runnablePending > 0 || statusData.hint?.code === 'NO_ONLINE_WORKERS')) {
         console.log(`暂无在线 Worker。先执行 ${statusData.hint?.doctor ?? '.biao/doctor'}，再启动 ${statusData.hint?.start_worker ?? '.biao/worker-codex、.biao/worker-kimi 或 .biao/worker-custom'}。`);
       }
       if (doorbellKinds.length > 0) {
@@ -1262,13 +1326,7 @@ verify: []
   }
 
   if (cmd === 'plan' && sub === 'submit') {
-    const planDir = rest[0];
-    if (!planDir) {
-      console.error('用法：biao plan submit <plan_dir>');
-      process.exit(1);
-    }
-    const r = await api('/plan/submit', { method: 'POST', body: JSON.stringify({ plan_dir: planDir }) });
-    printJson(r);
+    await runPlanSubmit(rest, api);
     return;
   }
 
@@ -1327,11 +1385,33 @@ verify: []
   if (cmd === 'plan' && sub === 'status') {
     const planId = rest[0];
     if (!planId) {
-      console.error('用法：biao plan status <plan_id>');
+      console.error('用法：biao plan status <plan_id> [--json]');
       process.exit(1);
     }
-    const r = await api(`/plan/${planId}`);
-    printJson(r);
+    const [rawPlan, rawOwnership] = await Promise.all([
+      api(`/plan/${encodeURIComponent(planId)}`),
+      api('/ownership/active'),
+    ]);
+    const result = rawPlan as { ok?: boolean; data?: (PlanParallelismRead & Record<string, unknown>) | null };
+    if (result.ok && result.data) {
+      const ownershipResult = rawOwnership as { ok?: boolean; data?: { ownership?: unknown }; error?: { message?: string } };
+      if (!ownershipResult.ok || !Array.isArray(ownershipResult.data?.ownership)) {
+        printJson({
+          ok: false,
+          data: null,
+          error: {
+            code: 'OWNERSHIP_FACTS_UNAVAILABLE',
+            message: ownershipResult.error?.message ?? '无法读取当前 ownership，拒绝输出可能失真的可运行数',
+          },
+        });
+        return;
+      }
+      result.data = {
+        ...result.data,
+        parallelism: analyzeDag(planTaskFacts(result.data), activeOwnershipFacts(rawOwnership)),
+      };
+    }
+    printJson(result);
     return;
   }
 
@@ -2453,9 +2533,9 @@ verify: []
   biao conflicts [--limit 20] [--json]                           文件占用冲突历史
   biao plan init <plan-id> [--project <path>] [--dir <plans/>]   本地生成 plan 骨架
   biao plan create <plan-id> --project <path> [--title <标题>]   通过 API 创建+提交
-  biao plan submit <plan_dir>                                     提交 plan 到 Redis
+  biao plan submit <plan_dir> [--preview] [--json]                预览并行度或提交 plan 到 Redis
   biao plan list [--json]                                         列出所有 plan + 任务计数
-  biao plan status <plan_id>                                      查看 plan 状态
+  biao plan status <plan_id> [--json]                             查看状态与真实并行度诊断
   biao plan revise <plan_id> [--preview|--diff|--submit] [--json]  预览磁盘/平台差异后安全提交
   biao plan intake --plan <id> --text "..." [--json]              存档人类需求（同名不覆盖）
   biao plan supersede <id> --preview                              预览历史待验收批量退出及快照 token

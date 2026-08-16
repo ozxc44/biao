@@ -386,7 +386,8 @@ describe('biao pm start', () => {
     });
 
     expect(stdout).toContain('待 PM 验收：1 项');
-    expect(stdout).toContain('待执行：1 项');
+    // 受管 Plan 模式不做本地 DAG 分析，只汇总受管 plan 的原始 pending，并指引 plan status。
+    expect(stdout).toContain('执行诊断：真实可运行未知，等待依赖未知（原始 pending 1 项');
     expect(stdout).not.toContain('39 项');
     expect(requests).toContain('GET /plan/managed-plan');
     expect(requests).toContain('GET /intake?consumer=pm-scope&plan_id=managed-plan');

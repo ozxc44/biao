@@ -52,12 +52,22 @@ export function usage() {
     --command <本地可执行文件绝对路径> [--biao-url URL]
     [--runtime-dir <.biao 绝对路径>] [--lock-dir <本机锁目录>]
 
+ProjectAgentBinding 模式额外传：
+  --require-receipt --binding-id <id> --agent-id <id> --harness-kind <kind>
+  --wake-mode <visible_session|external_worker> --adapter-id <id>
+  --project <absolute-project> --capability <capability>
+  [--reservation-id <id> --task-id <id> --reservation-expires-at <ms>]
+
 陌生 Agent 子命令契约：
   - stdin 只收到一行 ${WORKER_WAKE_PROTOCOL} JSON：
-    { protocol, biaoUrl, slotId, selector: { kind, model, planIds } }
+    { protocol, biaoUrl, slotId, binding, selector: { kind, model, planIds },
+      reservation? }
+  - binding 与 reservation 的字段一律 snake_case（binding_id、harness_kind、
+    reservation_id 等），与 HTTP API 及 ProjectAgentBinding 类型保持一致。
   - 门铃不包含任务详情或凭据；子命令必须通过本机授权的 Biao CLI 自行领取。
   - BIAO_RUNTIME_DIR（如配置）只用于定位本机 CLI；不会转交其他 BIAO_* 环境变量。
   - 子命令返回 0 表示本轮正常；非零表示 Supervisor 应在下一轮重试。
+  - 带 reservation 唤醒时，成功回执必须原样回带 task_id 与 reservation_id。
   - --command 是单个可执行文件。需要参数时请使用本地包装脚本，路径可以包含空格。
 
 环境变量等价项：
@@ -85,11 +95,21 @@ function optionValues(argv) {
     '--command',
     '--runtime-dir',
     '--lock-dir',
+    '--binding-id',
+    '--agent-id',
+    '--harness-kind',
+    '--wake-mode',
+    '--adapter-id',
+    '--project',
+    '--capability',
+    '--reservation-id',
+    '--task-id',
+    '--reservation-expires-at',
   ]);
 
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === '--once') continue;
+    if (arg === '--once' || arg === '--require-receipt') continue;
     if (!valueFlags.has(arg)) throw configError(`未知参数：${arg}（使用 --help 查看用法）`);
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw configError(`${arg} 需要一个值`);
@@ -180,11 +200,45 @@ export function readOptions(argv, env = process.env) {
   const lockDir = (single.get('--lock-dir') ?? env.BIAO_WORKER_AGENT_LOCK_DIR ?? tmpdir()).trim();
   if (!lockDir) throw configError('--lock-dir 不能为空');
 
-  return { biaoUrl, slotId, kind, model, planIds, command, runtimeDir, lockDir };
+  const requireReceipt = argv.includes('--require-receipt');
+  let projectAgent;
+  if (requireReceipt) {
+    const wakeMode = single.get('--wake-mode')?.trim();
+    if (!['visible_session', 'external_worker'].includes(wakeMode)) {
+      throw configError('--wake-mode 必须是 visible_session 或 external_worker');
+    }
+    const project = single.get('--project')?.trim() ?? '';
+    if (!isAbsolute(project) || /[\u0000\r\n]/.test(project)) throw configError('--project 必须是安全绝对路径');
+    projectAgent = {
+      bindingId: validateSelector(single.get('--binding-id'), 'bindingId'),
+      agentId: validateSelector(single.get('--agent-id'), 'agentId'),
+      harnessKind: validateSelector(single.get('--harness-kind'), 'harnessKind'),
+      wakeMode,
+      adapterId: validateSelector(single.get('--adapter-id'), 'adapterId'),
+      project,
+      capability: validateSelector(single.get('--capability'), 'capability'),
+    };
+    // reservation 三参必须同给或同缺：半截状态无法构成可回带的唤醒载荷。
+    const reservationId = validateSelector(single.get('--reservation-id'), 'reservationId', { optional: true });
+    const taskId = validateSelector(single.get('--task-id'), 'taskId', { optional: true });
+    const expiresAtRaw = single.get('--reservation-expires-at')?.trim() ?? '';
+    if (reservationId || taskId || expiresAtRaw) {
+      if (!reservationId || !taskId) {
+        throw configError('--reservation-id、--task-id 与 --reservation-expires-at 必须同时提供');
+      }
+      const expiresAt = Number(expiresAtRaw || Number.NaN);
+      if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+        throw configError('--reservation-expires-at 必须是正整数毫秒时间戳');
+      }
+      projectAgent.reservation = { reservationId, taskId, expiresAt };
+    }
+  }
+
+  return { biaoUrl, slotId, kind, model, planIds, command, runtimeDir, lockDir, requireReceipt, projectAgent };
 }
 
 export function buildWakePayload(options) {
-  return {
+  const payload = {
     protocol: WORKER_WAKE_PROTOCOL,
     biaoUrl: options.biaoUrl,
     slotId: options.slotId,
@@ -193,6 +247,96 @@ export function buildWakePayload(options) {
       model: options.model,
       planIds: options.planIds,
     },
+  };
+  if (options.projectAgent) {
+    // binding 一律 snake_case，与 HTTP API 及 ProjectAgentBinding 类型一致；
+    // 适配器侧不再需要任何 camelCase 分支（2026-08-15 前的 camelCase 载荷已废弃）。
+    payload.binding = {
+      binding_id: options.projectAgent.bindingId,
+      agent_id: options.projectAgent.agentId,
+      harness_kind: options.projectAgent.harnessKind,
+      wake_mode: options.projectAgent.wakeMode,
+      adapter_id: options.projectAgent.adapterId,
+    };
+    payload.selector.project = options.projectAgent.project;
+    payload.selector.capability = options.projectAgent.capability;
+    if (options.projectAgent.reservation) {
+      payload.reservation = {
+        reservation_id: options.projectAgent.reservation.reservationId,
+        task_id: options.projectAgent.reservation.taskId,
+        expires_at: options.projectAgent.reservation.expiresAt,
+      };
+    }
+  }
+  return payload;
+}
+
+const SAFE_RECEIPT_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const SAFE_SESSION_REF = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const CREDENTIAL_MARKERS = [
+  'authorization', 'bearer', 'biao_api_token', 'cookie', 'access_token', 'api_token', 'token', 'password', 'secret',
+];
+
+function containsCredential(value) {
+  const normalized = value.toLowerCase();
+  return CREDENTIAL_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function safeVisibleUrl(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value !== value.trim() || /[\u0000-\u001f\u007f\\]/u.test(value)
+      || value.startsWith('//') || containsCredential(value)) return undefined;
+  try {
+    if (value.startsWith('/')) {
+      const parsed = new URL(value, 'https://biao.invalid');
+      return parsed.origin === 'https://biao.invalid' && !parsed.search && !parsed.hash ? parsed.pathname : undefined;
+    }
+    const parsed = new URL(value);
+    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password
+      && !parsed.search && !parsed.hash ? parsed.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function normalizeAdapterReceipt(value, options) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !options.projectAgent) return undefined;
+  if (value.protocol !== WORKER_WAKE_PROTOCOL || value.ok !== true
+      || value.adapter_id !== options.projectAgent.adapterId
+      || value.harness_kind !== options.projectAgent.harnessKind
+      || value.wake_mode !== options.projectAgent.wakeMode
+      || typeof value.registration_id !== 'string' || !SAFE_RECEIPT_ID.test(value.registration_id)) return undefined;
+  // reservation 回带规则：worker-agent 与 supervisor 的终校验保持同一条规则——
+  // “带 reservation 的唤醒必须收到原样回带的 task_id/reservation_id”。这里选择
+  // 在 worker-agent 层透传（并先校验一次），而不是放宽 supervisor 的终校验，理由：
+  // 1) reservation 是重启栅栏的 attempt_id 来源，两层独立校验能尽早拒绝串扰回执
+  //    （例如适配器把别的任务的 task_id 带回来），坏回执不会进入 supervisor 进程；
+  // 2) 适配器契约保持唯一（“提供了 reservation 就必须原样回带”），外部实现者
+  //    不需要理解“哪些模式下可以省略”的例外分支；
+  // 3) 安全规则不放松：回带的字段值本身来自经 validateSelector 校验的 argv，
+  //    不可能携带凭据或控制字符。
+  if (options.projectAgent.reservation
+      && (value.task_id !== options.projectAgent.reservation.taskId
+        || value.reservation_id !== options.projectAgent.reservation.reservationId)) return undefined;
+  const sessionRef = value.session_ref === undefined
+    ? undefined
+    : typeof value.session_ref === 'string' && SAFE_SESSION_REF.test(value.session_ref) && !containsCredential(value.session_ref)
+      ? value.session_ref
+      : undefined;
+  const visibleUrl = safeVisibleUrl(value.visible_url);
+  if ((value.session_ref !== undefined && !sessionRef) || (value.visible_url !== undefined && !visibleUrl)) return undefined;
+  return {
+    protocol: WORKER_WAKE_PROTOCOL, ok: true,
+    adapter_id: options.projectAgent.adapterId,
+    registration_id: value.registration_id,
+    harness_kind: options.projectAgent.harnessKind,
+    wake_mode: options.projectAgent.wakeMode,
+    ...(options.projectAgent.reservation ? {
+      task_id: options.projectAgent.reservation.taskId,
+      reservation_id: options.projectAgent.reservation.reservationId,
+    } : {}),
+    ...(sessionRef ? { session_ref: sessionRef } : {}),
+    ...(visibleUrl ? { visible_url: visibleUrl } : {}),
   };
 }
 
@@ -277,7 +421,7 @@ export async function runWorkerAgent(options) {
   try {
     child = spawn(locker.executable, [...locker.args, options.command], {
       env: childEnvironment(options),
-      stdio: ['pipe', 'inherit', 'inherit', lockFd],
+      stdio: ['pipe', options.requireReceipt ? 'pipe' : 'inherit', 'inherit', lockFd],
     });
   } catch (error) {
     closeSync(lockFd);
@@ -289,6 +433,14 @@ export async function runWorkerAgent(options) {
   // 不能让未监听的 stream error 把唤醒器异常终止为 1。
   child.stdin.once('error', () => undefined);
   child.stdin.end(payload);
+  let stdout = '';
+  if (options.requireReceipt) {
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 64 * 1024) child.kill('SIGTERM');
+    });
+  }
   const result = await new Promise((resolve) => {
     child.once('error', (error) => resolve({ error, code: null, signal: null }));
     child.once('close', (code, signal) => resolve({ error: null, code, signal }));
@@ -300,6 +452,21 @@ export async function runWorkerAgent(options) {
   if (result.code !== 0) {
     console.error(`[biao-worker-agent] Worker 命令退出码 ${result.code ?? 'unknown'}${result.signal ? `（${result.signal}）` : ''}，等待 Supervisor 重试`);
     return EXIT_RETRY;
+  }
+  if (options.requireReceipt) {
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    let rawReceipt;
+    try {
+      rawReceipt = lines.length === 1 ? JSON.parse(lines[0]) : undefined;
+    } catch {
+      rawReceipt = undefined;
+    }
+    const receipt = normalizeAdapterReceipt(rawReceipt, options);
+    if (!receipt) {
+      console.error('[biao-worker-agent] Adapter 未返回唯一且安全的成功回执，唤醒失败。');
+      return EXIT_RETRY;
+    }
+    process.stdout.write(`${JSON.stringify(receipt)}\n`);
   }
   return 0;
 }
