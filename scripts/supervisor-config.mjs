@@ -29,7 +29,8 @@ function usage() {
 用法：
   biao-supervisor-config --config /absolute/runtime/config.env [--dry-run] worker add \\
     --id <agent-id> --kind <codex|kimi|custom|cli> --project <absolute-path> --types <a,b> \\
-    [--command <command>] [--model <model>] [--agent-type <type>]
+    [--command <command>] [--model <model>] [--agent-type <type>] \\
+    [[--binding-id <id>] --harness-kind <kind> --wake-mode <visible_session|background_executor|external_worker> --adapter-id <id>]
   biao-supervisor-config --config /absolute/runtime/config.env worker remove --id <agent-id>
   biao-supervisor-config --config /absolute/runtime/config.env worker list
 
@@ -272,6 +273,7 @@ function validateSlots(role, slots) {
 function buildWorkerSlot(args) {
   const options = parseOptions(args, new Set([
     '--id', '--kind', '--project', '--types', '--command', '--model', '--agent-type',
+    '--binding-id', '--harness-kind', '--wake-mode', '--adapter-id',
   ]));
   const agentId = safeId(required(options, '--id'), 'Worker id');
   const kind = required(options, '--kind');
@@ -291,11 +293,19 @@ function buildWorkerSlot(args) {
   const command = options.get('--command');
   const model = options.get('--model');
   const agentType = options.get('--agent-type');
+  const bindingId = options.get('--binding-id');
+  const harnessKind = options.get('--harness-kind');
+  const wakeMode = options.get('--wake-mode');
+  const adapterId = options.get('--adapter-id');
+  if (wakeMode !== undefined && !['visible_session', 'background_executor', 'external_worker'].includes(wakeMode)) {
+    throw new Error('--wake-mode 必须是 visible_session、background_executor 或 external_worker');
+  }
+  const harnessOwned = wakeMode === 'visible_session' || wakeMode === 'external_worker';
   if (command !== undefined) {
-    if (!['custom', 'cli'].includes(kind)) throw new Error('--command 仅适用于 custom/cli Worker');
+    if (!['custom', 'cli'].includes(kind) && !harnessOwned) throw new Error('--command 仅适用于 custom/cli 或 harness-owned Worker');
     slot.command = oneLine(command.trim(), '--command');
   }
-  if (['custom', 'cli'].includes(kind) && !slot.command) {
+  if ((['custom', 'cli'].includes(kind) || harnessOwned) && !slot.command) {
     throw new Error('custom/cli Worker 必须显式提供 --command，不能把缺少执行器的 slot 写入共用 Supervisor');
   }
   if (model !== undefined) {
@@ -304,6 +314,20 @@ function buildWorkerSlot(args) {
     else throw new Error('--model 当前仅适用于 kimi/custom/cli Worker');
   }
   if (agentType !== undefined) slot.agentType = safeId(agentType.trim(), '--agent-type');
+  const harnessFields = [harnessKind, wakeMode, adapterId];
+  if (harnessFields.some((value) => value !== undefined) && harnessFields.some((value) => value === undefined)) {
+    throw new Error('harness 心跳 slot 必须同时提供 --harness-kind、--wake-mode 和 --adapter-id');
+  }
+  if (harnessFields.every((value) => value !== undefined)) {
+    if (bindingId !== undefined) slot.bindingId = safeId(bindingId.trim(), '--binding-id');
+    slot.harnessKind = safeId(harnessKind.trim(), '--harness-kind');
+    slot.wakeMode = wakeMode;
+    slot.adapterId = safeId(adapterId.trim(), '--adapter-id');
+  } else if (bindingId !== undefined) {
+    // background 执行 slot 也允许只带 --binding-id 联动 biao-agent-join 建的绑定；
+    // harnessKind/adapterId/wakeMode 由 supervisor 加载时按 agent 类型补默认值。
+    slot.bindingId = safeId(bindingId.trim(), '--binding-id');
+  }
   return slot;
 }
 

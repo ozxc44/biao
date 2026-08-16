@@ -582,4 +582,8 @@ main()
   .catch((error) => {
     console.error(`[pm-agent] ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
-  });
+  })
+  // main() 的 finally 已释放内核锁。锁 holder 的 stdin/ack pipe 仍保持打开，
+  // 会让事件循环在业务结束后继续空转，导致 pm-agent 在 adapter 树已回收后仍
+  // 残留在进程表里（直到外部 SIGKILL）。业务结束即主动退出，避免残留进程。
+  .finally(() => process.exit(process.exitCode));

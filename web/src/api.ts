@@ -169,6 +169,65 @@ export interface PlanData {
   };
 }
 
+export type ProjectAgentWakeMode = 'visible_session' | 'background_executor' | 'external_worker';
+export type ProjectAgentBindingPolicy = 'manual' | 'on_demand' | 'automatic';
+export type ProjectAgentAvailabilityStatus =
+  | 'online_registered'
+  | 'bound_wakeable'
+  | 'background_only'
+  | 'manual_required';
+export type ExecutionReceiptStatus = 'requested' | 'succeeded' | 'failed';
+
+export interface ProjectAgentBindingData {
+  binding_id: string;
+  project_scope: string;
+  agent_id: string;
+  label: string;
+  harness_kind: string;
+  capabilities: string[];
+  wake_mode: ProjectAgentWakeMode;
+  policy: ProjectAgentBindingPolicy;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProjectAgentBoundRosterItem extends ProjectAgentBindingData {
+  availability_status: Exclude<ProjectAgentAvailabilityStatus, 'online_registered'>;
+  online_registered: boolean;
+}
+
+export interface ProjectAgentOnlineCandidateData {
+  agent_id: string;
+  label: string;
+  harness_kind: string;
+  capabilities: string[];
+  project_scope: string;
+  registered_projects: string[];
+  availability_status: 'online_registered';
+}
+
+export interface ExecutionReceiptData {
+  attempt_id: string;
+  task_id: string;
+  project_scope: string;
+  binding_id: string;
+  agent_id: string;
+  harness_kind: string;
+  wake_mode: ProjectAgentWakeMode;
+  adapter_id: string | null;
+  status: ExecutionReceiptStatus;
+  started_at: number;
+  session_ref?: string;
+  visible_url?: string;
+}
+
+export interface ProjectAgentRosterData {
+  project_scope: string;
+  bound_agents: ProjectAgentBoundRosterItem[];
+  online_candidates: ProjectAgentOnlineCandidateData[];
+  receipts: ExecutionReceiptData[];
+}
+
 interface ApiResponse<T> {
   ok: boolean;
   data: T | null;
@@ -179,6 +238,32 @@ export interface HumanSessionData {
   authenticated: boolean;
   mode: 'local_owner' | 'auth_disabled' | string;
   local_session_available: boolean;
+}
+
+/** 方案 E：远程人类 Cookie 会话状态（GET /auth/human-session；不回传 token）。 */
+export interface HumanWebSessionStatus {
+  authenticated: boolean;
+  /** 远程登录是否可用（服务配置了 SQLite 持久化 + bvh2 密钥环）。 */
+  available?: boolean;
+  /** Cookie 存在但已过期时为 true（登录页提示重新申领登录码）。 */
+  expired?: boolean;
+  subject?: string;
+  role?: string;
+  project_id?: string;
+  session_id?: string;
+  expires_at?: number;
+}
+
+/** 方案 E：enrollment code 换取的远程会话（主通道是 HttpOnly Cookie）。 */
+export interface HumanWebSessionCreated extends HumanWebSessionStatus {
+  authenticated: true;
+  subject: string;
+  role: string;
+  project_id: string;
+  session_id: string;
+  expires_at: number;
+  /** 备用通道：token 同时出现在响应体（前端默认不存储，Cookie 是唯一凭据载体）。 */
+  token: string;
 }
 
 function clearLegacyBrowserToken(): void {
@@ -209,9 +294,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return body.data as T;
 }
 
-async function publicSessionRequest(url: string, init?: RequestInit): Promise<HumanSessionData> {
+async function publicSessionRequest<T = HumanSessionData>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { ...init, credentials: 'same-origin' });
-  const body = (await res.json()) as ApiResponse<HumanSessionData>;
+  const body = (await res.json()) as ApiResponse<T>;
   if (!res.ok || !body.ok || !body.data) {
     throw new Error(body.error ? `${body.error.code}: ${body.error.message}` : `HTTP ${res.status}: ${url}`);
   }
@@ -234,6 +319,39 @@ export function endLocalOwnerSession(): Promise<HumanSessionData> {
   return publicSessionRequest('/auth/local-session', { method: 'DELETE' });
 }
 
+/* ---------------- 方案 E：远程人类 Cookie 会话（enrollment code 登录） ---------------- */
+
+/** 查询当前远程会话状态；登录页据此决定展示本机入口还是登录码输入。 */
+export function getHumanSessionStatus(): Promise<HumanWebSessionStatus> {
+  return publicSessionRequest('/auth/human-session');
+}
+
+/** 用一次性 enrollment code 登录；成功后服务端写入 HttpOnly Cookie。 */
+export async function humanLogin(username: string, password: string): Promise<HumanWebSessionCreated> {
+  const res = await fetch('/auth/human-login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ username, password }),
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error?.code ?? 'LOGIN_FAILED');
+  return json.data;
+}
+
+export function createHumanSession(enrollmentCode: string): Promise<HumanWebSessionCreated> {
+  return publicSessionRequest<HumanWebSessionCreated>('/auth/human-session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enrollment_code: enrollmentCode }),
+  });
+}
+
+/** 登出：清除 Cookie 并吊销 human_sessions（服务端即时生效）。 */
+export function deleteHumanSession(): Promise<{ authenticated: boolean }> {
+  return publicSessionRequest('/auth/human-session', { method: 'DELETE' });
+}
+
 /** GET /status → 全局任务计数、plan 列表、agent 列表 */
 export async function fetchStatus(): Promise<StatusData> {
   return request<StatusData>('/status');
@@ -242,6 +360,38 @@ export async function fetchStatus(): Promise<StatusData> {
 /** GET /plan/:id → plan 详情 + 按状态分桶的任务列表 */
 export async function fetchPlan(planId: string): Promise<PlanData> {
   return request<PlanData>(`/plan/${encodeURIComponent(planId)}`);
+}
+
+function projectScopedUrl(path: string, projectScope: string): string {
+  const query = new URLSearchParams({ project_scope: projectScope });
+  return `${path}?${query.toString()}`;
+}
+
+/** 项目 Agent roster 是项目作用域投影，不复用首页的全局在线 Agent 列表。 */
+export function fetchProjectAgentRoster(projectScope: string): Promise<ProjectAgentRosterData> {
+  return request<ProjectAgentRosterData>(projectScopedUrl('/project/agent-roster', projectScope));
+}
+
+/** 普通项目页面的一键加入入口；策略、能力和唤醒模式由服务端从在线注册补全。 */
+export function connectProjectAgent(
+  projectScope: string,
+  agentId: string,
+): Promise<ProjectAgentBindingData> {
+  return request<ProjectAgentBindingData>('/project/agent-connections', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_scope: projectScope, agent_id: agentId }),
+  });
+}
+
+export function deleteProjectAgentBinding(
+  projectScope: string,
+  bindingId: string,
+): Promise<{ binding_id: string; deleted: true }> {
+  return request<{ binding_id: string; deleted: true }>(
+    projectScopedUrl(`/project/agent-bindings/${encodeURIComponent(bindingId)}`, projectScope),
+    { method: 'DELETE' },
+  );
 }
 
 export interface CreatePlanRequest {

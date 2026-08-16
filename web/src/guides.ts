@@ -17,6 +17,26 @@ ${t('connection.pmSteps')}
 .biao/pm plan create <plan-id> --project <project-path> --title "<title>"
 \`\`\`
 
+## ${t('connection.mcpSectionTitle')}
+
+${t('connection.mcpConfigIntro')}
+
+\`\`\`json
+{
+  "mcpServers": {
+    "biao": {
+      "command": "biao-mcp",
+      "args": [],
+      "env": { "BIAO_URL": "${serviceOrigin}", "BIAO_API_TOKEN": "<token>" }
+    }
+  }
+}
+\`\`\`
+
+${t('connection.mcpTokenHint')}
+
+${t('connection.pmMcpHint')}
+
 ${t('connection.security')}`;
 }
 
@@ -34,13 +54,46 @@ export function buildWorkerConnectionGuide(
 - ${t('projectList.copyGuidePlanId')}：${plan.planId}
 - ${t('projectList.copyGuideProjectPath')}：${plan.projectPath}
 
+## ${t('connection.mcpSectionTitle')}
+
+${t('connection.mcpConfigIntro')}
+
+\`\`\`json
+{
+  "mcpServers": {
+    "biao": {
+      "command": "biao-mcp",
+      "args": [],
+      "env": { "BIAO_URL": "${serviceOrigin}", "BIAO_API_TOKEN": "<token>" }
+    }
+  }
+}
+\`\`\`
+
+${t('connection.mcpTokenHint')}
+
+${t('connection.mcpToolsHint')}
+
+## ${t('connection.cliSectionTitle')}
+
 \`\`\`bash
-# 推荐：登记一个 Worker slot，由共享 Supervisor 只处理当前 Plan。
+# 第 1 步：一条命令完成注册 + 自动绑定项目 + Worker Token 落盘。
+# 无需再到网页控制台重复添加绑定；输出会打印 binding_id，供第 2 步使用。
+# --wake-mode background_executor 匹配"由本机 Supervisor 直接执行"的 Worker。
+biao-agent-join \\
+  --agent-id <unique-agent-id> \\
+  --agent-type codex \\
+  --capabilities code,docs,review,acceptance \\
+  --project-scope ${projectPath} \\
+  --wake-mode background_executor
+
+# 第 2 步：为共享 Supervisor 登记执行 slot，并用第 1 步输出的 binding_id 联动（绑定道与执行 slot 精确配对）。
 .biao/supervisor-config worker add \\
   --id <unique-agent-id> \\
   --kind codex \\
   --project ${projectPath} \\
-  --types code,docs,review,acceptance
+  --types code,docs,review,acceptance \\
+  --binding-id <第1步输出的binding_id>
 .biao/supervisor --plans ${planId}
 \`\`\`
 

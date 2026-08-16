@@ -16,7 +16,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { runWorkerLoop, runAgentCli, type WorkerConfig } from './base.js';
-import type { ClaimedTask } from '../types/index.js';
+import type { ClaimedTask, ProjectAgentWakeMode } from '../types/index.js';
 import { buildQuestionResumeContext } from '../communication/question-context.js';
 import { atomicWriteWorkerArtifact, secureTaskWorkDir } from './artifact-security.js';
 
@@ -40,6 +40,25 @@ export function resolveCliInvocation(execCmd: string): { command: string; args: 
   }
   const [command, ...args] = execCmd.split(/\s+/);
   return { command, args };
+}
+
+export interface BindingCliInvocationOptions {
+  wakeMode: ProjectAgentWakeMode;
+  command: string;
+  taskId: string;
+  goalFile: string;
+  workDir: string;
+}
+
+/** Background executors receive the already-claimed task argv; harness-owned modes receive none. */
+export function resolveBindingCliInvocation(options: BindingCliInvocationOptions): { command: string; args: string[] } {
+  const invocation = resolveCliInvocation(options.command);
+  return {
+    command: invocation.command,
+    args: options.wakeMode === 'background_executor'
+      ? [...invocation.args, options.taskId, options.goalFile, options.workDir]
+      : invocation.args,
+  };
 }
 
 /** 可被共享 Supervisor 复用的通用执行器 slot。 */
@@ -79,9 +98,10 @@ export function createCliWorkerConfig(overrides: CliWorkerOptions = {}): WorkerC
 
       // 已存在的绝对可执行路径保持完整，支持陌生 Agent 适配器位于带空格目录；
       // 固定参数优先使用独立 args 数组。其它值继续兼容旧的简单命令串。
-      const { command, args: baseArgs } = resolveCliInvocation(execCmd);
-      // 传 3 个参数：task_id, goal_md_file, work_dir
-      const args = [...baseArgs, task.task_id, goalMdPath, workDir];
+      const { command, args } = resolveBindingCliInvocation({
+        wakeMode: 'background_executor', command: execCmd,
+        taskId: task.task_id, goalFile: goalMdPath, workDir,
+      });
 
       console.log(`[cli-worker] 执行：${command} ${args.join(' ')}`);
 

@@ -35,7 +35,18 @@ jobs:
       RUNTIME_RECONCILE_TEST_REDIS_URL: redis://127.0.0.1:6379/10
       STATUS_PROJECTION_TEST_REDIS_URL: redis://127.0.0.1:6379/11
       AGENT_EPOCH_TEST_REDIS_URL: redis://127.0.0.1:6379/12
+      MCP_LAN_TEST_REDIS_URL: redis://127.0.0.1:6379/13
       BLOCKING_CLAIM_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      P0A2_REGISTRY_TEST_REDIS_URL: redis://127.0.0.1:6379/13
+      P0A2_PARITY_TEST_REDIS_URL: redis://127.0.0.1:6379/13
+      P1_CREDENTIALS_TEST_REDIS_URL: redis://127.0.0.1:6379/13
+      P11_TEST_REDIS_URL: redis://127.0.0.1:6379/13
+      P9R_TEST_REDIS_URL: redis://127.0.0.1:6379/13
+      BIAO_TEST_REDIS_PORT: '6379'
+      OWNERSHIP_GLOB_REDIS_URL: redis://127.0.0.1:6379/14
+      PLAN_REVISE_CAS_REDIS_URL: redis://127.0.0.1:6379/14
+      PROJECT_AGENT_RESERVATION_REDIS_URL: redis://127.0.0.1:6379/14
+      BIAO_DISTRIBUTED_TEST_REDIS_URL: redis://127.0.0.1:6379/14
 
     steps:
       - name: Checkout
@@ -60,6 +71,9 @@ jobs:
         run: |
           npm audit --workspaces=false --audit-level=high
           npm --prefix web audit --workspaces=false --audit-level=high
+
+      - name: Build web console (pre-test)
+        run: npm --prefix web run build
 
       - name: Test server and CLI
         run: npm test -- --reporter=verbose

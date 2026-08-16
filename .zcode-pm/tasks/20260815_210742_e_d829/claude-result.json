@@ -1,0 +1,53 @@
+{
+  "is_error": false,
+  "duration_api_ms": 175614,
+  "num_turns": 38,
+  "stop_reason": "end_turn",
+  "session_id": "b731abf3-48db-40ca-b33a-13f29ba933e5",
+  "total_cost_usd": 2.223299,
+  "usage": {
+    "input_tokens": 163960,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 1674368,
+    "output_tokens": 21988,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "deepseek-v4-flash": {
+      "inputTokens": 165858,
+      "outputTokens": 22273,
+      "cacheReadInputTokens": 1674368,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 2.223299,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "canonicalModel": "deepseek-v4-flash",
+      "provider": "firstParty"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "## 交付总结\n\n### 变更文件\n\n| 文件 | 变更 |\n|---|---|\n| `docs/mcp.md` | 整篇重写，按真实 LAN stdio 架构组织（定位与 CLI 分工表、两种部署形态、客户端 JSON 配置、13 工具清单表、安全模型、中央 HTTP MCP 推迟原因、实现文件索引） |\n| `README.md` | 重写 \"## MCP 接口（AI Agent 优先入口）\" 段落（去掉 `/mcp` 端点与 MCP token 说法，改为 LAN stdio 适配器 + `BIAO_URL`/`BIAO_API_TOKEN`，指向 docs/mcp.md）；修正文档索引表中 MCP 一行的描述 |\n| `README.en.md` | **未改动**——检查后确认无 MCP 接口段落，仅有代码示例中无关的 \"MCP route\" 字样 |\n\n### 验证\n\n- **权威测试通过**：`MCP_LAN_TEST_REDIS_URL=\"redis://127.0.0.1:6380/15\" npx vitest run tests/mcp-lan-adapter.test.ts` → 5/5 通过（含 CAS 唯一 claim 赢家、零凭据泄漏、fail-closed、stdio 进程输出干净、中央 MCP 路径 404）。\n- **验收标准逐项核对**：\n  1. `docs/mcp.md` 全文无 \"POST /mcp\"、\"MCP token\"、\"BIAO_MCP_TOKEN\"（grep 通过）；`README.md` 同步无。\n  2. 工具清单 13 个与 `src/mcp/tools.ts` 的 `name:` 列表逐一相等（脚本比对通过）。\n  3. 环境变量名与代码一致：`BIAO_URL` / `BIAO_API_TOKEN` / `BIAO_MCP_TIMEOUT_MS`（与 `src/mcp/runtime.ts` 一致）。\n  4. 交付说明附\"断言↔出处\"核对表（见下）。\n\n### 断言 ↔ 出处核对表（交付物）\n\n| 文档断言 | 源码出处 |\n|---|---|\n| serverInfo 名称 = `biao-lan-mcp` | `src/mcp/session.ts` 的 `MCP_SERVER_NAME` |\n| 入口 `scripts/mcp-server.mjs` → `dist/mcp/stdio.js` | `scripts/mcp-server.mjs`（import `../dist/mcp/stdio.js`） |\n| `bin/biao-mcp` 等价入口；npm 命令 `biao-mcp` | `bin/biao-mcp.js`；`package.json` 的 `bin.biao-mcp` |\n| `createLanMcpRuntime` 要求 `BIAO_URL` + `BIAO_API_TOKEN` | `src/mcp/runtime.ts` |\n| `BIAO_MCP_TIMEOUT_MS` 可选、默认 10000、须为 10..60000 整数 | `src/mcp/runtime.ts`（`configuredTimeout`） |\n| stdio 不监听端口、stdout 只出 JSON-RPC、日志走 stderr | `src/mcp/stdio.ts`（`startMcpStdio` 无 `listen`）；`tests/mcp-lan-adapter.test.ts` 断言 |\n| 中央 Streamable HTTP MCP 为空插件、不注册路由 | `src/mcp/http-route.ts`；`src/server/http.ts` 装配点注释 |\n| 中央 MCP 路径返回 404 | `tests/mcp-lan-adapter.test.ts` |\n| 13 个工具名称与 HTTP 语义 | `src/mcp/tools.ts` 各 handler 的 `runtime.client.request(path)` |\n| 验收只读（无 review accept/reject/write） | `src/mcp/tools.ts` 工具注册表 + `tests/mcp-lan-adapter.test.ts` 断言 |\n| claim 回执只在进程内保管、协议输出剥离 claim_token/project_path/verify | `src/mcp/runtime.ts`（`rememberClaim`/`claimToken`）+ `src/mcp/tools.ts`（`smallMetadata`/`task_claim`） |\n| 输出脱敏键集合（cmd/output/goal_md 等） | `src/mcp/tools.ts` 的 `omittedMetadataKeys` |\n| `pm_review_read` 过滤绝对路径、产出 `verify_summary`/`result_ref` | `src/mcp/tools.ts` 的 `pm_review_read` handler |\n| fail-closed 7 种错误码 | `src/mcp/client.ts`（`BiaoRemoteError` + `rawRequest`） |\n| 错误 details 中 token 替换为 `[REDACTED]` | `src/mcp/client.ts` 的 `scrubSecret` |\n| health 校验 `data.version === 'v1'` | `src/mcp/client.ts` 的 `verifyProtocol` |\n\n### 残余风险\n\n- `docs/mcp.md` 在 git 中为未跟踪文件（`??`），是并行实现线新落盘的产物；重写后仍需编排层将其纳入提交。\n- `README.md` 工作区还含其他任务线留下的未提交改动（\"被动事件中枢\"\"被动式 PM 轮询\"等段落），本次未触碰，但提交时会一并带上，评审需知悉。\n- `bin/biao-mcp.js` 与 `scripts/mcp-server.mjs` 都依赖 `dist/mcp/stdio.js`，使用前需先 `npm run build`（文档配置示例默认走仓库内源码入口，与现有 Worker/CLI 用法一致）。\n- 文档中\"对应 HTTP 语义\"一列依据 `tools.ts` handler 的请求路径整理，已由通过的 `tests/mcp-lan-adapter.test.ts` 佐证，但属间接映射，后续若改路径需同步更新文档。",
+  "ttft_ms": 3103,
+  "ttft_stream_ms": 385,
+  "time_to_request_ms": 23,
+  "type": "result",
+  "duration_ms": 173608,
+  "uuid": "e47edd43-5139-43dc-a291-eee386fe0d2a"
+}

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join, parse } from 'node:path';
+import { delimiter, join, parse } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
@@ -311,6 +311,19 @@ describe('clone 后自举配置', () => {
     expect(guide).toContain('不自动 review、answer 或 ack');
     expect(guide).toContain('不自动安装 cron 或 launchd');
     expect(guide).toContain('done 不等于 accepted');
+    expect(guide).toContain('首波目标 3–4 条互不重叠的实现 lane');
+    expect(guide).toContain('lane ID、硬依赖、ownership、交付物、验证命令和验收者');
+    expect(guide).toContain('真实消费者');
+    expect(guide).toContain('同 phase、同里程碑或同优先级都不是依赖理由');
+    expect(guide).toContain('fan-in 汇合点');
+    expect(guide).toContain('全局阶段栅栏');
+    expect(guide).toContain('只读分析与测试');
+    expect(guide).toContain('review、Question 和 stale');
+    expect(guide).toContain('Worker 数大于 runnable 数');
+    expect(guide).toContain('runnable 数大于 Worker 数');
+    expect(guide).toContain('48 个任务却只有 1 个首波 runnable 实现 lane');
+    expect(guide).toContain('不得提交该 DAG');
+    expect(guide).toContain('同一文件、模块或共享入口同时只能有一个写入者');
     expect(guide).toContain('旧 attempt 的失败证据不能冒充当前交付结果');
     expect(guide).toContain('`changed_files=[]` 不是自动拒绝条件');
     expect(guide).toContain('独立验收');
@@ -816,6 +829,81 @@ describe('clone 后自举配置', () => {
     expect(run.stdout).toContain('[optional] 未安装 codex');
   });
 
+  it.each(['Darwin', 'Linux'] as const)('doctor 在 %s 按系统路径分隔符逐一规范化并检查多个 workspace roots', async (osName) => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const firstRoot = join(root, 'workspace-one');
+    const secondRoot = join(root, 'workspace-two');
+    mkdirSync(firstRoot);
+    mkdirSync(secondRoot);
+    bootstrap({
+      repoRoot: root,
+      workspace: firstRoot,
+      project: firstRoot,
+      token: 'doctor-secret-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const configPath = join(root, '.biao', 'config.env');
+    const config = readFileSync(configPath, 'utf8').replace(
+      /^BIAO_WORKSPACE_ROOTS=.*$/m,
+      `BIAO_WORKSPACE_ROOTS=${shellSingleQuoted([firstRoot, secondRoot].join(delimiter))}`,
+    );
+    writeFileSync(configPath, config, { mode: 0o600 });
+    const fakeBin = makeControlledPath(root, osName);
+    writeExecutable(join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n');
+    writeExecutable(join(fakeBin, 'redis-cli'), '#!/bin/sh\nexit 0\n');
+
+    const run = spawnSync('/bin/sh', [join(root, '.biao', 'doctor')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: fakeBin },
+    });
+    const output = `${run.stdout}${run.stderr}`;
+
+    expect(run.status).toBe(0);
+    expect(output).toContain(`[ok] workspace: ${realpathSync(firstRoot)}`);
+    expect(output).toContain(`[ok] workspace: ${realpathSync(secondRoot)}`);
+    expect(output).not.toContain('doctor-secret-token');
+  });
+
+  it.each(['Darwin', 'Linux'] as const)('doctor 在 %s 精确报告多 root 中缺失的对应项', async (osName) => {
+    const { bootstrap } = await loadBootstrap();
+    const root = makeRoot();
+    const existingRoot = join(root, 'workspace-existing');
+    const missingRoot = join(root, 'workspace-missing', '..', 'workspace-missing');
+    mkdirSync(existingRoot);
+    bootstrap({
+      repoRoot: root,
+      workspace: existingRoot,
+      project: existingRoot,
+      token: 'doctor-secret-token',
+      skipInstall: true,
+      skipBuild: true,
+    });
+
+    const configPath = join(root, '.biao', 'config.env');
+    const config = readFileSync(configPath, 'utf8').replace(
+      /^BIAO_WORKSPACE_ROOTS=.*$/m,
+      `BIAO_WORKSPACE_ROOTS=${shellSingleQuoted([existingRoot, missingRoot].join(delimiter))}`,
+    );
+    writeFileSync(configPath, config, { mode: 0o600 });
+    const fakeBin = makeControlledPath(root, osName);
+    writeExecutable(join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n');
+    writeExecutable(join(fakeBin, 'redis-cli'), '#!/bin/sh\nexit 0\n');
+
+    const run = spawnSync('/bin/sh', [join(root, '.biao', 'doctor')], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: fakeBin },
+    });
+    const output = `${run.stdout}${run.stderr}`;
+
+    expect(run.status).toBe(1);
+    expect(output).toContain(`[ok] workspace: ${realpathSync(existingRoot)}`);
+    expect(output).toContain(`[missing] workspace 不存在：${join(root, 'workspace-missing')}`);
+    expect(output).not.toContain('doctor-secret-token');
+  });
+
   it('doctor 在 SQLite 原生驱动缺失或 ABI 不兼容时失败并给出修复入口', async () => {
     const { bootstrap } = await loadBootstrap();
     const root = makeRoot();
@@ -959,6 +1047,9 @@ describe('clone 后自举配置', () => {
     expect(start).toContain('scripts/supervisor.mjs');
     expect(start).toContain('BIAO_SUPERVISOR_INTERVAL');
     expect(start).toContain('BIAO_SUPERVISOR_RESTART_DELAY');
+    expect(start).toContain('BIAO_SERVER_RESTART_DELAY');
+    expect(start).toContain('Server 异常退出');
+    expect(start).toContain('while [ "$shutdown_requested" -eq 0 ]');
     expect(start.indexOf('wait "$supervisor_pid"')).toBeLessThan(start.indexOf('kill "$server_pid"'));
     expect(start).toContain('. "$SCRIPT_DIR/config.env"');
   });

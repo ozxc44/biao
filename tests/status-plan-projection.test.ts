@@ -78,8 +78,11 @@ async function failAfterCommittedMulti<T>(
   beforeCommit?: () => Promise<void>,
 ): Promise<{ hit: boolean; value?: T; error?: unknown }> {
   const originalMulti = target.multi;
+  const originalDuplicate = target.duplicate;
   let hit = false;
-  target.multi = function interceptMulti(...args: Parameters<Redis['multi']>) {
+  // planSubmit 等路径会在 duplicate() 出来的独立连接上做 WATCH+MULTI，
+  // 因此除了原连接，还要拦住复制连接上的第一个事务提交。
+  const interceptMulti = function interceptMulti(this: Redis, ...args: Parameters<Redis['multi']>) {
     const transaction = originalMulti.apply(this, args);
     if (hit) return transaction;
     const originalExec = transaction.exec.bind(transaction);
@@ -90,7 +93,13 @@ async function failAfterCommittedMulti<T>(
       throw new Error('injected_disconnect_after_redis_commit');
     }) as typeof transaction.exec;
     return transaction;
-  } as typeof target.multi;
+  };
+  target.multi = interceptMulti as typeof target.multi;
+  target.duplicate = function interceptedDuplicate(this: Redis, ...args: Parameters<Redis['duplicate']>) {
+    const duplicated = originalDuplicate.apply(this, args);
+    duplicated.multi = interceptMulti.bind(duplicated) as typeof duplicated.multi;
+    return duplicated;
+  } as typeof target.duplicate;
   try {
     const value = await operation();
     return { hit, value };
@@ -98,6 +107,7 @@ async function failAfterCommittedMulti<T>(
     return { hit, error };
   } finally {
     target.multi = originalMulti;
+    target.duplicate = originalDuplicate;
   }
 }
 

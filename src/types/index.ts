@@ -7,6 +7,112 @@ export type TaskType = 'code' | 'review' | 'research' | 'docs' | 'acceptance';
 export type TaskStatus = 'pending' | 'running' | 'blocked' | 'done' | 'failed' | 'cancelled' | 'superseded';
 export type Assignee = 'codex' | 'kimi' | 'mimo' | 'zcode' | 'auto' | string;
 export type AgentStatus = 'idle' | 'busy' | 'offline';
+export type ProjectAgentWakeMode = 'visible_session' | 'background_executor' | 'external_worker';
+export type ProjectAgentBindingPolicy = 'manual' | 'on_demand' | 'automatic';
+export type ProjectAgentAvailabilityStatus =
+  | 'online_registered'
+  | 'bound_wakeable'
+  | 'background_only'
+  | 'manual_required';
+export type ExecutionReceiptStatus = 'requested' | 'succeeded' | 'failed';
+
+/** 项目绑定是独立于 Agent 注册 epoch 的耐久控制面实体。 */
+export interface ProjectAgentBinding {
+  binding_id: string;
+  project_scope: string;
+  agent_id: string;
+  label: string;
+  harness_kind: string;
+  capabilities: string[];
+  wake_mode: ProjectAgentWakeMode;
+  policy: ProjectAgentBindingPolicy;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProjectAgentBindingCreateRequest {
+  binding_id?: string;
+  agent_id: string;
+  label: string;
+  harness_kind: string;
+  capabilities?: string[];
+  wake_mode: ProjectAgentWakeMode;
+  policy: ProjectAgentBindingPolicy;
+}
+
+/** 注册时随请求携带的自动绑定声明（精简字段，平台补全默认值）。 */
+export interface RegistrationProjectBinding {
+  project_scope: string;
+  wake_mode?: ProjectAgentWakeMode;
+  policy?: ProjectAgentBindingPolicy;
+}
+
+/** UI/HTTP 状态投影；不包含注册 epoch、endpoint、command 或 target。 */
+export interface ProjectAgentRosterItem extends Omit<ProjectAgentBinding, 'created_at' | 'updated_at'> {
+  availability_status: ProjectAgentAvailabilityStatus;
+  online_registered: boolean;
+}
+
+export interface ProjectAgentOnlineCandidate {
+  agent_id: string;
+  label: string;
+  harness_kind: string;
+  capabilities: string[];
+  project_scope: string;
+  /** Agent 当前注册声明的项目；只作名册信息，不限制 Owner 将它加入其它项目。 */
+  registered_projects: string[];
+  availability_status: 'online_registered';
+}
+
+/** SQLite 内部完整回执；registration_id 只用于耐久审计，不进入公共投影。 */
+export interface ExecutionReceiptRecord {
+  attempt_id: string;
+  task_id: string;
+  project_scope: string;
+  binding_id: string;
+  agent_id: string;
+  registration_id: string;
+  harness_kind: string;
+  wake_mode: ProjectAgentWakeMode;
+  adapter_id: string | null;
+  status: ExecutionReceiptStatus;
+  started_at: number;
+  session_ref?: string;
+  visible_url?: string;
+}
+
+export type ExecutionReceiptCreateRequest = Omit<ExecutionReceiptRecord, 'project_scope'>;
+
+export type PublicExecutionReceipt = Omit<ExecutionReceiptRecord, 'registration_id'>;
+
+/** 任务列表读视图（V1 service.ts → V2 domain-interfaces.ts 共享）。 */
+export interface TaskListItem {
+  task_id: string;
+  title: string;
+  type: string;
+  phase: string;
+  status: string;
+  assignee: string;
+  priority: number;
+  plan_id: string;
+  project_path: string;
+  pm_review_status?: string;
+  failure_reason?: string;
+  block_reason?: string;
+  fix_for?: string;
+  repair_root_task_id?: string;
+  resolution_status?: string;
+  resolution_action?: string;
+  resolution_task_id?: string;
+  resolution_task_ids?: string[];
+  resolved_by_task?: string;
+  resolution_generation?: number;
+  resolution_attempts?: number;
+  superseded_at?: number;
+  superseded_by?: string;
+  superseded_reason?: string;
+}
+
 /** 修复/复验根任务的完整生命周期；cancelled 是 PM 显式终止后的终态。 */
 export type ResolutionStatus = 'required' | 'repairing' | 'resolved' | 'needs_pm_decision' | 'cancelled';
 /** resolution 的执行方向与 PM 决策动作；continue 只用于显式多放行一代。 */

@@ -673,11 +673,26 @@ for optional_name in codex kimi; do
     echo "[optional] 未安装 $optional_name"
   fi
 done
-if [ ! -d "$BIAO_WORKSPACE_ROOTS" ]; then
-  echo "[missing] workspace 不存在：$BIAO_WORKSPACE_ROOTS" >&2
+if ! printf '%s' "$BIAO_WORKSPACE_ROOTS" | node -e '
+const { readFileSync, realpathSync, statSync } = require("node:fs");
+const { delimiter, resolve } = require("node:path");
+const roots = readFileSync(0, "utf8").split(delimiter).map((root) => root.trim()).filter(Boolean);
+let missing = roots.length === 0;
+if (missing) console.error("[missing] workspace roots 未配置");
+for (const root of roots) {
+  const normalized = resolve(root);
+  try {
+    const canonical = realpathSync(normalized);
+    if (!statSync(canonical).isDirectory()) throw new Error("not-directory");
+    console.log("[ok] workspace: " + canonical);
+  } catch {
+    console.error("[missing] workspace 不存在：" + normalized);
+    missing = true;
+  }
+}
+process.exitCode = missing ? 1 : 0;
+'; then
   failed=1
-else
-  echo "[ok] workspace: $BIAO_WORKSPACE_ROOTS"
 fi
 exit "$failed"`),
   );
@@ -729,7 +744,9 @@ printf '[biao] API Token 已配置（SHA-256 指纹末尾：…%s）。\n' "$fin
   );
   writeExecutable(join(setupDir, 'start'), runtimeWrapper(`server_pid=''
 supervisor_pid=''
+shutdown_requested=0
 shutdown() {
+  shutdown_requested=1
   # 先让 Supervisor 回收 PM/Worker 子进程树，再停止 API 服务。两者同时 TERM 会让
   # pm-agent 失去清理窗口，旧 adapter 可能短暂成为孤儿并与重启后的 PM 重复处理。
   if [ -n "$supervisor_pid" ]; then
@@ -757,10 +774,7 @@ rotate_log() {
 }
 rotate_log "$log_dir/server.log"
 rotate_log "$log_dir/supervisor.log"
-echo "[biao] 日志目录：$log_dir（server.log / supervisor.log）"
-
-node "$BIAO_PACKAGE_ROOT/dist/server/main.js" >> "$log_dir/server.log" 2>&1 &
-server_pid=$!
+echo "[biao] 日志目录：\${log_dir}（server.log / supervisor.log）"
 
 # 服务与共享 Supervisor 由同一个启动器托管：不再出现“服务健康、但没有任何单元
 # 负责发现门铃、恢复等待任务或启动已配置 Worker slot”的孤岛状态。Supervisor 在
@@ -769,23 +783,52 @@ server_pid=$!
 # 下面的正常退出分支不再触发，本循环只承担异常退出的短退避重启。
 # 如果 Supervisor 异常退出，则使用独立的短退避立即重启；Worker 完成后的下一项
 # 调度仍由未退出的同一 Supervisor 直接处理，不能因为一次 Worker 退出而丢失监视。
-while kill -0 "$server_pid" 2>/dev/null; do
-  node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" >> "$log_dir/supervisor.log" 2>&1 &
-  supervisor_pid=$!
-  supervisor_exit=0
-  wait "$supervisor_pid" || supervisor_exit=$?
-  supervisor_pid=''
-  kill -0 "$server_pid" 2>/dev/null || break
-  if [ "$supervisor_exit" -eq 0 ]; then
-    sleep "\${BIAO_SUPERVISOR_INTERVAL:-60}"
-  else
-    echo "[biao] Supervisor 异常退出（exit=\${supervisor_exit}）；\${BIAO_SUPERVISOR_RESTART_DELAY:-5}s 后自动重启。" >&2
-    sleep "\${BIAO_SUPERVISOR_RESTART_DELAY:-5}"
-  fi
+while [ "$shutdown_requested" -eq 0 ]; do
+  node "$BIAO_PACKAGE_ROOT/dist/server/main.js" >> "$log_dir/server.log" 2>&1 &
+  server_pid=$!
+  server_exit=0
+
+  while kill -0 "$server_pid" 2>/dev/null; do
+    # slot 配置由 supervisor-config 原子更新 config.env。每次拉起新的 Supervisor
+    # 子进程都在隔离 shell 中重新读取它，避免父进程保留旧 Worker/PM slot。
+    (
+      set -a
+      . "$SCRIPT_DIR/config.env"
+      set +a
+      exec node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs"
+    ) >> "$log_dir/supervisor.log" 2>&1 &
+    supervisor_pid=$!
+
+    while kill -0 "$server_pid" 2>/dev/null && kill -0 "$supervisor_pid" 2>/dev/null; do
+      sleep "\${BIAO_SERVER_WATCH_INTERVAL:-1}"
+    done
+
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      kill "$supervisor_pid" 2>/dev/null || true
+      wait "$supervisor_pid" 2>/dev/null || true
+      supervisor_pid=''
+      break
+    fi
+
+    supervisor_exit=0
+    wait "$supervisor_pid" || supervisor_exit=$?
+    supervisor_pid=''
+    if [ "$supervisor_exit" -eq 0 ]; then
+      sleep "\${BIAO_SUPERVISOR_INTERVAL:-60}"
+    else
+      echo "[biao] Supervisor 异常退出（exit=\${supervisor_exit}）；\${BIAO_SUPERVISOR_RESTART_DELAY:-5}s 后自动重启。" >&2
+      sleep "\${BIAO_SUPERVISOR_RESTART_DELAY:-5}"
+    fi
+  done
+
+  wait "$server_pid" || server_exit=$?
+  server_pid=''
+  [ "$shutdown_requested" -eq 0 ] || break
+  echo "[biao] Server 异常退出（exit=\${server_exit}）；\${BIAO_SERVER_RESTART_DELAY:-5}s 后自动重启，并重新建立唯一 Supervisor。" >&2
+  sleep "\${BIAO_SERVER_RESTART_DELAY:-5}"
 done
 
-wait "$server_pid"
-exit $?`));
+exit 0`));
   writeExecutable(
     join(setupDir, 'pm'),
     runtimeWrapper('export BIAO_AGENT_ID="${BIAO_PM_AGENT_ID:-pm-agent}"\nexec node "$BIAO_PACKAGE_ROOT/bin/biao.js" "$@"'),
@@ -878,6 +921,15 @@ exec node "$BIAO_PACKAGE_ROOT/bin/biao-worker.js" "$@"`),
 3. 检查 Worker 结果、Verify 证据和独立验收，再决定接受或拒绝。
 
 兼容旧的只读体检入口仍为 \`.biao/pm-intake\`；新会话优先使用 \`.biao/pm-start --once\`。
+
+## 默认并行拆解与动态补槽
+
+- 派工前必须逐 lane 列出 lane ID、硬依赖、ownership、交付物、验证命令和验收者；ownership 要区分只读与写入并精确到文件、目录或模块。同一文件、模块或共享入口同时只能有一个写入者，只读 lane 才能共享检查范围。
+- 首波目标 3–4 条互不重叠的实现 lane。若一个计划有 48 个任务却只有 1 个首波 runnable 实现 lane，且没有可证明的硬依赖或不可拆分的写 ownership，必须调整拆解，**不得提交该 DAG**；不能为了凑并发让多个 Worker 争写同一范围。
+- 只有数据、接口、迁移或验收事实的真实消费者才写 \`depends_on\`。同 phase、同里程碑或同优先级都不是依赖理由；任务编号顺序也不能制造依赖。
+- acceptance 放在相关实现产物的 fan-in 汇合点，不为每个微任务建立全局阶段栅栏，也不阻塞无关 lane。只读分析与测试应在 ownership 安全的前提下尽早并行。
+- PM 每轮先处理 review、Question 和 stale，再补足可运行队列。Worker 数大于 runnable 数时，提示调整 DAG、移除伪依赖或拆开 ownership；runnable 数大于 Worker 数时，提示补槽位并优先启动互不重叠的 lane。
+- 这些并行规则不改变下文铁律：done 仍不等于 accepted，Question、repair 与 ack 仍按原闭环处理。
 
 ## 可选：共享 Supervisor 按需唤醒 PM Agent
 

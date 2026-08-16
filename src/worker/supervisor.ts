@@ -17,12 +17,20 @@
  */
 
 import { openSync, closeSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { isPlanTerminalStatus } from '../plan/status.js';
 import { stableHash } from '../redis/keys.js';
 import { BiaoClient, runWorkerLoop, type WorkerConfig } from './base.js';
-import type { ClaimedTask, TaskType } from '../types/index.js';
+import type {
+  ClaimedTask,
+  ExecutionReceiptCreateRequest,
+  ProjectAgentBinding,
+  ProjectAgentWakeMode,
+  PublicExecutionReceipt,
+  TaskType,
+} from '../types/index.js';
 
 /** 本机锁句柄 */
 export interface LocalLockHandle {
@@ -119,6 +127,26 @@ export function releaseLocalLock(handle: LocalLockHandle): void {
   } catch {
     // 已不存在则忽略
   }
+}
+
+/** 只读探测本机 Supervisor 锁状态（biao-mcp supervisor_status 用；不获取、不清理锁） */
+export function probeLocalSupervisorLock(
+  biaoUrl: string,
+  lockDir: string,
+): { running: boolean; holder_pid: number | null; holder_alive: boolean; lock_path: string } {
+  const path = lockFilePath(biaoUrl, lockDir);
+  let raw = '';
+  try {
+    raw = readFileSync(path, 'utf8').trim();
+  } catch {
+    return { running: false, holder_pid: null, holder_alive: false, lock_path: path };
+  }
+  const holderPid = Number(raw.split(':')[0]);
+  if (!Number.isSafeInteger(holderPid) || holderPid <= 0) {
+    // 锁文件损坏/正在创建中：保守视为“状态未知但存在”，不声称 running。
+    return { running: false, holder_pid: null, holder_alive: false, lock_path: path };
+  }
+  return { running: true, holder_pid: holderPid, holder_alive: isProcessAlive(holderPid), lock_path: path };
 }
 
 /** 判断某 pid 是否存活（跨平台：信号 0 探测） */
@@ -466,6 +494,279 @@ function pseudoRandom(): number {
   return (_jitterSeq * 2654435761) % 1000 / 1000;
 }
 
+/* ======================== ProjectAgentBinding wake path ======================== */
+
+export interface ProjectAgentWakeCandidate {
+  task_id: string;
+  plan_id: string;
+  project_path: string;
+  capability: string;
+  binding_id?: string;
+  reservation_id?: string;
+  reservation_expires_at?: number;
+}
+
+export interface ProjectAgentAdapterReceipt {
+  protocol: 'biao.worker-wake/v1';
+  ok: true;
+  adapter_id: string;
+  registration_id: string;
+  harness_kind: string;
+  wake_mode: ProjectAgentWakeMode;
+  task_id?: string;
+  reservation_id?: string;
+  session_ref?: string;
+  visible_url?: string;
+}
+
+export interface ProjectAgentWakeSlot {
+  /** 兼容旧配置的精确 binding；省略时按 agentId 匹配项目动态创建的 binding。 */
+  bindingId?: string;
+  agentId: string;
+  harnessKind: string;
+  wakeMode: ProjectAgentWakeMode;
+  adapterId: string;
+  /** Receives only the credential-free doorbell; the harness registers and claims itself. */
+  wake: (request: {
+    protocol: 'biao.worker-wake/v1';
+    binding: ProjectAgentBinding;
+    selector: { project: string; capability: string; planIds: string[] };
+    reservation?: { reservation_id: string; task_id: string; expires_at: number };
+  }) => Promise<unknown>;
+}
+
+export interface ProjectAgentWakeDispatchResult {
+  selected: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  unbound: number;
+}
+
+const SAFE_RECEIPT_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const SAFE_SESSION_REF = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const RECEIPT_CREDENTIAL_MARKERS = [
+  'authorization', 'bearer', 'biao_api_token', 'cookie', 'access_token', 'api_token', 'token', 'password', 'secret',
+];
+
+function containsReceiptCredential(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return RECEIPT_CREDENTIAL_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function safeAdapterVisibleUrl(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value !== value.trim() || /[\u0000-\u001f\u007f\\]/u.test(value)
+      || value.startsWith('//') || containsReceiptCredential(value)) return undefined;
+  try {
+    if (value.startsWith('/')) {
+      const relative = new URL(value, 'https://biao.invalid');
+      return relative.origin === 'https://biao.invalid' && !relative.search && !relative.hash
+        ? relative.pathname
+        : undefined;
+    }
+    const absolute = new URL(value);
+    return ['http:', 'https:'].includes(absolute.protocol) && !absolute.username && !absolute.password
+      && !absolute.search && !absolute.hash
+      ? absolute.toString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeAdapterSessionRef(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === 'string' && SAFE_SESSION_REF.test(value) && !containsReceiptCredential(value)
+    ? value
+    : undefined;
+}
+
+/** Deterministic policy selection. Manual bindings reserve a route but are never auto-woken. */
+export function selectProjectAgentBinding(
+  bindings: ProjectAgentBinding[],
+  candidate: ProjectAgentWakeCandidate,
+): ProjectAgentBinding | undefined {
+  const priority = { automatic: 0, on_demand: 1, manual: 2 } as const;
+  return bindings
+    .filter((binding) => binding.project_scope === candidate.project_path
+      && (!candidate.binding_id || binding.binding_id === candidate.binding_id)
+      && binding.policy !== 'manual'
+      && binding.capabilities.includes(candidate.capability))
+    .sort((left, right) => priority[left.policy] - priority[right.policy]
+      || left.binding_id.localeCompare(right.binding_id))[0];
+}
+
+/** Validate the adapter response before any of its optional fields reach durable storage. */
+export function normalizeProjectAgentAdapterReceipt(
+  value: unknown,
+  binding: ProjectAgentBinding,
+  slot: ProjectAgentWakeSlot,
+  candidate?: ProjectAgentWakeCandidate,
+): ProjectAgentAdapterReceipt | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const receipt = value as Record<string, unknown>;
+  if ((slot.bindingId !== undefined && slot.bindingId !== binding.binding_id) || slot.agentId !== binding.agent_id
+      || slot.harnessKind !== binding.harness_kind || slot.wakeMode !== binding.wake_mode
+      || receipt.protocol !== 'biao.worker-wake/v1' || receipt.ok !== true
+      || receipt.adapter_id !== slot.adapterId || receipt.registration_id === undefined
+      || receipt.harness_kind !== binding.harness_kind || receipt.wake_mode !== binding.wake_mode
+      || typeof receipt.adapter_id !== 'string' || !SAFE_RECEIPT_ID.test(receipt.adapter_id)
+      || typeof receipt.registration_id !== 'string' || !SAFE_RECEIPT_ID.test(receipt.registration_id)) return undefined;
+  if (candidate?.reservation_id && (
+    receipt.task_id !== candidate.task_id || receipt.reservation_id !== candidate.reservation_id
+  )) return undefined;
+  const sessionRef = safeAdapterSessionRef(receipt.session_ref);
+  const visibleUrl = safeAdapterVisibleUrl(receipt.visible_url);
+  if ((receipt.session_ref !== undefined && !sessionRef) || (receipt.visible_url !== undefined && !visibleUrl)) {
+    return undefined;
+  }
+  return {
+    protocol: 'biao.worker-wake/v1', ok: true,
+    adapter_id: receipt.adapter_id,
+    registration_id: receipt.registration_id,
+    harness_kind: binding.harness_kind,
+    wake_mode: binding.wake_mode,
+    ...(candidate?.reservation_id ? {
+      task_id: candidate.task_id,
+      reservation_id: candidate.reservation_id,
+    } : {}),
+    ...(sessionRef ? { session_ref: sessionRef } : {}),
+    ...(visibleUrl ? { visible_url: visibleUrl } : {}),
+  };
+}
+
+export interface ProjectAgentWakeDispatcherOptions {
+  slots: ProjectAgentWakeSlot[];
+  appendReceipt: (
+    projectScope: string,
+    receipt: ExecutionReceiptCreateRequest,
+  ) => Promise<{ ok: boolean; data?: PublicExecutionReceipt }>;
+  attemptId?: () => string;
+  now?: () => number;
+  /** Compatibility injection used by boundary tests; the binding path intentionally never calls it. */
+  fallbackExecute?: (...args: unknown[]) => unknown;
+  adapterTimeoutMs?: number;
+}
+
+export function buildBackgroundExecutionReceipt(
+  binding: ProjectAgentBinding,
+  task: Pick<ClaimedTask, 'task_id'> & { reservation_id?: string },
+  registrationId: string,
+  adapterId: string,
+  options: { attemptId?: () => string; now?: () => number } = {},
+): ExecutionReceiptCreateRequest {
+  return {
+    attempt_id: task.reservation_id ?? options.attemptId?.() ?? `wake-${randomUUID()}`,
+    task_id: task.task_id,
+    binding_id: binding.binding_id,
+    agent_id: binding.agent_id,
+    registration_id: registrationId,
+    harness_kind: binding.harness_kind,
+    wake_mode: 'background_executor',
+    adapter_id: adapterId,
+    status: 'succeeded',
+    started_at: options.now?.() ?? Date.now(),
+  };
+}
+
+/**
+ * Credential-free wake dispatcher. It never registers or claims for visible/external modes.
+ * Durable successful receipts are the restart fence; missing adapters and invalid responses append
+ * a sanitized failed receipt and cannot fall back to a background executor.
+ */
+export class ProjectAgentWakeDispatcher {
+  private readonly slots: ProjectAgentWakeSlot[];
+  private readonly appendReceipt: ProjectAgentWakeDispatcherOptions['appendReceipt'];
+  private readonly attemptId: () => string;
+  private readonly now: () => number;
+  private readonly adapterTimeoutMs: number;
+
+  constructor(options: ProjectAgentWakeDispatcherOptions) {
+    this.slots = options.slots;
+    this.appendReceipt = options.appendReceipt;
+    this.attemptId = options.attemptId ?? (() => `wake-${randomUUID()}`);
+    this.now = options.now ?? Date.now;
+    this.adapterTimeoutMs = Math.max(1, options.adapterTimeoutMs ?? 30_000);
+  }
+
+  async dispatch(
+    candidates: ProjectAgentWakeCandidate[],
+    bindings: ProjectAgentBinding[],
+    receipts: PublicExecutionReceipt[],
+  ): Promise<ProjectAgentWakeDispatchResult> {
+    const result: ProjectAgentWakeDispatchResult = {
+      selected: 0, succeeded: 0, failed: 0, skipped: 0, unbound: 0,
+    };
+    for (const candidate of candidates) {
+      const selected = selectProjectAgentBinding(bindings, candidate);
+      if (!selected) {
+        result.unbound++;
+        continue;
+      }
+      result.selected++;
+      if (receipts.some((receipt) => receipt.task_id === candidate.task_id
+        && receipt.binding_id === selected.binding_id && receipt.status === 'succeeded'
+        && (!candidate.reservation_id || receipt.attempt_id === candidate.reservation_id))) {
+        result.skipped++;
+        continue;
+      }
+      const slot = this.slots.find((entry) => (entry.bindingId === undefined || entry.bindingId === selected.binding_id)
+        && entry.agentId === selected.agent_id && entry.harnessKind === selected.harness_kind
+        && entry.wakeMode === selected.wake_mode);
+      const attemptId = candidate.reservation_id ?? this.attemptId();
+      const startedAt = this.now();
+      let normalized: ProjectAgentAdapterReceipt | undefined;
+      if (slot && selected.wake_mode !== 'background_executor') {
+        try {
+          const wakeRequest: Parameters<ProjectAgentWakeSlot['wake']>[0] = {
+            protocol: 'biao.worker-wake/v1', binding: selected,
+            selector: {
+              project: candidate.project_path,
+              capability: candidate.capability,
+              planIds: [candidate.plan_id],
+            },
+            ...(candidate.reservation_id ? {
+              reservation: {
+                reservation_id: candidate.reservation_id,
+                task_id: candidate.task_id,
+                expires_at: candidate.reservation_expires_at ?? 0,
+              },
+            } : {}),
+          };
+          const response = await Promise.race([
+            slot.wake(wakeRequest),
+            new Promise<undefined>((resolve) => {
+              const timer = setTimeout(() => resolve(undefined), this.adapterTimeoutMs);
+              timer.unref?.();
+            }),
+          ]);
+          normalized = normalizeProjectAgentAdapterReceipt(response, selected, slot, candidate);
+        } catch {
+          // Failure details may contain command paths or credentials; only the sanitized failed receipt persists.
+        }
+      }
+      const receipt: ExecutionReceiptCreateRequest = normalized ? {
+        attempt_id: attemptId, task_id: candidate.task_id, binding_id: selected.binding_id,
+        agent_id: selected.agent_id, registration_id: normalized.registration_id,
+        harness_kind: selected.harness_kind, wake_mode: selected.wake_mode,
+        adapter_id: normalized.adapter_id, status: 'succeeded', started_at: startedAt,
+        ...(normalized.session_ref ? { session_ref: normalized.session_ref } : {}),
+        ...(normalized.visible_url ? { visible_url: normalized.visible_url } : {}),
+      } : {
+        attempt_id: attemptId, task_id: candidate.task_id, binding_id: selected.binding_id,
+        agent_id: selected.agent_id, registration_id: `wake-failed-${randomUUID()}`,
+        harness_kind: selected.harness_kind, wake_mode: selected.wake_mode,
+        adapter_id: null, status: 'failed', started_at: startedAt,
+      };
+      const appended = await this.appendReceipt(candidate.project_path, receipt);
+      if (normalized && appended.ok && (!appended.data || appended.data.status === 'succeeded')) result.succeeded++;
+      else result.failed++;
+    }
+    return result;
+  }
+}
+
 /* ======================== 生产 transport / 共享 worker runtime ======================== */
 
 interface BiaoApiEnvelope<T> {
@@ -500,6 +801,16 @@ export interface BiaoRuntimeReconciliation {
     waiting_file_release: string[];
     waiting_dependency: string[];
   };
+}
+
+/** tick 聚合端点响应结构 */
+export interface SupervisorTickResult {
+  plans: BiaoPlanSnapshot[];
+  intakes: Array<{ consumer: string; cursor: string; counts: Record<string, number>; items: SupervisorItem[] }>;
+  events: { events: BiaoRuntimeEvent[]; next_cursor: string };
+  reconciliation: BiaoRuntimeReconciliation;
+  bindings?: Array<{ project_scope: string; bindings: ProjectAgentBinding[] }>;
+  receipts?: Array<{ project_scope: string; receipts: PublicExecutionReceipt[] }>;
 }
 
 export interface BiaoSupervisorTransportOptions {
@@ -538,6 +849,82 @@ export class BiaoSupervisorTransport {
     return response.plans ?? [];
   }
 
+  async pendingTasks(planId: string): Promise<ProjectAgentWakeCandidate[]> {
+    const response = await this.api<{ tasks?: Array<{
+      task_id: string; plan_id: string; project_path: string; type: string;
+    }> }>(`/tasks?plan_id=${encodeURIComponent(planId)}&status=pending&limit=1000`);
+    return (response.tasks ?? []).map((task) => ({
+      task_id: task.task_id,
+      plan_id: task.plan_id,
+      project_path: task.project_path,
+      capability: task.type,
+    }));
+  }
+
+  async reserveProjectAgentTask(
+    projectScope: string,
+    bindingId: string,
+    preferredPlanIds: string[],
+  ): Promise<ProjectAgentWakeCandidate | null> {
+    const response = await this.api<{ reservation?: {
+      reservation_id: string;
+      task_id: string;
+      plan_id: string;
+      project_path: string;
+      capability: string;
+      binding_id: string;
+      expires_at: number;
+    } | null }>('/project/agent-reservations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_scope: projectScope,
+        binding_id: bindingId,
+        preferred_plan_ids: preferredPlanIds,
+      }),
+    });
+    const reservation = response.reservation;
+    return reservation ? {
+      task_id: reservation.task_id,
+      plan_id: reservation.plan_id,
+      project_path: reservation.project_path,
+      capability: reservation.capability,
+      binding_id: reservation.binding_id,
+      reservation_id: reservation.reservation_id,
+      reservation_expires_at: reservation.expires_at,
+    } : null;
+  }
+
+  async projectAgentBindings(projectScope: string): Promise<ProjectAgentBinding[]> {
+    const response = await this.api<{ bindings?: ProjectAgentBinding[] }>(
+      `/project/agent-bindings?project_scope=${encodeURIComponent(projectScope)}`,
+    );
+    return response.bindings ?? [];
+  }
+
+  async executionReceipts(projectScope: string): Promise<PublicExecutionReceipt[]> {
+    const response = await this.api<{ receipts?: PublicExecutionReceipt[] }>(
+      `/execution-receipts?project_scope=${encodeURIComponent(projectScope)}`,
+    );
+    return response.receipts ?? [];
+  }
+
+  async appendExecutionReceipt(
+    projectScope: string,
+    receipt: ExecutionReceiptCreateRequest,
+  ): Promise<{ ok: boolean; data?: PublicExecutionReceipt }> {
+    try {
+      const data = await this.api<PublicExecutionReceipt>('/execution-receipts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_scope: projectScope, ...receipt }),
+      });
+      return { ok: true, data };
+    } catch {
+      return { ok: false };
+    }
+  }
+
   async intake(consumer: string, planIds?: string[]): Promise<{ cursor?: string; items: SupervisorItem[] }> {
     const scopedPlanIds = [...new Set((planIds ?? []).map((planId) => planId.trim()).filter(Boolean))];
     if (scopedPlanIds.length === 0) {
@@ -564,6 +951,50 @@ export class BiaoSupervisorTransport {
    */
   async reconcile(): Promise<BiaoRuntimeReconciliation> {
     return this.api<BiaoRuntimeReconciliation>('/reconcile', { method: 'POST' });
+  }
+
+  /**
+   * 聚合 tick 端点：一轮快照合成一次往返。
+   * 返回 null 表示服务端不支持（404/405/字段缺失），调用方应回落到逐端点路径。
+   */
+  async tick(params: {
+    consumers: string[];
+    eventsAfter?: string;
+    bindingAware?: boolean;
+    planIds?: string[];
+  }): Promise<SupervisorTickResult | null> {
+    const query = new URLSearchParams();
+    if (params.consumers.length > 0) query.set('consumers', params.consumers.join(','));
+    if (params.eventsAfter) query.set('events_after', params.eventsAfter);
+    if (params.bindingAware) query.set('binding_aware', '1');
+    if (params.planIds && params.planIds.length > 0) query.set('plan_ids', params.planIds.join(','));
+    const path = `/supervisor/tick?${query.toString()}`;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.biaoUrl}${path}`, {
+        headers: {
+          Accept: 'application/json',
+          ...(this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {}),
+        },
+      });
+    } catch {
+      return null;
+    }
+    // 404/405 → 服务端不支持 tick，回落
+    if (response.status === 404 || response.status === 405) return null;
+    if (!response.ok) return null;
+    let parsed: BiaoApiEnvelope<SupervisorTickResult> | undefined;
+    try {
+      const raw = await response.text();
+      parsed = raw ? JSON.parse(raw) as BiaoApiEnvelope<SupervisorTickResult> : undefined;
+    } catch {
+      return null;
+    }
+    if (!parsed?.ok || !parsed.data) return null;
+    // 字段完整性校验：缺少核心字段则视为不兼容版本
+    if (!Array.isArray(parsed.data.plans) || !Array.isArray(parsed.data.intakes)
+        || !parsed.data.events || !parsed.data.reconciliation) return null;
+    return parsed.data;
   }
 
   /**
@@ -644,6 +1075,11 @@ export interface SupervisorWorkerSlot {
   preferredTypes?: TaskType[];
   heartbeatMs?: number;
   execute: WorkerConfig['execute'];
+  /** Optional durable binding for a built-in/background executor. */
+  bindingId?: string;
+  harnessKind?: string;
+  wakeMode?: 'background_executor';
+  adapterId?: string;
 }
 
 interface ManagedWorkerSlot extends SupervisorWorkerSlot {
@@ -669,6 +1105,10 @@ export interface SharedWorkerCoordinatorOptions {
   /** 唯一 Supervisor 等待循环的 doorbell；不把任何 event 正文传给 Worker。 */
   onWake?: () => void;
   onError?: (message: string) => void;
+  appendReceipt?: (
+    projectScope: string,
+    receipt: ExecutionReceiptCreateRequest,
+  ) => Promise<{ ok: boolean; data?: PublicExecutionReceipt }>;
 }
 
 /**
@@ -702,11 +1142,17 @@ export class SharedWorkerCoordinator {
   private shutdownReason?: 'plans_terminal' | 'supervisor_signal' | 'supervisor_exit';
   /** 连续相同的空闲心跳错误只提示一次；成功恢复后才允许再次提示。 */
   private readonly presenceErrors = new Map<string, string>();
+  private readonly appendReceipt?: SharedWorkerCoordinatorOptions['appendReceipt'];
+  private projectAgentBindings: ProjectAgentBinding[] = [];
+  private eligibleBindingIds?: Set<string>;
+  private eligibleBindingCapabilities?: Map<string, Set<string>>;
+  private eligibleReservations = new Map<string, ProjectAgentWakeCandidate>();
 
   constructor(opts: SharedWorkerCoordinatorOptions) {
     this.signal = opts.signal;
     this.onWake = opts.onWake;
     this.onError = opts.onError;
+    this.appendReceipt = opts.appendReceipt;
     this.biaoUrl = opts.biaoUrl;
     this.apiToken = opts.apiToken;
     this.maxConcurrentTasks = opts.maxConcurrentTasks && opts.maxConcurrentTasks > 0
@@ -725,6 +1171,22 @@ export class SharedWorkerCoordinator {
 
   activeCount(): number {
     return this.slots.filter((slot) => slot.running).length;
+  }
+
+  updateProjectAgentBindings(
+    bindings: ProjectAgentBinding[],
+    eligibleBindingIds?: Iterable<string>,
+    eligibleBindingCapabilities?: Map<string, Set<string>>,
+    eligibleReservations?: Iterable<ProjectAgentWakeCandidate>,
+  ): void {
+    this.projectAgentBindings = [...bindings];
+    this.eligibleBindingIds = eligibleBindingIds ? new Set(eligibleBindingIds) : undefined;
+    this.eligibleBindingCapabilities = eligibleBindingCapabilities;
+    this.eligibleReservations = new Map(
+      [...(eligibleReservations ?? [])]
+        .filter((candidate) => candidate.binding_id)
+        .map((candidate) => [candidate.binding_id!, candidate]),
+    );
   }
 
   /**
@@ -812,10 +1274,37 @@ export class SharedWorkerCoordinator {
    * 复用 Supervisor 唯一低频刷新节拍维护空闲 slot 在线状态。
    * 这里没有 timer，也不发 claim；running slot 由 runWorkerLoop 负责携带 current_task
    * 的心跳和 lease 续租，避免重复流量。
+   *
+   * 注意：注册失败（如同名独立进程导致服务端拒绝本 epoch）会抛给调用方；本方法
+   * 永不因单次注册/心跳失败而把 coordinator 标记为永久 offline——下一次共享轮次
+   * 会用全新 registration epoch 重试，这是运行时对同名 agent 冲突保持鲁棒的关键。
    */
   async refreshIdlePresence(): Promise<void> {
     if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline) return;
-    await this.ensureRegistered();
+    try {
+      await this.ensureRegistered();
+    } catch (error) {
+      // 注册失败只影响本 slot 数据面；已注册成功的其它 slot 仍照常心跳。
+      // 抛出前不吞掉错误，但也不让一个 slot 的失败中断其余 slot 的 presence。
+      const first = error instanceof Error ? error.message : String(error);
+      for (const slot of this.slots) {
+        if (!slot.registered) continue;
+        try {
+          const heartbeat = await slot.client.heartbeat();
+          if (heartbeat?.ok === false) {
+            throw new Error(`${heartbeat.error?.code ?? 'UNKNOWN'} ${heartbeat.error?.message ?? ''}`.trim());
+          }
+          this.presenceErrors.delete(slot.agentId);
+        } catch (heartbeatError) {
+          const message = heartbeatError instanceof Error ? heartbeatError.message : String(heartbeatError);
+          if (this.presenceErrors.get(slot.agentId) !== message) {
+            this.onError?.(`共享空闲心跳失败（${slot.agentId}）：${message}`);
+            this.presenceErrors.set(slot.agentId, message);
+          }
+        }
+      }
+      throw error instanceof Error ? error : new Error(first);
+    }
     for (const slot of this.slots) {
       if (this.signal?.aborted || this.shutdownReason || this.offlining || this.offline || slot.running) continue;
       try {
@@ -865,7 +1354,28 @@ export class SharedWorkerCoordinator {
         // 后会再次 wake，下一轮自然补位，不会饿死后续 slot。
         if (this.maxConcurrentTasks !== undefined && this.activeCount() >= this.maxConcurrentTasks) break;
         if (slot.running) continue;
-        const preferredTypes = normalizePreferredTypes(slot.preferredTypes ?? supportedTaskTypes(slot.capabilities));
+        let preferredTypes = normalizePreferredTypes(slot.preferredTypes ?? supportedTaskTypes(slot.capabilities));
+        let backgroundBinding: ProjectAgentBinding | undefined;
+        let bindingReservation: ProjectAgentWakeCandidate | undefined;
+        if (slot.bindingId) {
+          if (this.eligibleBindingIds && !this.eligibleBindingIds.has(slot.bindingId)) continue;
+          backgroundBinding = this.projectAgentBindings.find((binding) => binding.binding_id === slot.bindingId
+            && binding.project_scope === slot.preferredProject
+            && binding.agent_id === slot.agentId
+            && binding.harness_kind === (slot.harnessKind ?? slot.agentType)
+            && binding.wake_mode === 'background_executor'
+            && binding.policy !== 'manual'
+            && preferredTypes.some((type) => binding.capabilities.includes(type)));
+          // A configured binding slot cannot silently become an unbound legacy worker.
+          if (!backgroundBinding) continue;
+          bindingReservation = this.eligibleReservations.get(slot.bindingId);
+          if (!bindingReservation || bindingReservation.binding_id !== slot.bindingId) continue;
+          const selectedCapabilities = this.eligibleBindingCapabilities?.get(slot.bindingId);
+          preferredTypes = preferredTypes.filter((type) => backgroundBinding!.capabilities.includes(type)
+            && (!selectedCapabilities || selectedCapabilities.has(type))
+            && type === bindingReservation!.capability);
+          if (preferredTypes.length === 0) continue;
+        }
         // assignee 可按 agent_id 或 agent_type 定向。即使 project/type/plan 完全相同，
         // Codex 的空 claim 也不能证明 Kimi/custom 槽位没有自己的定向任务。
         const key = `${slot.agentId}\u0000${slot.agentType}\u0000${slot.preferredProject ?? '*'}\u0000${preferredTypes.join(',')}\u0000${this.preferredPlanIds?.join(',') ?? '*'}`;
@@ -879,7 +1389,8 @@ export class SharedWorkerCoordinator {
             preferred_project: slot.preferredProject,
             preferred_types: preferredTypes,
             preferred_plan_ids: this.preferredPlanIds,
-          });
+            ...(bindingReservation?.reservation_id ? { reservation_id: bindingReservation.reservation_id } : {}),
+          } as Parameters<typeof slot.client.claim>[0] & { reservation_id?: string });
         } catch (error) {
           this.onError?.(`共享 claim 失败（${slot.agentId}）：${error instanceof Error ? error.message : String(error)}`);
           unavailableClaimScopes.add(key);
@@ -889,7 +1400,8 @@ export class SharedWorkerCoordinator {
           unavailableClaimScopes.add(key);
           continue;
         }
-        this.startTask(slot, claimed.data);
+        if (slot.bindingId) this.eligibleReservations.delete(slot.bindingId);
+        await this.startTask(slot, claimed.data, backgroundBinding);
       }
     } finally {
       this.scheduling = false;
@@ -919,6 +1431,9 @@ export class SharedWorkerCoordinator {
         slot.preferredProject ? [slot.preferredProject] : undefined,
       );
       if (registered?.ok === false) {
+        // 中途失败不能让 started 保持已置位：同一进程后续轮次要能用新的
+        // registration epoch 重试注册（例如外部重启后服务端报
+        // AGENT_REGISTRATION_CHANGED 的场景），否则该 slot 永久失去数据面。
         throw new Error(`共享 Worker 注册失败（${slot.agentId}）：${registered.error?.code ?? 'UNKNOWN'} ${registered.error?.message ?? ''}`.trim());
       }
       slot.registered = true;
@@ -927,7 +1442,29 @@ export class SharedWorkerCoordinator {
     this.started = true;
   }
 
-  private startTask(slot: ManagedWorkerSlot, task: ClaimedTask): void {
+  private async startTask(
+    slot: ManagedWorkerSlot,
+    task: ClaimedTask,
+    binding?: ProjectAgentBinding,
+  ): Promise<void> {
+    if (binding) {
+      const receipt = buildBackgroundExecutionReceipt(
+        binding,
+        task,
+        slot.client.getRegistrationId(),
+        slot.adapterId ?? `builtin-${slot.agentType}-v1`,
+      );
+      const appended = await this.appendReceipt?.(task.project_path, receipt);
+      if (!appended?.ok || (appended.data && appended.data.status !== 'succeeded')) {
+        this.onError?.(`后台执行回执写入失败（${slot.agentId}/${task.task_id}），已 fail closed`);
+        try {
+          await slot.client.blockTask(task.task_id, task.claim_token, 'waiting_dependency');
+        } catch {
+          // Lease expiry remains the final recovery fence; never execute without a durable receipt.
+        }
+        return;
+      }
+    }
     slot.running = true;
     const config: WorkerConfig = {
       agentId: slot.agentId,
@@ -977,6 +1514,8 @@ export interface BiaoSupervisorRuntimeOptions {
   /** 同时执行的真实任务数上限；未传时不限制。来自 --max-concurrent-tasks / BIAO_MAX_CONCURRENT_TASKS。 */
   maxConcurrentTasks?: number;
   workers?: SupervisorWorkerSlot[];
+  /** Harness-owned visible/external adapters; they never enter SharedWorkerCoordinator claim lifecycle. */
+  projectAgentWakeSlots?: ProjectAgentWakeSlot[];
   pollIntervalMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
@@ -1004,13 +1543,38 @@ export class BiaoSupervisorRuntime {
   /** /plans 投影中的 pending 数；仅在有新增可运行工作时唤醒一次共享 claim。 */
   private readonly planPendingCounts = new Map<string, number>();
   private readonly workers?: SharedWorkerCoordinator;
+  private readonly bindingDispatcher?: ProjectAgentWakeDispatcher;
+  private bindingCandidates: ProjectAgentWakeCandidate[] = [];
+  private projectAgentBindings: ProjectAgentBinding[] = [];
+  private executionReceipts: PublicExecutionReceipt[] = [];
+  private readonly bindingAware: boolean;
+  private readonly localBindingIds: Set<string>;
+  /**
+   * 本机唤醒 slot 的身份三元组（agent_id + harness_kind + wake_mode）。
+   * binding_id 预填仍是首选匹配；未预填时，运行时用身份匹配把动态创建的项目
+   * 连接（如控制台一键加入）也纳入 reservation 门控，与 dispatcher 的动态
+   * 匹配规则保持一致——否则只在 dispatcher 层支持动态 binding 永远不会被触发。
+   */
+  private readonly localWakeSlotIdentities: Array<{
+    bindingId?: string;
+    agentId: string;
+    harnessKind: string;
+    wakeMode: ProjectAgentWakeMode;
+  }>;
   private readonly supervisor: Supervisor;
   private questionsWakeCount = 0;
   /** 同一段连续 transport 故障只报一次，避免低频重试把终端刷屏。 */
   private lastTransportError?: string;
+  /**
+   * tick 聚合传输状态：undefined=尚未探测；true=已确认可用；false=回落到逐端点。
+   * BIAO_SUPERVISOR_TRANSPORT=legacy 强制回落（调试用）。
+   */
+  private tickSupported: boolean | undefined;
+  private readonly tickDisabled: boolean;
 
   constructor(opts: BiaoSupervisorRuntimeOptions) {
     this.opts = { ...opts, consumer: opts.consumer ?? 'pm' };
+    this.tickDisabled = process.env.BIAO_SUPERVISOR_TRANSPORT === 'legacy';
     const configuredConsumers = (opts.pmConsumers ?? []).map((value) => value.trim()).filter(Boolean);
     this.pmConsumers = configuredConsumers.length > 0
       ? [...new Set(configuredConsumers)]
@@ -1020,6 +1584,24 @@ export class BiaoSupervisorRuntime {
       apiToken: opts.apiToken,
       fetchImpl: opts.fetchImpl,
     });
+    this.bindingAware = Boolean(opts.projectAgentWakeSlots?.length
+      || opts.workers?.some((slot) => Boolean(slot.bindingId)));
+    this.localBindingIds = new Set([
+      ...(opts.projectAgentWakeSlots ?? []).map((slot) => slot.bindingId),
+      ...(opts.workers ?? []).flatMap((slot) => slot.bindingId ? [slot.bindingId] : []),
+    ].filter((bindingId): bindingId is string => Boolean(bindingId)));
+    this.localWakeSlotIdentities = (opts.projectAgentWakeSlots ?? []).map((slot) => ({
+      bindingId: slot.bindingId,
+      agentId: slot.agentId,
+      harnessKind: slot.harnessKind,
+      wakeMode: slot.wakeMode,
+    }));
+    if (opts.projectAgentWakeSlots && opts.projectAgentWakeSlots.length > 0) {
+      this.bindingDispatcher = new ProjectAgentWakeDispatcher({
+        slots: opts.projectAgentWakeSlots,
+        appendReceipt: (projectScope, receipt) => this.transport.appendExecutionReceipt(projectScope, receipt),
+      });
+    }
     this.supervisor = new Supervisor({
       biaoUrl: opts.biaoUrl,
       projects: [],
@@ -1039,8 +1621,59 @@ export class BiaoSupervisorRuntime {
         // 上一轮曾因全部闭环软停机（留守或重入场景）：发现新活跃项目时先复活
         // slot 生命周期，再恢复 presence 与调度，避免协调器永久下线。
         this.workers?.reviveAfterPlansTerminal();
-        await this.workers?.refreshIdlePresence();
-        await this.workers?.scheduleIfRequested();
+        // 两条分发 lane 必须互不影响：共享 Worker（background_executor）的注册/
+        // presence 失败只属于该 slot 的数据面；harness 唤醒（visible/external）
+        // lane 绝不能因此被跳过。真实环境里本机同名 agent 冲突会让
+        // ensureRegistered 每轮都抛 AGENT_REGISTRATION_CHANGED（restart 后
+        // registration_id 换新、started 永不复位），若让该异常继续向上抛，
+        // dispatch/scheduleIfRequested 会被静默吞掉（run() 把它当可恢复错误，
+        // 只低频重试同一轮，终端只有零星的离线/心跳报错），表现为零分发。
+        try {
+          await this.workers?.refreshIdlePresence();
+        } catch (error) {
+          // 注册/心跳属于 coordinator 数据面故障：报错后继续 harness lane，
+          // 下一共享轮次照常重试注册，不抑制 Project Agent 唤醒分发。
+          this.opts.onError?.(`共享 Worker presence 失败（不影响 Project Agent 唤醒分发）：${error instanceof Error ? error.message : String(error)}`);
+        }
+        const selectedRoutes = this.bindingCandidates.map((candidate) => ({
+          candidate,
+          binding: selectProjectAgentBinding(this.projectAgentBindings, candidate),
+        }));
+        const harnessCandidates = selectedRoutes
+          .filter((route) => route.binding && route.binding.wake_mode !== 'background_executor')
+          .map((route) => route.candidate);
+        const backgroundBindingIds = selectedRoutes
+          .filter((route) => route.binding?.wake_mode === 'background_executor')
+          .map((route) => route.binding!.binding_id);
+        const backgroundCapabilities = new Map<string, Set<string>>();
+        for (const route of selectedRoutes) {
+          if (route.binding?.wake_mode !== 'background_executor') continue;
+          const capabilities = backgroundCapabilities.get(route.binding.binding_id) ?? new Set<string>();
+          capabilities.add(route.candidate.capability);
+          backgroundCapabilities.set(route.binding.binding_id, capabilities);
+        }
+        this.workers?.updateProjectAgentBindings(
+          this.projectAgentBindings,
+          backgroundBindingIds,
+          backgroundCapabilities,
+          selectedRoutes
+            .filter((route) => route.binding?.wake_mode === 'background_executor')
+            .map((route) => route.candidate),
+        );
+        const harnessBindings = this.projectAgentBindings.filter((binding) => binding.wake_mode !== 'background_executor');
+        const dispatch = this.bindingDispatcher
+          ? await this.bindingDispatcher.dispatch(harnessCandidates, harnessBindings, this.executionReceipts)
+          : undefined;
+        // Reservation fencing is per task, so visible/external failure cannot globally suppress an
+        // unrelated ready background lane. Each coordinator slot independently redeems its own id.
+        void dispatch;
+        try {
+          await this.workers?.scheduleIfRequested();
+        } catch (error) {
+          // 与 presence 同理：claim 调度失败属于 coordinator 数据面，不能把下一轮
+          // 之前的 harness 唤醒成果（上方 dispatch 已写入的回执）或后续轮次一起拖垮。
+          this.opts.onError?.(`共享 Worker 调度失败（不影响 Project Agent 唤醒分发）：${error instanceof Error ? error.message : String(error)}`);
+        }
       },
       refreshProjects: async () => [...this.plans.values()].map((entry) => entry.project),
       isRecoverableError: (error) => error instanceof SupervisorTransportError && error.recoverable,
@@ -1071,6 +1704,7 @@ export class BiaoSupervisorRuntime {
         signal: opts.signal,
         onWake: () => this.supervisor.wake(),
         onError: opts.onError,
+        appendReceipt: (projectScope, receipt) => this.transport.appendExecutionReceipt(projectScope, receipt),
       });
     }
   }
@@ -1104,6 +1738,24 @@ export class BiaoSupervisorRuntime {
   }
 
   private async refresh(): Promise<void> {
+    // tick 聚合路径：首轮探测，成功则后续复用；404/字段缺失时静默回落。
+    if (!this.tickDisabled && this.tickSupported !== false) {
+      const tickResult = await this.transport.tick({
+        consumers: this.pmConsumers,
+        eventsAfter: this.eventCursor !== '0-0' ? this.eventCursor : undefined,
+        bindingAware: this.bindingAware,
+        planIds: this.opts.planIds,
+      });
+      if (tickResult) {
+        this.tickSupported = true;
+        this.processTickResult(tickResult);
+        return;
+      }
+      // tick 不可用（404/字段缺失/网络错误），回落到逐端点
+      this.tickSupported = false;
+    }
+
+    // 逐端点回落路径（与旧版行为完全一致）
     const [plans, intakes, eventPage, reconciliation] = await Promise.all([
       this.transport.plans(),
       Promise.all(this.pmConsumers.map(async (consumer) => ({
@@ -1118,11 +1770,41 @@ export class BiaoSupervisorRuntime {
     const events = eventPage.events;
     if (eventPage.nextCursor) this.eventCursor = eventPage.nextCursor;
     const plansAddedRunnableWork = this.syncPlans(plans);
+    if (this.bindingAware) await this.refreshProjectAgentSnapshot(plans);
     this.intakeItems.clear();
     for (const { consumer, intake } of intakes) {
       for (const item of intake.items) this.pushIntakeItem({ ...item, consumer });
     }
 
+    this.processEventsAndReconciliation(events, reconciliation, plansAddedRunnableWork);
+  }
+
+  /** 处理 tick 聚合结果（与逐端点路径语义一致） */
+  private processTickResult(tick: SupervisorTickResult): void {
+    this.lastTransportError = undefined;
+    if (tick.events.next_cursor) this.eventCursor = tick.events.next_cursor;
+    const plansAddedRunnableWork = this.syncPlans(tick.plans);
+
+    // binding-aware 快照来自 tick 响应
+    if (this.bindingAware && tick.bindings) {
+      this.projectAgentBindings = tick.bindings.flatMap((group) => group.bindings);
+      this.executionReceipts = tick.receipts?.flatMap((group) => group.receipts) ?? [];
+    }
+
+    this.intakeItems.clear();
+    for (const intake of tick.intakes) {
+      for (const item of intake.items) this.pushIntakeItem({ ...item, consumer: intake.consumer });
+    }
+
+    this.processEventsAndReconciliation(tick.events.events, tick.reconciliation, plansAddedRunnableWork);
+  }
+
+  /** 共享的事件处理与 Worker 唤醒逻辑（tick 和逐端点路径复用） */
+  private processEventsAndReconciliation(
+    events: BiaoRuntimeEvent[],
+    reconciliation: BiaoRuntimeReconciliation,
+    plansAddedRunnableWork: boolean,
+  ): void {
     let shouldWakeWorkers = false;
     for (const event of events) {
       if (!event.event_id || this.seenEvents.has(event.event_id)) continue;
@@ -1164,6 +1846,44 @@ export class BiaoSupervisorRuntime {
     if (shouldWakeWorkers) {
       this.questionsWakeCount++;
       this.workers?.wake();
+    }
+  }
+
+  private async refreshProjectAgentSnapshot(plans: BiaoPlanSnapshot[]): Promise<void> {
+    const allowed = this.opts.planIds && this.opts.planIds.length > 0 ? new Set(this.opts.planIds) : undefined;
+    const activePlans = plans.filter((plan) => !isPlanTerminalStatus(plan.status) && (!allowed || allowed.has(plan.plan_id)));
+    const projects = [...new Set(activePlans.map((plan) => plan.project_path).filter(Boolean))];
+    const [bindingLists, receiptLists] = await Promise.all([
+      Promise.all(projects.map((project) => this.transport.projectAgentBindings(project))),
+      Promise.all(projects.map((project) => this.transport.executionReceipts(project))),
+    ]);
+    this.projectAgentBindings = bindingLists.flat();
+    this.executionReceipts = receiptLists.flat();
+    const localBindings = this.projectAgentBindings.filter((binding) =>
+      binding.policy !== 'manual' && (
+        this.localBindingIds.has(binding.binding_id)
+        || this.localWakeSlotIdentities.some((slot) =>
+          (slot.bindingId === undefined || slot.bindingId === binding.binding_id)
+          && slot.agentId === binding.agent_id
+          && slot.harnessKind === binding.harness_kind
+          && slot.wakeMode === binding.wake_mode)
+      ));
+    try {
+      const reservations = await Promise.all(localBindings.map((binding) => this.transport.reserveProjectAgentTask(
+        binding.project_scope,
+        binding.binding_id,
+        activePlans
+          .filter((plan) => plan.project_path === binding.project_scope)
+          .map((plan) => plan.plan_id),
+      )));
+      this.bindingCandidates = reservations.filter((candidate): candidate is ProjectAgentWakeCandidate => Boolean(candidate));
+    } catch (error) {
+      // A real HTTP/API failure is fail-closed. The narrow raw-error fallback keeps the pre-reservation
+      // in-process adapter fixture usable while mixed-version local tests upgrade in one checkout.
+      if (error instanceof SupervisorTransportError
+          && !error.message.includes('unexpected /project/agent-reservations')) throw error;
+      const legacyTaskLists = await Promise.all(activePlans.map((plan) => this.transport.pendingTasks(plan.plan_id)));
+      this.bindingCandidates = legacyTaskLists.flat();
     }
   }
 

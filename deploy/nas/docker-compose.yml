@@ -1,0 +1,54 @@
+# Biao V2 NAS 119 部署编排
+# 端口：7331（biao-server）、6380（redis 仅内部，不暴露宿主端口）
+# 数据卷：/data_n004/biao/docker/ 下 bind mount
+
+services:
+  biao-redis:
+    image: redis:7-alpine
+    container_name: biao-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - /data_n004/biao/docker/redis-data:/data
+    networks:
+      - biao-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  biao-server:
+    build:
+      context: ../..
+      dockerfile: deploy/nas/Dockerfile
+      platforms:
+        - linux/amd64
+    container_name: biao-server
+    depends_on:
+      biao-redis:
+        condition: service_healthy
+    environment:
+      BIAO_HOST: "0.0.0.0"
+      BIAO_PORT: "7331"
+      BIAO_REDIS_URL: "redis://biao-redis:6379"
+      BIAO_DATA_DIR: "/data"
+      BIAO_API_TOKEN: "${BIAO_API_TOKEN}"
+      BIAO_V2_CREDENTIAL_KEY: "${BIAO_V2_CREDENTIAL_KEY}"
+      # V2 feature flags：默认全关，灰度按 §23.1 顺序开启
+      BIAO_DISTRIBUTED_MODE: "${BIAO_DISTRIBUTED_MODE:-0}"
+      BIAO_V2_ARTIFACTS: "${BIAO_V2_ARTIFACTS:-0}"
+      BIAO_V2_NODE_RUNTIME: "${BIAO_V2_NODE_RUNTIME:-0}"
+      BIAO_V2_GIT_DELIVERY: "${BIAO_V2_GIT_DELIVERY:-0}"
+      BIAO_V2_MERGE_QUEUE: "${BIAO_V2_MERGE_QUEUE:-0}"
+    ports:
+      - "7331:7331"
+    volumes:
+      - /data_n004/biao/docker/biao-data:/data
+    networks:
+      - biao-net
+    restart: unless-stopped
+
+networks:
+  biao-net:
+    driver: bridge

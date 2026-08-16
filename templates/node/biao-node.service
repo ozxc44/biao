@@ -1,0 +1,59 @@
+# biao-node systemd 单元模板（Phase 3 · §10.2）
+#
+# 占位符替换说明（替换后不得再残留任何占位符）：
+#   __NODE_BIN__             Node.js 运行时绝对路径，如 /usr/bin/node
+#   __BIAO_NODE_JS__         bin/biao-node.js 绝对路径
+#   __BIAO_NODE_CONFIG__     biao-node.config.json 绝对路径
+#   __BIAO_NODE_STATE_DIR__  节点状态/日志目录（daemon 用户可写）
+#   __BIAO_NODE_CACHE_DIR__  本地缓存根（config 的 cache_root）
+#   __BIAO_NODE_USER__       运行用户（建议专用低权账号）
+#   __BIAO_NODE_GROUP__      运行组
+#   __BIAO_NODE_ENV_FILE__   EnvironmentFile 绝对路径（0600；只放过渡期
+#                            BIAO_NODE_OWNER_TOKEN，Node credential 不放这里）
+#
+# 安装步骤（中文 runbook：docs/runbooks/biao-node.md）：
+#   1. 替换占位符后：sudo systemctl daemon-reload
+#   2. sudo systemctl enable --now biao-node.service
+#   3. 排空/升级：biao-node drain --config <配置> && sudo systemctl restart biao-node
+#   4. EnvironmentFile 权限门禁：sudo chown root:__BIAO_NODE_GROUP__ <env 文件> &&
+#      sudo chmod 640 <env 文件>（或 0600 归运行用户）
+#
+# 停止语义：KillSignal=SIGTERM 触发 daemon 优雅 drain（等待 running
+# attempts 收口），TimeoutStopSec 内未收口由 systemd SIGKILL 兜底——
+# 该值必须大于配置 drain_timeout_ms，否则显式 cancel 动作没有机会执行。
+
+[Unit]
+Description=biao-node（Biao 分布式节点守护进程）
+Documentation=https://github.com/ozxc44/biao docs/runbooks/biao-node.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__BIAO_NODE_USER__
+Group=__BIAO_NODE_GROUP__
+WorkingDirectory=__BIAO_NODE_STATE_DIR__
+EnvironmentFile=__BIAO_NODE_ENV_FILE__
+ExecStart=__NODE_BIN__ __BIAO_NODE_JS__ run --config __BIAO_NODE_CONFIG__
+
+# 优雅停止：SIGTERM=drain；必须大于 biao-node 配置的 drain_timeout_ms
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+# 非零退出（fencing/配置错误）自动重启；drain 后 exit 0 不重启
+Restart=on-failure
+RestartSec=10
+
+# 日志走 journald；状态/缓存目录才可写
+StandardOutput=journal
+StandardError=journal
+
+# 最小权限加固：根目录只读，仅放开 daemon 自己的目录
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__BIAO_NODE_STATE_DIR__ __BIAO_NODE_CACHE_DIR__
+
+[Install]
+WantedBy=multi-user.target

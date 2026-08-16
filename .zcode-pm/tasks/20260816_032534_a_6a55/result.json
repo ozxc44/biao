@@ -1,0 +1,22 @@
+{
+  "status": "success",
+  "worker": "hermes-a",
+  "backend": "mimo_code",
+  "model": "xiaomi/mimo-v2.5-pro",
+  "model_override_applied": false,
+  "returncode": 0,
+  "stdout_log": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_032534_a_6a55/stdout.log",
+  "stderr_log": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_032534_a_6a55/stderr.log",
+  "session_id": "ses_ff91cfd1fffe4PazncCZ55R7dp",
+  "usage": {
+    "total": 145456,
+    "input": 1318,
+    "output": 330,
+    "reasoning": 0,
+    "cache": {
+      "write": 0,
+      "read": 143808
+    }
+  },
+  "cost": 0.0013781388
+}

@@ -109,7 +109,7 @@ Redis 负责实时调度（lease、ownership、队列），SQLite 保存任务�
 
 ### 被动事件中枢 + 持久化 Question · Passive Hub
 
-平台不主动 push、不常驻 Reviewer、不自动验收。状态变化只写一次**持久、可补交、可确认**的 PM 事件，由 PM 主动轮询；Worker 遇到产品决策时不向人类会话提问，而是发一条 `BIAO_QUESTION`，平台原子创建 Question、释放 lease、置任务等待，PM 回答后才用新 claim 继续。
+服务端不主动 push、不常驻 Reviewer、不自动验收（按需唤醒 PM 的是 PM 同机的共享 Supervisor，见下文）。状态变化只写一次**持久、可补交、可确认**的 PM 事件，由 PM 主动轮询；Worker 遇到产品决策时不向人类会话提问，而是发一条 `BIAO_QUESTION`，平台原子创建 Question、释放 lease、置任务等待，PM 回答后才用新 claim 继续。
 
 > 对比 chat 式 Agent：没有"悄悄搁住任务等人回答"的灰色地带。
 
@@ -122,6 +122,8 @@ Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网�
 一句话定位：**harness 解决的是"一个 Agent 怎么把代码写好"，Biao 解决的是"多个不同 harness 的 Agent 怎么一起安全地把项目交付完"。**
 
 ## 架构与技术栈
+
+### 单机模式（V1，默认）
 
 ```text
                     ┌────────────────────────────────────────────┐
@@ -138,14 +140,38 @@ Node.js + Redis + SQLite 即可运行，无云依赖。适合本机、局域网�
 - **客户端**：一个共享 Supervisor 进程承载 PM 门铃、按需 PM Agent 唤醒和全部 Worker slot；Worker 通过 CLI 启动器或标准 HTTP API 接入。
 - **Web 控制台**：`web/` 下的 Vue 前端，构建产物由服务端托管，本机 loopback 自动登录。
 
+### 分布式多机模式（V2，可选启用）
+
+```text
+  ┌─────────────┐       ┌──────────────────────┐       ┌─────────────┐
+  │   PM 机器    │       │    中央服务区（NAS）   │       │  Worker 节点  │
+  │  Web/CLI    │       │  Biao Server + Redis  │       │  biao-node  │
+  │  bvh2 Cookie│◄─────►│  + Gitea + Artifact   │◄─────►│  bvn2 凭据   │
+  └─────────────┘  LAN  │  + SQLite + 合并队列   │  LAN  └─────────────┘
+                            │
+                    每 attempt 独立 clone + 独立分支
+                    服务端 diff 验证 + 单写者 Merge Queue
+```
+
+- **中央服务区**（推荐 NAS 部署）：Docker 化的 Biao Server + Redis（AOF）+ SQLite + 内容寻址制品存储 + Git Remote（Gitea）。`deploy/nas/` 一键部署。
+- **Worker 节点**（任意 OS）：`biao-node` 守护进程，凭 bvn2 Node credential 领取任务、clone 最新代码到独立工作区、执行修改、push 分支、上传制品、上报结果。
+- **凭据体系**：Owner API Token → bvn2（Node）→ bva2（Attempt，scope=claim/report/ownership）→ bvh2（人类会话，RBAC 四角色）。互相独立、可撤销、密钥可轮换。
+- **五旗灰度**：`BIAO_DISTRIBUTED_MODE → BIAO_V2_ARTIFACTS → BIAO_V2_NODE_RUNTIME → BIAO_V2_GIT_DELIVERY → BIAO_V2_MERGE_QUEUE`，按依赖序逐面开启，关闭按反序。默认全关 = 纯 V1。
+- **远程控制台登录**：Owner 创建 enrollment code 或用户名密码账户 → bvh2 Cookie（HttpOnly, SameSite=Strict, 30 天）→ 全功能访问。
+
+详见 [分布式多节点方案](docs/distributed-multi-node-development-plan.md) 与 [NAS 部署指南](deploy/nas/README.md)。
+
 主要目录：
 
 ```text
 src/           服务端与 CLI 源码（server / redis / db / worker / cli / plan）
-scripts/       supervisor、pm-agent、bootstrap 等可执行入口
-bin/           codex-worker / kimi-worker / biao 等启动脚本
+src/server/v2/ 分布式 V2 层（领域服务、Git workspace、合并队列、RBAC、凭据）
+src/node/      biao-node 守护进程（Worker 节点运行时）
+scripts/       supervisor、pm-agent、bootstrap、sync-preflight 等可执行入口
+bin/           codex-worker / kimi-worker / biao / biao-node / biao-mcp 等启动脚本
+deploy/nas/    Docker 化部署（Dockerfile + docker-compose + install.sh）
 docs/          产品与接入文档
-tests/         vitest 测试（服务端契约 + 真实子进程端到端）
+tests/         vitest 测试（服务端契约 + 真实子进程端到端 + 分布式 E2E）
 web/           Web 控制台前端
 ```
 
@@ -942,7 +968,6 @@ node bin/biao.js version
 node bin/biao.js status
 node bin/biao.js events --since 1h
 node bin/biao.js conflicts
-
 # 计划和任务
 node bin/biao.js plan list
 node bin/biao.js plan status my-feature
@@ -966,6 +991,12 @@ node bin/biao.js watchdog --auto-fix
 node bin/biao.js db status
 node bin/biao.js db restore --yes
 ```
+
+## MCP 接口（AI Agent 优先入口）
+
+AI Agent 的结构化操作优先走 `biao-mcp`：任务领取/心跳/上报/阻塞、PM 待验收与证据摘要、plan/task 状态查询、ownership 检查与 Question 提问。`biao-mcp` 是每台开发机上的**本地 stdio 适配器**：由本机 MCP 客户端作为子进程启动，通过 HTTP（`BIAO_URL` + `BIAO_API_TOKEN`）访问中央 Biao 服务，不监听端口。它与 CLI 共用同一套 service 层校验和并行度分析，没有第二套规则。
+
+CLI 保留用于人工运维、脚本兼容（`.biao/*`）与灾备恢复；今后面向 AI 的新能力默认只加 MCP 工具。完整工具清单、客户端配置与安全模型见 [docs/mcp.md](docs/mcp.md)。
 
 ### SQLite 灾难恢复（只在空 namespace 中执行）
 
@@ -1009,7 +1040,7 @@ CLI 面向 Agent 和自动化脚本提供可靠退出码：服务返回 `ok:fals
 
 ## 被动式 PM 轮询、提醒与验收就绪通知
 
-Biao 是一个被动的状态与事件中枢：状态变化时只记录一次持久、可补交、可确认的 PM 事件，由 PM/CLI 主动轮询并提醒。平台**不会**主动唤醒 PM、不常驻 Reviewer、不自动验收，也不要求人盯看板。
+Biao **服务端**是一个被动的状态与事件中枢：状态变化时只记录一次持久、可补交、可确认的 PM 事件，从不主动联系或唤醒任何 PM，不常驻 Reviewer、不自动验收，也不要求人盯看板。PM 侧有两种消费方式：PM/CLI 主动轮询，或者由**你自己机器上的共享 Supervisor**（`.biao/start` 托管，可选）在有最小待办时按需唤醒 PM Agent——Supervisor 是客户端组件，它也绝不自动 ack、回答或验收。服务端与 Supervisor 的这一分工在 [PM 手册](.biao/PM_AGENT.md)与[ Supervisor 定时唤起](docs/supervisor-scheduling.md)中一致。
 
 ### PM 事件语义
 
@@ -1118,9 +1149,9 @@ Biao **不会自动安装任何系统计划任务**。需要常驻或定时唤�
 
 ### 平台保持被动的边界
 
+- 上述“被动”指 **Biao 服务端**：不通过 webhook、系统通知或私有 Desktop API 主动调用 PM，只提供可被 PM 客户端主动轮询的状态、事件和 Question 协议（`/intake`、`/intake/unacked`、`/intake/ack`、`/events`、`/questions`、`/question/:id`、`/status`、`/watchdog`）。
+- 按需唤醒 PM 的是运行在 PM 同机上的共享 Supervisor（客户端组件，见上文与 [Supervisor 定时唤起](docs/supervisor-scheduling.md)）；它只投递最小门铃，且绝不自动 ack、回答或验收。
 - SSE 接口保持兼容（仍每 ~2 秒轮询 Redis 推送事件）。
-- 本任务**不要求**平台通过 webhook、系统通知或私有 Desktop API 主动调用 PM。
-- 平台只提供可被 PM 客户端主动轮询的状态、事件和 Question 协议：`/intake`、`/intake/unacked`、`/intake/ack`、`/events`、`/questions`、`/question/:id`、`/status`、`/watchdog`。
 
 ## 服务配置
 
@@ -1220,15 +1251,25 @@ npm run verify:package
 
 ## 当前边界
 
-Biao 当前定位是本地优先的多 Agent 研发控制台，而不是完整企业 SaaS。源代码以 [Apache-2.0](LICENSE) 公开，但目前尚未内置：
+Biao 当前定位是本地优先、局域网多机的多 Agent 研发控制台。源代码以 [Apache-2.0](LICENSE) 公开，目前已实现：
+
+- 单机 V1 完整闭环（调度、ownership、Question、验收、灾难恢复）
+- 局域网 V2 分布式（中央服务区 + 多 Worker 节点 + Git 工作空间 + 制品存储 + 合并队列）
+- 四层凭据体系（Owner → Node → Attempt → Human RBAC）
+- Web 控制台远程登录（enrollment code / 用户名密码）
+- MCP 接口（LAN stdio 适配器，13 个工具）
+- 同步预检体系（六段门禁 + pre-push hook）
+
+尚未内置：
 
 - GitHub/GitLab PR 与 CI 原生联动；
-- 企业 SSO、RBAC 和多租户；
+- 企业 SSO 与多租户（Phase 6 RBAC 已实现四角色，但 SSO 未接）；
 - 容器级 Worker 沙箱；
 - 模型 Token、成本和 Trace 分析；
-- 跨节点自动部署和弹性扩缩容。
+- TLS 传输加密（当前推荐局域网部署或反向代理 TLS 终止）；
+- 异 OS 实机验证（Windows/macOS Worker 实跑属灰度阶段）。
 
-这些能力可以后续接入，但不影响当前本地多 Agent 调度、验证和验收闭环。
+这些能力可以后续接入，但不影响当前单机和多机多 Agent 调度、验证和验收闭环。
 
 ## 文档索引
 
@@ -1237,11 +1278,22 @@ Biao 当前定位是本地优先的多 Agent 研发控制台，而不是完整�
 | [5 分钟快速上手](docs/quickstart.md) | 从 bootstrap 到第一次 PM 验收的最短路径 |
 | [Worker 接入契约](docs/worker-integration.md) | 领取、ownership、Question、上报的完整契约 |
 | [规划 CLI](docs/planning-cli.md) | `plan` / `task add` / `task edit` 的 Agent 机器合同 |
+| [MCP 接口](docs/mcp.md) | `biao-mcp` LAN stdio 适配器：工具清单、客户端配置与安全模型 |
+| [一站式加入](docs/agent-join.md) | 新 Agent 一条命令注册、自动绑定并领取 Worker Token |
 | [无人盯盘的闭环](docs/autonomous-closure.md) | 失败、拒绝与 resolution 的自动闭环边界 |
 | [陌生 Agent 接入包](docs/agent-adapter-kit.md) | `contract → scaffold → check` 三步生成适配器 |
 | [预构建安装与升级](docs/prebuilt-install.md) | npm tarball 布局、runtime-dir 与升级流程 |
 | [Supervisor 定时唤起](docs/supervisor-scheduling.md) | cron / launchd 定时器示例 |
 | [真实 Harness 端到端验收剧本](docs/e2e-real-harness-runbook.md) | 用真实 `codex` 走完产品级闭环 |
+| [分布式多节点方案](docs/distributed-multi-node-development-plan.md) | 多机架构、领域模型、状态机、Git 工作空间、合并队列、安全与灰度 |
+| [验收审计](docs/distributed-multi-node-acceptance-audit.md) | §22 矩阵 99 项逐项判定与证据 |
+| [NAS 部署指南](deploy/nas/README.md) | Docker 化中央服务区一键部署 |
+| [NAS 运维手册](docs/runbooks/nas-deploy.md) | 升级、备份、回退、feature flag 灰度 |
+| [远程控制台登录](docs/runbooks/remote-console-auth.md) | enrollment code / 用户名密码 → bvh2 Cookie |
+| [biao-node 运维](docs/runbooks/biao-node.md) | Worker 节点安装、服务化、drain/升级 |
+| [Git Workspace](docs/runbooks/git-workspace.md) | 每 attempt 独立 clone、分支命名、signed marker、BranchCleanup |
+| [Merge Queue](docs/runbooks/merge-queue.md) | 串行队列、默认分支 CAS、conflict/integration_failed |
+| [同步预检](scripts/sync-preflight.sh) | git push 前的六段门禁（构建/安全/测试/git/平台健康/PM 台账） |
 | [docs/README.md](docs/README.md) | 文档目录总览 |
 
 ### 源码开放与软件包发布

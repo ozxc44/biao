@@ -1,37 +1,86 @@
 import { useEffect, useState } from 'react';
-import { beginLocalOwnerSession, fetchHumanSession } from './api';
-import { LocalOwnerAccessGate, LocalOwnerSessionControl } from './components/LocalOwnerAccess';
+import {
+  beginLocalOwnerSession,
+  fetchHumanSession,
+  getHumanSessionStatus,
+  type HumanWebSessionCreated,
+} from './api';
+import { LocalOwnerSessionControl } from './components/LocalOwnerAccess';
+import { HumanLoginPage, HumanSessionControl } from './components/HumanLoginPage';
 import { PlanDetailView } from './components/PlanDetailView';
 import { ProjectListView } from './components/ProjectListView';
 import { LanguageSwitcher } from './i18n/LanguageSwitcher';
 import { useI18n } from './i18n/I18nContext';
 import { planSelectionUrl, selectedPlanFromSearch } from './navigation';
 
+/** 认证通道：本机 Owner 会话 / auth_disabled 直通 / 远程人类 Cookie 会话。 */
+type AuthKind = 'none' | 'local_owner' | 'auth_disabled' | 'human';
+
+interface AuthState {
+  loading: boolean;
+  kind: AuthKind;
+  /** loopback 本机会话入口是否可用（/auth/session.local_session_available）。 */
+  localAvailable: boolean;
+  /** 远程 enrollment 登录是否可用（/auth/human-session.available）。 */
+  remoteAvailable: boolean;
+  /** 远程会话身份（kind==='human' 时存在）。 */
+  subject?: string;
+  role?: string;
+  /** Cookie 曾存在但已失效（提示重新申领登录码）。 */
+  sessionExpired: boolean;
+  error: string | null;
+}
+
+const initialAuthState: AuthState = {
+  loading: true,
+  kind: 'none',
+  localAvailable: false,
+  remoteAvailable: false,
+  sessionExpired: false,
+  error: null,
+};
+
 export default function App() {
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(() =>
     typeof window === 'undefined' ? null : selectedPlanFromSearch(window.location.search));
   const [authRevision, setAuthRevision] = useState(0);
-  const [humanSession, setHumanSession] = useState<{ loading: boolean; authenticated: boolean; available: boolean; error: string | null }>({
-    loading: true, authenticated: false, available: false, error: null,
-  });
+  const [auth, setAuth] = useState<AuthState>(initialAuthState);
   const { t } = useI18n();
 
   useEffect(() => {
     let cancelled = false;
+    // 方案 E 双通道：先查本机会话 → 不行再查远程人类会话 → 都不行显示登录页。
     void fetchHumanSession()
-      .then((session) => {
-        if (!cancelled) setHumanSession({
+      .then(async (session) => {
+        if (cancelled) return;
+        if (session.authenticated) {
+          setAuth({
+            loading: false,
+            kind: session.mode === 'auth_disabled' ? 'auth_disabled' : 'local_owner',
+            localAvailable: session.local_session_available,
+            remoteAvailable: false,
+            sessionExpired: false,
+            error: null,
+          });
+          return;
+        }
+        const human = await getHumanSessionStatus();
+        if (cancelled) return;
+        setAuth({
           loading: false,
-          authenticated: session.authenticated,
-          available: session.local_session_available,
+          kind: human.authenticated ? 'human' : 'none',
+          localAvailable: session.local_session_available,
+          remoteAvailable: human.available ?? false,
+          subject: human.subject,
+          role: human.role,
+          sessionExpired: Boolean(!human.authenticated && human.expired),
           error: null,
         });
       })
       .catch((error) => {
-        if (!cancelled) setHumanSession({
+        if (!cancelled) setAuth({
+          ...initialAuthState,
           loading: false,
-          authenticated: false,
-          available: false,
           error: error instanceof Error ? error.message : String(error),
         });
       });
@@ -52,13 +101,37 @@ export default function App() {
 
   const enterLocalOwnerSession = async () => {
     const session = await beginLocalOwnerSession();
-    setHumanSession({ loading: false, authenticated: session.authenticated, available: session.local_session_available, error: null });
+    setAuth((current) => ({
+      ...current,
+      loading: false,
+      kind: session.authenticated ? 'local_owner' : current.kind,
+      sessionExpired: false,
+      error: null,
+    }));
+    setAuthRevision((value) => value + 1);
+  };
+
+  const enterHumanSession = (session: HumanWebSessionCreated) => {
+    setAuth({
+      ...auth,
+      loading: false,
+      kind: 'human',
+      subject: session.subject,
+      role: session.role,
+      sessionExpired: false,
+      error: null,
+    });
     setAuthRevision((value) => value + 1);
   };
 
   const signOut = () => {
     selectPlan(null, true);
-    setHumanSession((current) => ({ ...current, authenticated: false }));
+    setAuth((current) => ({
+      ...current,
+      kind: 'none',
+      subject: undefined,
+      role: undefined,
+    }));
     setAuthRevision((value) => value + 1);
   };
 
@@ -79,17 +152,25 @@ export default function App() {
             </button>
           )}
           <LanguageSwitcher />
-          {humanSession.authenticated && <LocalOwnerSessionControl onSignedOut={signOut} />}
+          {auth.kind === 'human' && auth.subject && (
+            <HumanSessionControl subject={auth.subject} role={auth.role ?? ''} onSignedOut={signOut} />
+          )}
+          {(auth.kind === 'local_owner' || auth.kind === 'auth_disabled') && (
+            <LocalOwnerSessionControl onSignedOut={signOut} />
+          )}
         </div>
       </header>
 
-      {humanSession.loading ? (
+      {auth.loading ? (
         <div className="notice">{t('common.loadingConsole')}</div>
-      ) : !humanSession.authenticated ? (
-        <LocalOwnerAccessGate
-          available={humanSession.available}
-          error={humanSession.error}
-          onEntered={enterLocalOwnerSession}
+      ) : auth.kind === 'none' ? (
+        <HumanLoginPage
+          localAvailable={auth.localAvailable}
+          remoteAvailable={auth.remoteAvailable}
+          error={auth.error}
+          sessionExpired={auth.sessionExpired}
+          onEnteredLocal={enterLocalOwnerSession}
+          onEnteredHuman={enterHumanSession}
         />
       ) : selectedPlanId ? (
         <PlanDetailView planId={selectedPlanId} authRevision={authRevision} />

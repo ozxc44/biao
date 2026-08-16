@@ -146,6 +146,34 @@ describe('Supervisor owner-only slot config CLI', () => {
     expect(readFileSync(config, 'utf8')).toBe(before);
   });
 
+  it('configures a harness heartbeat command by agent id without a project binding id', async () => {
+    const { config } = makeConfig();
+    await run([
+      '--config', config,
+      'worker', 'add',
+      '--id', 'glm5.3',
+      '--kind', 'custom',
+      '--project', '/Volumes/Workspace/project',
+      '--types', 'code,review',
+      '--command', '/opt/glm/heartbeat',
+      '--harness-kind', 'glm',
+      '--wake-mode', 'external_worker',
+      '--adapter-id', 'glm-heartbeat-v1',
+    ]);
+
+    const listed = await run(['--config', config, 'worker', 'list']);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({
+        agentId: 'glm5.3',
+        command: '/opt/glm/heartbeat',
+        harnessKind: 'glm',
+        wakeMode: 'external_worker',
+        adapterId: 'glm-heartbeat-v1',
+      }),
+    ]);
+    expect(listed.stdout).not.toContain('bindingId');
+  });
+
   it('adds, lists, and removes independent PM queue slots without exposing config credentials', async () => {
     const { config } = makeConfig();
     const command = '/Users/operator/Agent Adapters/kimi pm';

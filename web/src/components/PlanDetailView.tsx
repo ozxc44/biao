@@ -1,12 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   cancelTask,
+  connectProjectAgent,
+  deleteProjectAgentBinding,
   fetchPlan,
+  fetchProjectAgentRoster,
   fetchTaskReview,
   resetTask,
   reviewTask,
   subscribeToEvents,
+  type ExecutionReceiptData,
   type PlanData,
+  type ProjectAgentOnlineCandidateData,
+  type ProjectAgentRosterData,
   type TaskReviewInfo,
   type TaskSummary,
   type VerifyResult,
@@ -31,6 +37,8 @@ import {
   type RootTaskCard,
 } from '../view-model';
 import CopyButton from './CopyButton';
+import { ExecutionReceipt } from './ExecutionReceipt';
+import { ProjectAgentRoster } from './ProjectAgentRoster';
 
 interface SelectedTask {
   card: RootTaskCard;
@@ -52,23 +60,43 @@ const COLLAPSED_GROUP_LIMIT = 5;
 export function PlanDetailView({ planId, authRevision }: { planId: string; authRevision: number }) {
   const { locale, t } = useI18n();
   const [plan, setPlan] = useState<PlanData | null>(null);
+  const [agentRoster, setAgentRoster] = useState<ProjectAgentRosterData | null>(null);
+  const [agentRosterError, setAgentRosterError] = useState('');
+  const [agentRosterBusy, setAgentRosterBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<SelectedTask | null>(null);
   const [message, setMessage] = useState('');
   const [now, setNow] = useState(Date.now());
   const [expandedGroups, setExpandedGroups] = useState<Set<BoardGroupKey>>(() => new Set());
+  const loadGeneration = useRef(0);
 
   const load = async () => {
+    const generation = ++loadGeneration.current;
     try {
       const next = await fetchPlan(planId);
+      if (generation !== loadGeneration.current) return;
       setPlan(next);
       setError(null);
+      try {
+        const nextRoster = await fetchProjectAgentRoster(next.project_path);
+        if (generation !== loadGeneration.current) return;
+        setAgentRoster(nextRoster);
+        setAgentRosterError('');
+      } catch (rosterError) {
+        if (generation !== loadGeneration.current) return;
+        setAgentRoster(null);
+        setAgentRosterError(rosterError instanceof Error ? rosterError.message : String(rosterError));
+      }
     } catch (loadError) {
+      if (generation !== loadGeneration.current) return;
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     }
   };
 
   useEffect(() => {
+    setPlan(null);
+    setAgentRoster(null);
+    setAgentRosterError('');
     let active = true;
     const guardedLoad = async () => {
       if (!active) return;
@@ -78,6 +106,7 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
     const unsubscribe = subscribeToEvents(() => void guardedLoad());
     return () => {
       active = false;
+      loadGeneration.current += 1;
       unsubscribe();
     };
     // load is intentionally recreated; planId/authRevision define the subscription lifecycle.
@@ -94,6 +123,21 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
   }, []);
 
   const groups = useMemo(() => (plan ? buildRootTaskBoard(plan.tasks) : null), [plan]);
+
+  const mutateAgentRoster = async (action: () => Promise<unknown>, success: string) => {
+    if (!plan) return;
+    setAgentRosterBusy(true);
+    setAgentRosterError('');
+    try {
+      await action();
+      setAgentRoster(await fetchProjectAgentRoster(plan.project_path));
+      setMessage(success);
+    } catch (mutationError) {
+      setAgentRosterError(mutationError instanceof Error ? mutationError.message : String(mutationError));
+    } finally {
+      setAgentRosterBusy(false);
+    }
+  };
 
   if (error && !plan) return <div className="notice error" role="alert">{t('common.loadFailed')}{error}</div>;
   if (!plan || !groups) return <div className="notice">{t('common.loadingPlan')}</div>;
@@ -130,6 +174,21 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
           )}
         </div>
       </section>
+
+      <ProjectAgentConsolePanel
+        projectScope={plan.project_path}
+        roster={agentRoster}
+        error={agentRosterError}
+        busy={agentRosterBusy}
+        onAdd={(candidate) => mutateAgentRoster(
+          () => connectProjectAgent(plan.project_path, candidate.agent_id),
+          t('projectAgents.bindSuccess', { agent: candidate.label }),
+        )}
+        onRemove={(bindingId) => mutateAgentRoster(
+          () => deleteProjectAgentBinding(plan.project_path, bindingId),
+          t('projectAgents.unbindSuccess'),
+        )}
+      />
 
       {(!rootSummary.matchesDeclared || groups.projectionIssues.length > 0) && (
         <div className="banner error" role="alert">
@@ -237,6 +296,7 @@ export function PlanDetailView({ planId, authRevision }: { planId: string; authR
       {selected && (
         <TaskDetails
           selected={selected}
+          receipts={agentRoster?.receipts ?? []}
           onClose={() => setSelected(null)}
           onChanged={async (nextMessage) => {
             setSelected(null);
@@ -310,19 +370,22 @@ function TaskCard({
 
 function TaskDetails({
   selected,
+  receipts,
   onClose,
   onChanged,
 }: {
   selected: SelectedTask;
+  receipts: readonly ExecutionReceiptData[];
   onClose: () => void;
   onChanged: (message: string) => Promise<void>;
 }) {
   const { locale, t } = useI18n();
   const { card, group } = selected;
   const { actionTask, root, repairs } = card;
-  const timeline = getRootAttemptTimeline(card);
+  const timeline = getRootAttemptTimeline(card, receipts);
   const [selectedAttemptId, setSelectedAttemptId] = useState(actionTask.task_id);
   const task = timeline.find((item) => item.task.task_id === selectedAttemptId)?.task ?? actionTask;
+  const attemptReceipts = timeline.find((item) => item.task.task_id === task.task_id)?.receipts ?? [];
   const [review, setReview] = useState<TaskReviewInfo | null>(null);
   const [reviewError, setReviewError] = useState('');
   const [comment, setComment] = useState('');
@@ -435,6 +498,11 @@ function TaskDetails({
                   <span className="tag">{getStatusLabel(attemptStatus, t)}</span>
                   {item.isCurrent && <span className="tag">{t('planDetail.timelineCurrent')}</span>}
                   {item.isResolvedBy && <span className="tag">{t('planDetail.timelineResolvedBy')}</span>}
+                  {(item.receipts?.length ?? 0) === 0 ? (
+                    <span className="tag receipt-missing">{t('projectAgents.noReceiptShort')}</span>
+                  ) : (
+                    <span className="tag receipt-present">{t('projectAgents.receiptCount', { count: item.receipts?.length ?? 0 })}</span>
+                  )}
                 </button>
               );
             })}
@@ -471,6 +539,8 @@ function TaskDetails({
           {task.pm_reviewed_at !== undefined && <Detail label={t('planDetail.detailPmReviewedAt')} value={formatAuditTime(task.pm_reviewed_at, locale)} />}
           {resolution && <Detail label={t('planDetail.resolutionStatus')} value={getResolutionLabel(resolution.status, resolution.action, t)} />}
         </div>
+
+        <AttemptExecutionReceipts receipts={attemptReceipts} />
 
         {task.pm_review_comment && (
           <section className="detail-section">
@@ -681,6 +751,111 @@ function TaskDetails({
         {actionError && <div className="banner error" role="alert">{t('common.actionFailed')}{actionError}</div>}
       </aside>
     </div>
+  );
+}
+
+export function AttemptExecutionReceipts({ receipts }: { receipts: readonly ExecutionReceiptData[] }) {
+  const { t } = useI18n();
+  return (
+    <section className="detail-section attempt-receipts">
+      <h3>{t('projectAgents.attemptReceiptsHeading', { count: receipts.length })}</h3>
+      {receipts.length === 0 ? (
+        <p className="receipt-empty-warning">{t('projectAgents.attemptNoReceipt')}</p>
+      ) : (
+        <div className="execution-receipt-list">
+          {receipts.map((receipt) => <ExecutionReceipt key={receipt.attempt_id} receipt={receipt} />)}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export interface ProjectAgentConsolePanelProps {
+  projectScope: string;
+  roster: ProjectAgentRosterData | null;
+  error?: string;
+  busy: boolean;
+  onAdd: (candidate: ProjectAgentOnlineCandidateData) => void | Promise<unknown>;
+  onRemove: (bindingId: string) => void | Promise<unknown>;
+}
+
+export function ProjectAgentConsolePanel({
+  projectScope,
+  roster,
+  error,
+  busy,
+  onAdd,
+  onRemove,
+}: ProjectAgentConsolePanelProps) {
+  const { locale, t } = useI18n();
+  const scopeMismatch = Boolean(roster && roster.project_scope !== projectScope);
+  const scopedRoster = scopeMismatch ? null : roster;
+  const receipts = [...(scopedRoster?.receipts ?? [])].sort(
+    (a, b) => b.started_at - a.started_at || b.attempt_id.localeCompare(a.attempt_id),
+  );
+
+  return (
+    <section className="section-card project-agent-console" aria-label={t('projectAgents.consoleAriaLabel')}>
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">{t('projectAgents.eyebrow')}</p>
+          <h2>{t('projectAgents.heading')}</h2>
+          <p className="project-scope-note">{t('projectAgents.scopeLabel')}: <code>{projectScope}</code></p>
+        </div>
+        <span className="section-summary">{t('projectAgents.summary', {
+          bound: scopedRoster?.bound_agents.length ?? 0,
+          candidates: scopedRoster?.online_candidates.length ?? 0,
+        })}</span>
+      </div>
+
+      {error && <div className="banner error" role="alert">{t('projectAgents.loadError')}{error}</div>}
+      {scopeMismatch && <div className="banner error" role="alert">{t('projectAgents.scopeMismatch')}</div>}
+      {!scopedRoster && !error && !scopeMismatch && <div className="muted">{t('projectAgents.loading')}</div>}
+      {scopedRoster && (
+        <>
+          {scopedRoster.bound_agents.length === 0 && (
+            <div className="binding-empty-state">
+              <strong>{t('projectAgents.noBindingTitle')}</strong>
+              <p>{t('projectAgents.noBindingBody')}</p>
+            </div>
+          )}
+
+          <ProjectAgentRoster
+            joined_agents={scopedRoster.bound_agents.map((binding) => ({
+              ...binding,
+              latest_receipt_status: receipts.find((receipt) => receipt.binding_id === binding.binding_id)?.status ?? 'missing',
+            }))}
+            available_agents={scopedRoster.online_candidates}
+            busy={busy}
+            onAdd={(candidate) => {
+              const source = scopedRoster.online_candidates.find((item) => item.agent_id === candidate.agent_id);
+              if (source) void onAdd(source);
+            }}
+            onRemove={(bindingId, agent) => {
+              if (window.confirm(t('projectAgents.confirmUnbind', { agent: agent.label }))) {
+                void onRemove(bindingId);
+              }
+            }}
+          />
+
+          <details className="project-receipts" open={receipts.length > 0}>
+            <summary>{t('projectAgents.projectReceiptsHeading', { count: receipts.length })}</summary>
+            {receipts.length === 0 ? (
+              <p className="receipt-empty-warning">{t('projectAgents.projectNoReceipts')}</p>
+            ) : (
+              <div className="execution-receipt-list">
+                {receipts.map((receipt) => (
+                  <div key={receipt.attempt_id} className="project-receipt-entry">
+                    <p>{t('projectAgents.receiptTask', { task: receipt.task_id })} · {new Date(receipt.started_at).toLocaleString(locale)}</p>
+                    <ExecutionReceipt receipt={receipt} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </details>
+        </>
+      )}
+    </section>
   );
 }
 

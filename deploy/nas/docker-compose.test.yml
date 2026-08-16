@@ -1,0 +1,22 @@
+# NAS 部署测试配置（覆盖端口和卷，避免与生产环境冲突）
+# 用法：docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+
+services:
+  biao-redis:
+    ports:
+      - "${TEST_REDIS_PORT:-16380}:6379"
+    volumes:
+      - biao-test-redis-data:/data
+
+  biao-server:
+    ports:
+      - "${TEST_PORT:-17331}:7331"
+    environment:
+      BIAO_API_TOKEN: "test-token-for-e2e"
+      BIAO_V2_CREDENTIAL_KEY: "test-credential-key-for-e2e"
+    volumes:
+      - biao-test-data:/data
+
+volumes:
+  biao-test-redis-data:
+  biao-test-data:

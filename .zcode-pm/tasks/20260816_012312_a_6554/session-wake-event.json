@@ -1,0 +1,20 @@
+{
+  "event_id": "20260816_013229_20260816_012312_a_6554",
+  "type": "pm_worker_completed",
+  "task_id": "20260816_012312_a_6554",
+  "worker": "hermes-a",
+  "session_id": "sess_ebf761ff-39cd-4477-88c2-7cc7c2209ecd",
+  "project": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao",
+  "task_dir": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_012312_a_6554",
+  "goal_file": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/inbox/p1-laneB-service-wiring.md",
+  "result_status": "success",
+  "review_status": "skipped",
+  "result_md": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_012312_a_6554/result.md",
+  "result_json": "/Volumes/CodexMac/CodexData/Documents/Codex/2026-06-05/pm-worker-c-d-a-b/packages/biao/.zcode-pm/tasks/20260816_012312_a_6554/result.json",
+  "review_md": "",
+  "review_json": "",
+  "created_at": "2026-08-15T17:32:29+00:00",
+  "acked": false,
+  "session_wake_status": "resume_error:-32022",
+  "session_wake_attempted_at": "2026-08-15T17:32:44+00:00"
+}

@@ -1,0 +1,53 @@
+{
+  "is_error": false,
+  "duration_api_ms": 1979551,
+  "num_turns": 220,
+  "stop_reason": "end_turn",
+  "session_id": "3a783418-0124-4c4a-beaa-6f341fd5349a",
+  "total_cost_usd": 17.673222,
+  "usage": {
+    "input_tokens": 279077,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 25992768,
+    "output_tokens": 130730,
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "",
+    "iterations": [],
+    "speed": "standard"
+  },
+  "modelUsage": {
+    "glm-5.3": {
+      "inputTokens": 280972,
+      "outputTokens": 130874,
+      "cacheReadInputTokens": 25993024,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 17.673222,
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "canonicalModel": "glm-5.3",
+      "provider": "firstParty"
+    }
+  },
+  "permission_denials": [],
+  "terminal_reason": "completed",
+  "fast_mode_state": "off",
+  "fast_mode_disabled_reason": "sdk_opt_in_required",
+  "subtype": "success",
+  "api_error_status": null,
+  "result": "# Phase 4 交付总结：Git Workspace 与 Delivery\n\n## 变更文件\n\n**新增（车道内）**\n| 文件 | 内容 |\n| --- | --- |\n| `src/server/v2/git/provider.ts` | GitProvider 能力接口（clone/fetch/push/lsRemote/readRef/writeRef/diffStat/mergeBase + finalize 受控扩展），无 GitHub API 依赖（§6.1） |\n| `src/server/v2/git/generic-git.ts` | 适配器：execFile 参数直传不经 shell、单命令 30s 超时、2 MiB 输出上限、`-c core.autocrlf=false -c core.quotepath=false -c gc.auto=0`、`GIT_TERMINAL_PROMPT=0`（§19.2） |\n| `src/server/v2/git/workspace.ts` | Prepare 状态机 `pending→cloning→checking_base→creating_branch→ready` + Finalize `idle→committing→pushing→delivering→delivered/pending_recovery`（+`failed:*` 终态），每步先落库再执行、幂等可重入；fingerprint=`v1:<anchor>:<sha256(url\\nbranch\\nanchor)>`（锚点祖先校验）；孤儿扫描复用 orphan_recovery_candidates |\n| `src/server/v2/git/marker.ts` | R1C-005 signed marker：canonical JSON（键排序）+ HMAC-SHA256 + timing-safe 验签 + 身份字段核对 |\n| `src/server/v2/git/ownership-gate.ts` | write_globs 匹配（`**`/`*`/`?`，空列表 fail-closed） |\n| `src/server/v2/delivery-service.ts` | §7.3 服务端独立 diff 复核（ref CAS→base 可达→marker 验签→独立 diff×ownership）+ §4.5 状态机 `pending_review→reviewing→accepted\\|rejected\\|invalidated` + §4.4.2 BranchCleanup 幂等落记录/到期复核 HEAD 后删除 |\n| `src/db/migrations/007_git_workspace.ts` | `attempt_workspaces` 表 + `deliveries` 重建（追加 `pending_review/reviewing/pending_recovery` 状态、`diff_summary`/`server_verified` 列，旧数据全量迁移） |\n| `src/types/v2-git.ts` | 状态机/表行/marker/常量（85% 水位、30 天保留期、分支与 marker ref 前缀） |\n| `tests/distributed/p4-git-workspace.test.ts` | 20 用例，真实 git 子进程 + 自建临时 bare（不 import fixture） |\n| `docs/runbooks/git-workspace.md` | 中文 runbook：状态机图、七检查项对照表、分支/marker 规范、清理保留期、水位阈值、git 调用清单与安全约束、daemon 收尾项 |\n\n**修改**：`src/db/migrate.ts`（007 注册）、`src/db/sqlite-store.ts`（workspace/delivery/branch_cleanup 方法）、`src/types/v2-artifact.ts`（DeliveryStatus/Row 扩展，新列可选故 Phase 2 代码零改动）、`src/server/v2/routes/registry.ts` + `v2-routes.ts`（11 条 workspace/delivery 路由 + bva2 鉴权）、`src/server/v2/domain-interfaces.ts`（**注意：超出明示车道清单，但为路由 handler 引用的编译期必需，仅追加类型方法，无实现变更**）、版本期望测试 3 处改链条连续性断言（p0a2/p1-identity 不再硬编码终态号；p1-credentials 期望矩阵补 3 条）。\n\n## 验证\n\n- **构建**：`npm run build:server`（tsc + copy-assets）✅，`tsc --noEmit` ✅\n- **tests/distributed/**：19 文件 / **267 用例全绿**（基线 18/247，+20 为 p4 新增）\n- **全量**：**115 文件 / 1303 用例**，仅 1 失败 = 既有已知 flaky `supervisor-pm-agent-cli.test.ts`（SIGINT/SIGTERM 孙进程竞态，单独复跑 12/12 恒绿，与基线行为一致）——**不劣化 114/1283 基线**\n- §21 验收三项与七检查项逐项测试路径：并行不覆盖（T1）、ownership 拒绝（T2/§7.3 服务端复核 T8）、CAS/force-push/marker 篡改→invalidated（T3）、fingerprint 换仓+force 改写（T4）、base 不可达（T4）、水位 84/85 边界（T4）、marker 写失败（T4）、cloning/committing kill 重入收敛（T5）、orphan 扫描幂等（T5）、Artifact 中断 pending_recovery 收敛（T6）、BranchCleanup 到期/幂等 missing/head 变化拒删（T9）、HTTP 接线冒烟（T10）\n\n## 残余风险与收尾项\n\n1. **marker 密钥为进程内替身**：Phase 4 用控制面 credential keyring 的对称密钥模拟 Node signing key；真 Node 非对称密钥（enrollment 注册公钥）属 daemon 接线收尾项（runbook §8.1）\n2. **daemon 接线**：clone/commit/push 执行仍在服务端进程内模拟，`src/node/**` 未动（按约束）；收尾清单六项见 runbook §8（含 worktree 模式、mirror 维护、claim 自动写 ownership snapshot——当前无快照按 fail-closed 拒绝 finalize）\n3. **CAS 窗口**：push 前置 ls-remote 检查存在微小 TOCTOU 窗口，由非 force push 的 non-fast-forward 拒绝兜底（push-rejected → 复核 → invalidated）\n4. `domain-interfaces.ts` 的追加接口超出明示车道清单（类型-only、可分离），如需我可单独剥离",
+  "ttft_ms": 11746,
+  "ttft_stream_ms": 2637,
+  "time_to_request_ms": 28,
+  "type": "result",
+  "duration_ms": 3087090,
+  "uuid": "b19f38c8-0436-4f82-be4d-7a3a700980fb"
+}

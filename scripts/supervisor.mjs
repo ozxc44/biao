@@ -14,7 +14,7 @@
  * 或 --worker-slots <json-file>。没有 slot 时脚本只是 PM 门铃。
  */
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -278,10 +278,51 @@ function signalExitCode(signal) {
   return signal === 'SIGINT' ? 130 : 143;
 }
 
+/**
+ * 收集 rootPid 的整棵后代树（按 PPID 递归）。pm-agent 会把 adapter 放在自己的
+ * 独立进程组里启动，组信号到不了 adapter 及其孙进程；沿 pid 树补杀才能保证
+ * 信号覆盖整棵树，不依赖 pm-agent 的信号处理器代为转发。
+ */
+function descendantPids(rootPid) {
+  const seen = new Set([rootPid]);
+  const queue = [rootPid];
+  const result = [];
+  while (queue.length > 0) {
+    const pid = queue.shift();
+    let children = [];
+    try {
+      const out = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });
+      children = out.split(/\s+/).filter(Boolean).map(Number)
+        .filter((childPid) => Number.isInteger(childPid) && childPid > 0);
+    } catch {
+      // pgrep 无匹配时以 1 退出；其余错误不阻塞树遍历。
+    }
+    for (const childPid of children) {
+      if (seen.has(childPid)) continue;
+      seen.add(childPid);
+      result.push(childPid);
+      queue.push(childPid);
+    }
+  }
+  return result;
+}
+
 function signalPmAgentTree(slotId, child, signal) {
   try {
-    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
-    else child.kill(signal);
+    if (process.platform !== 'win32' && child.pid) {
+      process.kill(-child.pid, signal);
+      // 组信号只覆盖 pm-agent 自己的进程组；adapter 以 detached 独立组启动，
+      // 必须沿 pid 树逐点补杀，否则 adapter 的孙进程会成为孤儿。
+      for (const pid of descendantPids(child.pid)) {
+        try {
+          process.kill(pid, signal);
+        } catch {
+          // 已退出或已被组信号回收。
+        }
+      }
+    } else {
+      child.kill(signal);
+    }
   } catch (error) {
     if (error?.code !== 'ESRCH') {
       console.error(`[supervisor] 无法用 ${signal} 停止 PM slot ${slotId}：${error instanceof Error ? error.message : String(error)}`);
@@ -327,7 +368,11 @@ async function stopAndDrainActivePmAgents() {
     ]);
   };
 
-  stopActivePmAgents('SIGTERM');
+  // 信号路径里 stop() 已经发过一轮 SIGTERM（并为此设置了 force-kill 定时器）；
+  // 这里若再补一轮，pm-agent 的 process.once(SIGTERM) 会在第一轮被消费后把
+  // SIG_DFL 恢复，紧随其后的第二个 SIGTERM 会在 adapter 组被回收前把
+  // pm-agent 直接杀死，导致孙进程失孤。非信号路径（正常闭环退出）才在这里兜底发 SIGTERM。
+  if (!receivedSignal) stopActivePmAgents('SIGTERM');
   await waitForActivePmAgents(PM_FORCE_KILL_GRACE_MS + 500);
   if (activePmAgents.size === 0) return;
   stopActivePmAgents('SIGKILL');

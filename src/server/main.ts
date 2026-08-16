@@ -142,7 +142,7 @@ export async function startServer(overrides: Partial<BiaoConfig> = {}): Promise<
     console.warn('[biao] 历史闭环自动补偿失败：', (e as Error).message);
   }
 
-  const app = await createHttpServer(redis, config);
+  const app = await createHttpServer(redis, config, { sqliteStore: store });
   try {
     await app.listen({ port: config.port, host: config.host });
   } catch (error) {

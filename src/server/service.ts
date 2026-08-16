@@ -1,6 +1,17 @@
 /**
  * Biao 核心服务：claim/report/plan submit 的业务逻辑
  * 对应 docs/biao/05-biao-service-spec.md, 06-dispatch-protocol.md
+ *
+ * ── V1 facade 边界声明（Phase 0a-2 起，2026-08）────────────────────────────
+ * 自 Phase 0a-2 起，本文件不再新增 V2 逻辑；新逻辑一律进入对应领域模块
+ * （七个领域服务：Project/Node/Attempt/Delivery/Merge/Incident/Reconcile，
+ * 接口契约见 src/server/v2/domain-interfaces.ts）。本文件现有函数的归属台账
+ * 见 src/server/v2/SERVICE_MAP.md，作为后续分批搬迁到
+ * src/server/services/{projects,nodes,attempts,deliveries,merge,incidents,reconcile}.ts
+ * 的依据；搬迁后本文件只保留 re-export 兼容层（先例：maintenance.ts）。
+ * V2 的 durable-first 提交协议、attempt_generation fencing 与凭据分层要求见
+ * docs/distributed-multi-node-development-plan.md §13.1/§14.5/§15.6。
+ * ──────────────────────────────────────────────────────────────────────────
  */
 
 import type Redis from 'ioredis';
@@ -8,10 +19,24 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { keys, pendingScore, runningScore, DEFAULT_PM_CONSUMER, isValidConsumerName } from '../redis/keys.js';
-import { SqliteStore, type TaskRow, type PlanRow, type AgentRegistrationRow } from '../db/sqlite-store.js';
+import {
+  SqliteStore,
+  type AgentRegistrationRow,
+  type ExecutionReceiptRow,
+  type PlanRow,
+  type ProjectAgentBindingRow,
+  type TaskRow,
+} from '../db/sqlite-store.js';
 import type {
+  ExecutionReceiptCreateRequest,
+  ProjectAgentBinding,
+  ProjectAgentBindingCreateRequest,
+  ProjectAgentOnlineCandidate,
+  ProjectAgentRosterItem,
+  PublicExecutionReceipt,
   QuestionCreateRequest,
   QuestionAnswerRequest,
+  RegistrationProjectBinding,
   QuestionRecord,
   QuestionSummary,
   QuestionStatus,
@@ -33,6 +58,40 @@ import {
   QUESTION_BODY_MAX_CHARS,
   QUESTION_CHECKPOINT_MAX_CHARS,
 } from '../communication/question-context.js';
+import { isPlanTerminalStatus } from '../plan/status.js';
+
+import {
+  MARK_RESTORE_BARRIER_FAILED,
+  acquireMutationPermit,
+  acquireRestoreLock,
+  beginLocalMutation,
+  enterLocalMutation,
+  getRestoreMaintenanceGate,
+  isBiaoNamespaceEmpty,
+  maintenanceGateError,
+  releaseMutationPermit,
+  releaseRestoreBarrier,
+  releaseRestoreLock,
+  renewRestoreLock,
+  retryEmptyFailedRestore,
+  startMaintenanceRenewal,
+  type MaintenanceGateErrorCode,
+  type MaintenanceGateResult,
+  type MaintenanceRenewal,
+} from './maintenance.js';
+
+export {
+  acquireMutationPermit,
+  acquireRestoreLock,
+  activeLocalMutationCount,
+  beginLocalMutation,
+  getRestoreMaintenanceGate,
+  isBiaoNamespaceEmpty,
+  releaseMutationPermit,
+  releaseRestoreLock,
+  renewRestoreLock,
+} from './maintenance.js';
+export type { MaintenanceGateErrorCode, MaintenanceGateResult } from './maintenance.js';
 
 function configuredWorkspaceRoots(): string[] {
   return parseWorkspaceRoots(process.env.BIAO_WORKSPACE_ROOTS);
@@ -172,6 +231,426 @@ export function setSqliteStore(store: SqliteStore | null): void {
 /** 获取当前 store（供 CLI 的 db status/restore 用） */
 export function getSqliteStore(): SqliteStore | null {
   return sqliteStore;
+}
+
+const CONTROL_PLANE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const CONTROL_PLANE_TEXT = /^[^\u0000-\u001f\u007f]{1,256}$/u;
+const RECEIPT_SESSION_REF = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const CREDENTIAL_MARKERS = [
+  'authorization', 'bearer', 'biao_api_token', 'cookie', 'access_token', 'api_token', 'password', 'secret',
+];
+const PROJECT_AGENT_RESERVATION_TTL_MS = 30_000;
+const PROJECT_AGENT_RESERVATION_PREFIX = 'biao:v1:hash:project_agent_reservation:';
+
+function projectAgentReservationKey(reservationId: string): string {
+  return `${PROJECT_AGENT_RESERVATION_PREFIX}${reservationId}`;
+}
+
+export interface ProjectAgentTaskReservation {
+  reservation_id: string;
+  task_id: string;
+  plan_id: string;
+  project_path: string;
+  capability: string;
+  binding_id: string;
+  expires_at: number;
+}
+
+export interface ProjectAgentReservationRequest {
+  binding_id: string;
+  preferred_plan_ids?: string[];
+  task_id?: string;
+}
+
+function sqliteControlPlane(): SqliteStore | undefined {
+  return sqliteStore ?? undefined;
+}
+
+function controlPlaneUnavailable<T>(): ApiResponse<T> {
+  return { ok: false, data: null, error: { code: 'SQLITE_NOT_ENABLED', message: 'SQLite 持久化未启用' } };
+}
+
+function hasCredentialMarker(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return CREDENTIAL_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function normalizeCapabilities(values: string[] | undefined): string[] | undefined {
+  const capabilities = [...new Set(values ?? [])].sort();
+  return capabilities.every((value) => CONTROL_PLANE_ID.test(value)) ? capabilities : undefined;
+}
+
+function parseCapabilities(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === 'string' && CONTROL_PLANE_ID.test(value)).sort()
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function publicBinding(row: ProjectAgentBindingRow): ProjectAgentBinding {
+  return {
+    binding_id: row.binding_id,
+    project_scope: row.project_scope,
+    agent_id: row.agent_id,
+    label: row.label,
+    harness_kind: row.harness_kind,
+    capabilities: parseCapabilities(row.capabilities),
+    wake_mode: row.wake_mode,
+    policy: row.policy,
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+function publicReceipt(row: ExecutionReceiptRow): PublicExecutionReceipt {
+  return {
+    attempt_id: row.attempt_id,
+    task_id: row.task_id,
+    project_scope: row.project_scope,
+    binding_id: row.binding_id,
+    agent_id: row.agent_id,
+    harness_kind: row.harness_kind,
+    wake_mode: row.wake_mode,
+    adapter_id: row.adapter_id,
+    status: row.status,
+    started_at: Number(row.started_at),
+    ...(row.session_ref ? { session_ref: row.session_ref } : {}),
+    ...(row.visible_url ? { visible_url: row.visible_url } : {}),
+  };
+}
+
+function bindingInputError(input: ProjectAgentBindingCreateRequest): string | undefined {
+  if (input.binding_id && !CONTROL_PLANE_ID.test(input.binding_id)) return 'binding_id 格式无效';
+  if (!CONTROL_PLANE_ID.test(input.agent_id)) return 'agent_id 格式无效';
+  if (!CONTROL_PLANE_TEXT.test(input.label)) return 'label 格式无效';
+  if (!CONTROL_PLANE_ID.test(input.harness_kind)) return 'harness_kind 格式无效';
+  if (!normalizeCapabilities(input.capabilities)) return 'capabilities 格式无效';
+  if (!['visible_session', 'background_executor', 'external_worker'].includes(input.wake_mode)) return 'wake_mode 格式无效';
+  if (!['manual', 'on_demand', 'automatic'].includes(input.policy)) return 'policy 格式无效';
+  return undefined;
+}
+
+/**
+ * 绑定即加入项目：这是两条对外入口（/register 的 project_bindings 与
+ * /project/agent-connections）共用的内部写入，不直接暴露为 HTTP CRUD。
+ */
+export async function createProjectAgentBinding(
+  projectScope: string,
+  input: ProjectAgentBindingCreateRequest,
+): Promise<ApiResponse<ProjectAgentBinding>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const invalid = !projectScope.trim() ? 'project_scope 不能为空' : bindingInputError(input);
+  if (invalid) return { ok: false, data: null, error: { code: 'INVALID_PROJECT_AGENT_BINDING', message: invalid } };
+  const now = Date.now();
+  const row: ProjectAgentBindingRow = {
+    binding_id: input.binding_id ?? `binding-${randomUUID()}`,
+    project_scope: projectScope,
+    agent_id: input.agent_id,
+    label: input.label,
+    harness_kind: input.harness_kind,
+    capabilities: JSON.stringify(normalizeCapabilities(input.capabilities)),
+    wake_mode: input.wake_mode,
+    policy: input.policy,
+    created_at: now,
+    updated_at: now,
+  };
+  try {
+    store.createProjectAgentBinding(row);
+    return { ok: true, data: publicBinding(row) };
+  } catch (error) {
+    const code = (error as { code?: string }).code ?? '';
+    if (code.startsWith('SQLITE_CONSTRAINT')) {
+      return { ok: false, data: null, error: { code: 'PROJECT_AGENT_BINDING_EXISTS', message: '项目绑定已存在' } };
+    }
+    throw error;
+  }
+}
+
+export async function getProjectAgentBinding(
+  projectScope: string,
+  bindingId: string,
+): Promise<ApiResponse<ProjectAgentBinding | null>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const row = store.getProjectAgentBinding(projectScope, bindingId);
+  return { ok: true, data: row ? publicBinding(row) : null };
+}
+
+export async function listProjectAgentBindings(
+  projectScope: string,
+): Promise<ApiResponse<{ project_scope: string; bindings: ProjectAgentBinding[] }>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  return {
+    ok: true,
+    data: { project_scope: projectScope, bindings: store.getProjectAgentBindings(projectScope).map(publicBinding) },
+  };
+}
+
+export async function deleteProjectAgentBinding(
+  projectScope: string,
+  bindingId: string,
+): Promise<ApiResponse<{ binding_id: string; deleted: true }>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  if (!store.deleteProjectAgentBinding(projectScope, bindingId)) {
+    return { ok: false, data: null, error: { code: 'BINDING_NOT_FOUND', message: '项目绑定不存在' } };
+  }
+  return { ok: true, data: { binding_id: bindingId, deleted: true } };
+}
+
+function safeSessionRef(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return RECEIPT_SESSION_REF.test(value) && !hasCredentialMarker(value) ? value : undefined;
+}
+
+function safeVisibleUrl(value: string | undefined): string | undefined {
+  if (!value || value !== value.trim() || /[\u0000-\u001f\u007f\\]/u.test(value) || value.startsWith('//') || hasCredentialMarker(value)) {
+    return undefined;
+  }
+  try {
+    if (value.startsWith('/')) {
+      const relative = new URL(value, 'https://biao.invalid');
+      return relative.origin === 'https://biao.invalid' && !relative.search && !relative.hash
+        ? relative.pathname
+        : undefined;
+    }
+    const absolute = new URL(value);
+    return ['http:', 'https:'].includes(absolute.protocol) && !absolute.username && !absolute.password && !absolute.search && !absolute.hash
+      ? absolute.toString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function appendExecutionReceipt(
+  projectScope: string,
+  input: ExecutionReceiptCreateRequest,
+  redis?: Redis,
+): Promise<ApiResponse<PublicExecutionReceipt>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const binding = store.getProjectAgentBinding(projectScope, input.binding_id);
+  if (!binding) return { ok: false, data: null, error: { code: 'BINDING_NOT_FOUND', message: '项目绑定不存在' } };
+  const identifiers = [input.attempt_id, input.task_id, input.binding_id, input.agent_id, input.registration_id, input.harness_kind];
+  if (identifiers.some((value) => !CONTROL_PLANE_ID.test(value)) ||
+      !['visible_session', 'background_executor', 'external_worker'].includes(input.wake_mode) ||
+      !['requested', 'succeeded', 'failed'].includes(input.status) ||
+      !Number.isSafeInteger(input.started_at) || input.started_at < 0 ||
+      binding.agent_id !== input.agent_id || binding.harness_kind !== input.harness_kind || binding.wake_mode !== input.wake_mode) {
+    return { ok: false, data: null, error: { code: 'INVALID_EXECUTION_RECEIPT', message: '执行回执字段或绑定关系无效' } };
+  }
+  const adapterId = input.adapter_id && CONTROL_PLANE_ID.test(input.adapter_id) ? input.adapter_id : null;
+  if (input.adapter_id && !adapterId) {
+    return { ok: false, data: null, error: { code: 'INVALID_EXECUTION_RECEIPT', message: 'adapter_id 格式无效' } };
+  }
+  const status = input.status === 'succeeded' && !adapterId ? 'requested' : input.status;
+  if (status === 'succeeded' && redis) {
+    const reservation = await redis.hgetall(projectAgentReservationKey(input.attempt_id));
+    const task = await redis.hgetall(keys.hash.task(input.task_id));
+    if (
+      reservation.reservation_id !== input.attempt_id || reservation.status !== 'claimed' ||
+      reservation.task_id !== input.task_id || reservation.project_scope !== projectScope ||
+      reservation.binding_id !== input.binding_id || reservation.agent_id !== input.agent_id ||
+      reservation.registration_id !== input.registration_id || !reservation.claim_attempt_id ||
+      task.task_id !== input.task_id || task.claimed_by !== input.agent_id ||
+      !['running', 'blocked', 'done', 'failed'].includes(task.status ?? '')
+    ) {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'RESERVATION_NOT_REDEEMED',
+          message: 'succeeded 回执必须匹配已实际 claim 的 task、reservation 与 delivery attempt',
+        },
+      };
+    }
+  }
+  const sessionRef = status === 'succeeded' ? safeSessionRef(input.session_ref) : undefined;
+  const visibleUrl = status === 'succeeded' ? safeVisibleUrl(input.visible_url) : undefined;
+  if (status === 'succeeded' && ((input.session_ref && !sessionRef) || (input.visible_url && !visibleUrl))) {
+    return { ok: false, data: null, error: { code: 'INVALID_EXECUTION_RECEIPT', message: 'session_ref 或 visible_url 未通过安全校验' } };
+  }
+  const row: ExecutionReceiptRow = {
+    attempt_id: input.attempt_id,
+    task_id: input.task_id,
+    project_scope: projectScope,
+    binding_id: input.binding_id,
+    agent_id: input.agent_id,
+    registration_id: input.registration_id,
+    harness_kind: input.harness_kind,
+    wake_mode: input.wake_mode,
+    adapter_id: adapterId,
+    status,
+    started_at: input.started_at,
+    session_ref: sessionRef ?? null,
+    visible_url: visibleUrl ?? null,
+  };
+  try {
+    store.appendExecutionReceipt(row);
+    if (redis && status === 'failed') {
+      const reservation = await redis.hgetall(projectAgentReservationKey(input.attempt_id));
+      if (reservation.reservation_id === input.attempt_id && reservation.task_id === input.task_id
+          && reservation.binding_id === input.binding_id && reservation.status === 'reserved') {
+        await releaseProjectAgentReservation(redis, reservation, 'failed');
+      }
+    }
+    return { ok: true, data: publicReceipt(row) };
+  } catch (error) {
+    const code = (error as { code?: string }).code ?? '';
+    if (code.startsWith('SQLITE_CONSTRAINT')) {
+      return { ok: false, data: null, error: { code: 'EXECUTION_RECEIPT_EXISTS', message: 'attempt_id 已存在，回执不可覆盖' } };
+    }
+    throw error;
+  }
+}
+
+export async function listExecutionReceipts(
+  projectScope: string,
+  options: { binding_id?: string; task_id?: string } = {},
+): Promise<ApiResponse<{ project_scope: string; receipts: PublicExecutionReceipt[]; total: number }>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const receipts = store.getExecutionReceipts(projectScope, options).map(publicReceipt);
+  return { ok: true, data: { project_scope: projectScope, receipts, total: receipts.length } };
+}
+
+type OnlineProjectAgent = {
+  agent_id: string;
+  harness_kind: string;
+  capabilities: string[];
+  registered_projects: string[];
+};
+
+function onlineProjectAgentFromRegistration(
+  registration: Record<string, string>,
+  now: number,
+): OnlineProjectAgent | undefined {
+  if (!registration.agent_id) return undefined;
+  const status = deriveAgentStatus(
+    registration.status,
+    Number(registration.last_heartbeat ?? 0),
+    now,
+  );
+  if (!['idle', 'busy', 'online'].includes(status)) return undefined;
+  return {
+    agent_id: registration.agent_id,
+    harness_kind: registration.agent_type || 'custom',
+    capabilities: (registration.capabilities ?? '')
+      .split(',')
+      .filter((value) => CONTROL_PLANE_ID.test(value))
+      .sort(),
+    registered_projects: (registration.projects ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .sort(),
+  };
+}
+
+async function onlineProjectAgents(redis: Redis, now: number): Promise<Map<string, OnlineProjectAgent>> {
+  const agentIds = await redis.smembers(keys.planStatusProjection.agentIds);
+  const registrations = await Promise.all(agentIds.map((agentId) => redis.hgetall(keys.hash.agent(agentId))));
+  const online = new Map<string, OnlineProjectAgent>();
+  for (const registration of registrations) {
+    const agent = onlineProjectAgentFromRegistration(registration, now);
+    if (agent) online.set(agent.agent_id, agent);
+  }
+  return online;
+}
+
+/**
+ * 面向普通项目页面的一键连接入口。Owner 只选择在线 Agent；控制面从注册真相补全
+ * harness/capability，并统一使用 automatic + external_worker。具体唤醒脚本由该 Agent
+ * 所在机器的 Supervisor slot 按 agent_id 匹配，页面不再要求填写 bindingId 或策略。
+ */
+export async function connectProjectAgent(
+  redis: Redis,
+  projectScope: string,
+  agentId: string,
+  now = Date.now(),
+): Promise<ApiResponse<ProjectAgentBinding>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  if (!projectScope.trim() || !CONTROL_PLANE_ID.test(agentId)) {
+    return {
+      ok: false, data: null,
+      error: { code: 'INVALID_PROJECT_AGENT_CONNECTION', message: 'project_scope 或 agent_id 无效' },
+    };
+  }
+  const existing = store.getProjectAgentBindings(projectScope)
+    .find((binding) => binding.agent_id === agentId);
+  if (existing) return { ok: true, data: publicBinding(existing) };
+
+  const registration = onlineProjectAgentFromRegistration(
+    await redis.hgetall(keys.hash.agent(agentId)),
+    now,
+  );
+  if (!registration) {
+    return {
+      ok: false, data: null,
+      error: { code: 'PROJECT_AGENT_NOT_ONLINE', message: `Agent ${agentId} 当前不在线，不能加入项目` },
+    };
+  }
+  return createProjectAgentBinding(projectScope, {
+    agent_id: registration.agent_id,
+    label: registration.agent_id,
+    harness_kind: registration.harness_kind,
+    capabilities: registration.capabilities,
+    wake_mode: 'external_worker',
+    policy: 'automatic',
+  });
+}
+
+export async function getProjectAgentRoster(
+  redis: Redis,
+  projectScope: string,
+  now = Date.now(),
+): Promise<ApiResponse<{
+  project_scope: string;
+  bound_agents: ProjectAgentRosterItem[];
+  online_candidates: ProjectAgentOnlineCandidate[];
+  receipts: PublicExecutionReceipt[];
+}>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const bindings = store.getProjectAgentBindings(projectScope).map(publicBinding);
+  const boundAgentIds = new Set(bindings.map((binding) => binding.agent_id));
+  // “可添加”表示全局在线但尚未加入当前项目；不能提前按 registration.projects
+  // 过滤，否则页面永远无法把其它项目的在线 Agent 加入本项目。
+  const online = await onlineProjectAgents(redis, now);
+  const boundAgents = bindings.map((binding): ProjectAgentRosterItem => ({
+    ...binding,
+    availability_status: binding.policy === 'manual'
+      ? 'manual_required'
+      : binding.wake_mode === 'background_executor'
+        ? 'background_only'
+        : 'bound_wakeable',
+    online_registered: online.has(binding.agent_id),
+  })).sort((a, b) => a.binding_id.localeCompare(b.binding_id));
+  const onlineCandidates = [...online.entries()]
+    .filter(([agentId]) => !boundAgentIds.has(agentId))
+    .map(([agentId, registration]): ProjectAgentOnlineCandidate => ({
+      agent_id: agentId,
+      label: agentId,
+      harness_kind: registration.harness_kind,
+      capabilities: registration.capabilities,
+      project_scope: projectScope,
+      registered_projects: registration.registered_projects,
+      availability_status: 'online_registered',
+    }))
+    .sort((a, b) => a.agent_id.localeCompare(b.agent_id));
+  const receipts = store.getExecutionReceipts(projectScope).map(publicReceipt);
+  return {
+    ok: true,
+    data: { project_scope: projectScope, bound_agents: boundAgents, online_candidates: onlineCandidates, receipts },
+  };
 }
 
 async function persistTaskFromRedis(redis: Redis, taskId: string): Promise<void> {
@@ -332,308 +811,6 @@ export async function getDbStatus(redis: Redis): Promise<ApiResponse<{
   };
 }
 
-const MAINTENANCE_PERMIT_TTL_MS = 120_000;
-const RESTORE_LOCK_TTL_MS = 300_000;
-const MAINTENANCE_RENEW_INTERVAL_MS = 30_000;
-let localMutationCount = 0;
-
-export type MaintenanceGateErrorCode =
-  | 'RESTORE_IN_PROGRESS'
-  | 'RESTORE_FAILED'
-  | 'RESTORE_WRITERS_ACTIVE'
-  | 'RESTORE_ACTIVE_RUNTIME_STATE'
-  | 'RESTORE_TARGET_NOT_EMPTY'
-  | 'RESTORE_LEASE_LOST';
-
-export type MaintenanceGateResult =
-  | { ok: true; owner: string }
-  | { ok: false; error: { code: MaintenanceGateErrorCode; message: string } };
-
-function enterLocalMutation(): () => void {
-  localMutationCount++;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    localMutationCount = Math.max(0, localMutationCount - 1);
-  };
-}
-
-export function activeLocalMutationCount(): number {
-  return localMutationCount;
-}
-
-export function beginLocalMutation(): () => void {
-  return enterLocalMutation();
-}
-
-const ACQUIRE_MUTATION_PERMIT = `
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local expires_at = now + tonumber(ARGV[1])
-local owner = ARGV[2]
-
-local lock_owner = redis.call('GET', KEYS[2])
-local barrier = redis.call('GET', KEYS[3])
-if barrier then
-  local ok, decoded = pcall(cjson.decode, barrier)
-  if ok and decoded['phase'] == 'restoring' and lock_owner and decoded['owner'] == lock_owner then
-    return 'RESTORE_IN_PROGRESS'
-  end
-  return 'RESTORE_FAILED'
-end
-if lock_owner then
-  return 'RESTORE_IN_PROGRESS'
-end
-redis.call('ZADD', KEYS[1], expires_at, owner)
-return 'ACQUIRED'
-`;
-
-const READ_RESTORE_GATE = `
-local lock_owner = redis.call('GET', KEYS[1])
-local barrier = redis.call('GET', KEYS[2])
-if barrier then
-  local ok, decoded = pcall(cjson.decode, barrier)
-  if ok and decoded['phase'] == 'restoring' and lock_owner and decoded['owner'] == lock_owner then
-    return 'RESTORE_IN_PROGRESS'
-  end
-  return 'RESTORE_FAILED'
-end
-if lock_owner then return 'RESTORE_IN_PROGRESS' end
-return 'OPEN'
-`;
-
-const ACQUIRE_RESTORE_LOCK = `
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local owner = ARGV[1]
-local ttl = tonumber(ARGV[2])
-
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  return 'RESTORE_FAILED'
-end
-if redis.call('EXISTS', KEYS[2]) == 1 then
-  return 'RESTORE_IN_PROGRESS'
-end
--- permit 过期只能说明续期中断，不能证明旧 handler 已停止写。为了不让 restore 越过
--- 一个可能会晚到的 writer，这里必须等待 owner finally 显式 release。
-if redis.call('ZCARD', KEYS[1]) > 0 then
-  return 'RESTORE_WRITERS_ACTIVE'
-end
-if redis.call('SET', KEYS[2], owner, 'NX', 'PX', ttl) then
-  return 'ACQUIRED'
-end
-return 'RESTORE_IN_PROGRESS'
-`;
-
-const RENEW_RESTORE_LOCK = `
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-`;
-
-const RELEASE_RESTORE_LOCK = `
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('DEL', KEYS[1])
-`;
-
-const RELEASE_RESTORE_BARRIER = `
-local value = redis.call('GET', KEYS[1])
-if not value then return 0 end
-local ok, decoded = pcall(cjson.decode, value)
-if not ok or decoded['owner'] ~= ARGV[1] then return 0 end
-return redis.call('DEL', KEYS[1])
-`;
-
-const MARK_RESTORE_BARRIER_FAILED = `
-local value = redis.call('GET', KEYS[1])
-if not value then return 0 end
-local ok, decoded = pcall(cjson.decode, value)
-if not ok or decoded['owner'] ~= ARGV[1] then return 0 end
-redis.call('SET', KEYS[1], ARGV[2])
-return 1
-`;
-
-const RETRY_EMPTY_FAILED_RESTORE = `
-local barrier = redis.call('GET', KEYS[3])
-if not barrier then return 'NO_BARRIER' end
-local ok, decoded = pcall(cjson.decode, barrier)
-if not ok or decoded['phase'] ~= 'failed' then return 'RESTORE_FAILED' end
-if redis.call('EXISTS', KEYS[2]) == 1 then return 'RESTORE_IN_PROGRESS' end
-if redis.call('ZCARD', KEYS[1]) > 0 then return 'RESTORE_WRITERS_ACTIVE' end
-if not redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', tonumber(ARGV[2])) then
-  return 'RESTORE_IN_PROGRESS'
-end
-redis.call('DEL', KEYS[3])
-return 'ACQUIRED'
-`;
-
-function maintenanceGateError(code: MaintenanceGateErrorCode, message: string): Error & { code: MaintenanceGateErrorCode } {
-  const error = new Error(message) as Error & { code: MaintenanceGateErrorCode };
-  error.code = code;
-  return error;
-}
-
-/**
- * 进入一个会改变 Redis/SQLite 状态的短请求。检查 restore 锁/屏障和登记
- * 当前 owner 必须在同一个 Redis Lua 原子单元内，不能留下 TOCTOU 窗口。
- * permit 只能由 owner 在 handler settle 后 finally 释放；过期 score 只用于诊断。
- */
-export async function acquireMutationPermit(redis: Redis, owner = randomUUID()): Promise<MaintenanceGateResult> {
-  const result = String(await redis.eval(
-    ACQUIRE_MUTATION_PERMIT,
-    3,
-    keys.zset.maintenanceMutationPermits,
-    keys.string.dbRestoreLock,
-    keys.string.dbRestoreBarrier,
-    String(MAINTENANCE_PERMIT_TTL_MS),
-    owner,
-  ));
-  if (result === 'ACQUIRED') return { ok: true, owner };
-  if (result === 'RESTORE_FAILED') {
-    return {
-      ok: false,
-      error: { code: 'RESTORE_FAILED', message: '上一次数据库恢复失败或结果不确定，维护屏障仍然生效' },
-    };
-  }
-  return {
-    ok: false,
-    error: { code: 'RESTORE_IN_PROGRESS', message: '数据库恢复进行中，暂不接受状态写入' },
-  };
-}
-
-/** 普通读在返回 Redis 投影前后都检查，避免暴露失败恢复的半投影。 */
-export async function getRestoreMaintenanceGate(
-  redis: Redis,
-): Promise<{ code: 'RESTORE_IN_PROGRESS' | 'RESTORE_FAILED'; message: string } | null> {
-  const result = String(await redis.eval(
-    READ_RESTORE_GATE,
-    2,
-    keys.string.dbRestoreLock,
-    keys.string.dbRestoreBarrier,
-  ));
-  if (result === 'OPEN') return null;
-  if (result === 'RESTORE_FAILED') {
-    return {
-      code: 'RESTORE_FAILED',
-      message: '上一次数据库恢复失败或结果不确定，维护屏障仍然生效',
-    };
-  }
-  return { code: 'RESTORE_IN_PROGRESS', message: '数据库恢复进行中，暂不提供运行态投影' };
-}
-
-export async function releaseMutationPermit(redis: Redis, owner: string): Promise<void> {
-  await redis.zrem(keys.zset.maintenanceMutationPermits, owner);
-}
-
-/**
- * 恢复入口使用一个 Lua 原子完成：确认无 writer → SET NX PX。
- * 返回 owner token 后，续期和释放都必须再次比较 owner，不能删除后来者的锁。
- */
-export async function acquireRestoreLock(redis: Redis, owner = randomUUID()): Promise<MaintenanceGateResult> {
-  // 产品部署边界是单 Biao server 实例。Redis 重启/FLUSH 可能把远端
-  // permit 与业务键一起丢失，但同进程已入场 handler 仍在；本地计数防止
-  // 它重连后与 restore 重叠。跨实例需持久 fencing，当前明确禁止。
-  if (localMutationCount > 0) {
-    return {
-      ok: false,
-      error: { code: 'RESTORE_WRITERS_ACTIVE', message: '当前 Biao 服务进程仍有未完成的状态写入，拒绝数据库恢复' },
-    };
-  }
-  const result = String(await redis.eval(
-    ACQUIRE_RESTORE_LOCK,
-    3,
-    keys.zset.maintenanceMutationPermits,
-    keys.string.dbRestoreLock,
-    keys.string.dbRestoreBarrier,
-    owner,
-    String(RESTORE_LOCK_TTL_MS),
-  ));
-  if (result === 'ACQUIRED') return { ok: true, owner };
-  if (result === 'RESTORE_FAILED') {
-    return {
-      ok: false,
-      error: { code: 'RESTORE_FAILED', message: '上一次数据库恢复失败或结果不确定，维护屏障仍然生效' },
-    };
-  }
-  if (result === 'RESTORE_WRITERS_ACTIVE') {
-    return {
-      ok: false,
-      error: { code: 'RESTORE_WRITERS_ACTIVE', message: 'Redis 当前有进行中的状态写入，拒绝数据库恢复' },
-    };
-  }
-  return {
-    ok: false,
-    error: { code: 'RESTORE_IN_PROGRESS', message: '数据库恢复进行中，暂不接受状态写入' },
-  };
-}
-
-export async function renewRestoreLock(redis: Redis, owner: string): Promise<boolean> {
-  const renewed = Number(await redis.eval(
-    RENEW_RESTORE_LOCK,
-    1,
-    keys.string.dbRestoreLock,
-    owner,
-    String(RESTORE_LOCK_TTL_MS),
-  ));
-  return renewed === 1;
-}
-
-export async function releaseRestoreLock(redis: Redis, owner: string): Promise<void> {
-  await redis.eval(RELEASE_RESTORE_LOCK, 1, keys.string.dbRestoreLock, owner);
-}
-
-async function releaseRestoreBarrier(redis: Redis, owner: string): Promise<void> {
-  await redis.eval(RELEASE_RESTORE_BARRIER, 1, keys.string.dbRestoreBarrier, owner);
-}
-
-async function retryEmptyFailedRestore(
-  redis: Redis,
-  owner: string,
-): Promise<MaintenanceGateResult> {
-  // barrier 存在时所有内建 writer 均 fail closed，所以扫描到空目标后，
-  // Lua 内再一次校验 barrier/lock/permit 并原子地换成新 restore lock。
-  if (!(await isBiaoNamespaceEmpty(redis))) {
-    return {
-      ok: false,
-      error: { code: 'RESTORE_FAILED', message: '上一次恢复遗留了未完整 Redis 投影，拒绝自动清除屏障' },
-    };
-  }
-  const result = String(await redis.eval(
-    RETRY_EMPTY_FAILED_RESTORE,
-    3,
-    keys.zset.maintenanceMutationPermits,
-    keys.string.dbRestoreLock,
-    keys.string.dbRestoreBarrier,
-    owner,
-    String(RESTORE_LOCK_TTL_MS),
-  ));
-  if (result === 'ACQUIRED') return { ok: true, owner };
-  if (result === 'RESTORE_WRITERS_ACTIVE') {
-    return { ok: false, error: { code: 'RESTORE_WRITERS_ACTIVE', message: 'Redis 当前有进行中的状态写入，拒绝数据库恢复' } };
-  }
-  if (result === 'RESTORE_IN_PROGRESS') {
-    return { ok: false, error: { code: 'RESTORE_IN_PROGRESS', message: '数据库恢复进行中，暂不接受状态写入' } };
-  }
-  return {
-    ok: false,
-    error: { code: 'RESTORE_FAILED', message: '上一次数据库恢复失败或结果不确定，维护屏障仍然生效' },
-  };
-}
-
-function startMaintenanceRenewal(renew: () => Promise<boolean>): MaintenanceRenewal {
-  const state: MaintenanceRenewal['state'] = { lost: false };
-  const timer = setInterval(() => {
-    void renew().then((ok) => {
-      if (!ok) state.lost = true;
-    }).catch((error: Error) => {
-      state.lost = true;
-      state.error = error;
-    });
-  }, MAINTENANCE_RENEW_INTERVAL_MS);
-  timer.unref();
-  return { timer, state };
-}
-
 async function activeTaskLeaseIds(redis: Redis): Promise<string[]> {
   const active: string[] = [];
   let cursor = '0';
@@ -682,20 +859,6 @@ async function assertRestoreRuntimeIdle(redis: Redis): Promise<void> {
   );
 }
 
-export async function isBiaoNamespaceEmpty(redis: Redis): Promise<boolean> {
-  let cursor = '0';
-  do {
-    const [next, found] = await redis.scan(cursor, 'MATCH', 'biao:v1:*', 'COUNT', 100);
-    cursor = next;
-    const materialKeys = found.filter((key) =>
-      key !== keys.string.dbRestoreLock &&
-      key !== keys.string.dbRestoreBarrier &&
-      key !== keys.zset.maintenanceMutationPermits,
-    );
-    if (materialKeys.length > 0) return false;
-  } while (cursor !== '0');
-  return true;
-}
 
 async function assertRestoreTargetEmpty(redis: Redis): Promise<void> {
   if (await isBiaoNamespaceEmpty(redis)) return;
@@ -1046,10 +1209,6 @@ interface RestoreProjection {
   byStatus: Record<string, number>;
 }
 
-interface MaintenanceRenewal {
-  timer: NodeJS.Timeout;
-  state: { lost: boolean; error?: Error };
-}
 
 function prepareRestoreProjection(sqlite: SqliteStore): RestoreProjection {
   // 这一步先于 Redis 发布且自身是 SQLite 单事务。若后续 Redis 失败，pending 是比
@@ -1388,8 +1547,6 @@ async function publishRestoreProjection(
 }
 import {
   lazyReclaimTaskIds,
-  writeTaskToRedis,
-  writePlanToRedis,
   hashToTaskRecord,
   activateOwnership,
   releaseOwnershipByAgent,
@@ -1580,8 +1737,91 @@ verify:
   }
 }
 
+export interface PlanSubmissionPreview {
+  plan_id: string;
+  plan_revision: string;
+  tasks: Array<{
+    task_id: string;
+    status: string;
+    revision: string;
+    lease_present: boolean;
+  }>;
+}
+
+function taskSubmissionRevision(hash: Record<string, string>): string {
+  if (!hash.task_id) return 'missing';
+  const canonical = Object.entries(hash)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([field, value]) => `${field}\u0000${value}`)
+    .join('\u0001');
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+async function buildPlanSubmissionPreview(
+  redis: Redis,
+  planId: string,
+  taskIds: string[],
+): Promise<PlanSubmissionPreview> {
+  const [planRevision, hashes, leases] = await Promise.all([
+    redis.hget(keys.planStatusProjection.revisionByPlan, planId),
+    Promise.all(taskIds.map((taskId) => redis.hgetall(keys.hash.task(taskId)))),
+    Promise.all(taskIds.map((taskId) => redis.exists(keys.string.lease(taskId)))),
+  ]);
+  return {
+    plan_id: planId,
+    plan_revision: planRevision ?? '0',
+    tasks: taskIds.map((taskId, index) => ({
+      task_id: taskId,
+      status: hashes[index]?.status || 'missing',
+      revision: taskSubmissionRevision(hashes[index] ?? {}),
+      lease_present: Number(leases[index] ?? 0) > 0,
+    })),
+  };
+}
+
+function samePlanSubmissionPreview(left: PlanSubmissionPreview, right: PlanSubmissionPreview): boolean {
+  if (left.plan_id !== right.plan_id || left.plan_revision !== right.plan_revision
+      || left.tasks.length !== right.tasks.length) return false;
+  const rightByTask = new Map(right.tasks.map((task) => [task.task_id, task]));
+  return left.tasks.every((task) => {
+    const other = rightByTask.get(task.task_id);
+    return Boolean(other && other.status === task.status && other.revision === task.revision
+      && other.lease_present === task.lease_present);
+  });
+}
+
+export async function previewPlanSubmission(
+  redis: Redis,
+  planDir: string,
+): Promise<ApiResponse<PlanSubmissionPreview>> {
+  try {
+    const roots = configuredWorkspaceRoots();
+    const validatedPlanDir = resolveAndValidateWorkspacePath(planDir, roots);
+    const { plan, tasks } = parsePlanDir(validatedPlanDir);
+    plan.project_path = resolveAndValidateWorkspacePath(plan.project_path, roots);
+    return {
+      ok: true,
+      data: await buildPlanSubmissionPreview(redis, plan.plan_id, tasks.map(({ fm }) => fm.task_id)),
+    };
+  } catch (error) {
+    return { ok: false, data: null, error: workspaceError(error, 'PLAN_PARSE_ERROR') };
+  }
+}
+
+function planSubmitStalePreview(current: PlanSubmissionPreview): ApiResponse<never> {
+  return {
+    ok: false,
+    data: null,
+    error: {
+      code: 'PLAN_SUBMIT_STALE_PREVIEW',
+      message: 'Plan 或目标 task 在 preview 后已发生 claim/block/review；整批未提交，请重新 preview。',
+      details: current,
+    },
+  };
+}
+
 /** plan submit */
-export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResponse<{
+export async function planSubmit(redis: Redis, planDir: string, expectedPreview?: PlanSubmissionPreview): Promise<ApiResponse<{
   plan_id: string;
   task_count: number;
   created: number;
@@ -1665,6 +1905,19 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
     // 只有明确的 pending 才允许被本地 MD 更新；任何未知已存状态也
     // fail-closed 保留，防止新版/损坏状态被当成“不存在”而复活。
     const defaultPriority = plan.default_priority ?? 5;
+    for (const { fm } of tasks) {
+      if (fm.timeout_seconds === undefined) {
+        const type = fm.type;
+        fm.timeout_seconds = type === 'code' || type === 'acceptance'
+          ? 3600
+          : type === 'review' || type === 'research' ? 2400 : 1800;
+      }
+    }
+    const taskIds = tasks.map(({ fm }) => fm.task_id);
+    const initialPreview = await buildPlanSubmissionPreview(redis, plan.plan_id, taskIds);
+    if (expectedPreview && !samePlanSubmissionPreview(expectedPreview, initialPreview)) {
+      return planSubmitStalePreview(initialPreview);
+    }
     let created = 0;
     let updated = 0;
     let skippedRunning = 0;
@@ -1673,59 +1926,138 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
     let skippedCancelled = 0;
     let skippedSuperseded = 0;
     const preservedRuntimeTaskIds = new Set<string>();
-    for (const { fm, body } of tasks) {
-      // 按 task type 设默认 timeout（未显式声明时）：code/acceptance 3600s，review/research 2400s，docs 1800s
-      if (fm.timeout_seconds === undefined) {
-        const t = fm.type;
-        fm.timeout_seconds = t === 'code' || t === 'acceptance' ? 3600 : t === 'review' || t === 'research' ? 2400 : 1800;
-      }
-      const existing = await redis.hget(keys.hash.task(fm.task_id), 'status');
+    for (const task of initialPreview.tasks) {
+      const existing = task.status;
       if (existing === 'done' || existing === 'failed') {
         skippedDone++;
-        preservedRuntimeTaskIds.add(fm.task_id);
-        continue; // 保留历史
+        preservedRuntimeTaskIds.add(task.task_id);
+        continue;
       }
       if (existing === 'running') {
         skippedRunning++;
-        preservedRuntimeTaskIds.add(fm.task_id);
-        continue; // agent 正在跑，不强行改
+        preservedRuntimeTaskIds.add(task.task_id);
+        continue;
       }
       if (existing === 'blocked') {
         skippedBlocked++;
-        preservedRuntimeTaskIds.add(fm.task_id);
+        preservedRuntimeTaskIds.add(task.task_id);
         continue;
       }
       if (existing === 'cancelled') {
         skippedCancelled++;
-        preservedRuntimeTaskIds.add(fm.task_id);
+        preservedRuntimeTaskIds.add(task.task_id);
         continue;
       }
       if (existing === 'superseded') {
         skippedSuperseded++;
-        preservedRuntimeTaskIds.add(fm.task_id);
+        preservedRuntimeTaskIds.add(task.task_id);
         continue;
       }
       if (existing === 'pending') {
-        // 用新 MD 覆盖（HSET 重写 + 重新入流，让下次被领拿到新内容）
-        await writeTaskToRedis(redis, fm, body, plan.plan_id, plan.project_path, defaultPriority);
         updated++;
         continue;
       }
-      if (existing) {
+      if (existing !== 'missing') {
         // 已存但当前版本不识别的状态：绝不能走“不存在”分支。
-        preservedRuntimeTaskIds.add(fm.task_id);
+        preservedRuntimeTaskIds.add(task.task_id);
         skippedDone++;
         continue;
       }
-      // 不存在，新建
-      await writeTaskToRedis(redis, fm, body, plan.plan_id, plan.project_path, defaultPriority);
       created++;
     }
-
-    // writeTaskToRedis / writePlanToRedis 各自把真相与 plan registry/revision/dirty 放在
-    // 同一 MULTI。这里不能再依赖一个循环结束后的“事后标脏”调用：进程可能在任意
-    // 一个 task 已发布后退出，而已发布的 task 必须立即可被投影增量重建。
-    await writePlanToRedis(redis, plan, tasks.length);
+    const transactionRedis = redis.duplicate();
+    try {
+      await transactionRedis.ping();
+      await transactionRedis.watch(
+        keys.planStatusProjection.revisionByPlan,
+        keys.hash.plan(plan.plan_id),
+        ...taskIds.flatMap((taskId) => [keys.hash.task(taskId), keys.string.lease(taskId)]),
+      );
+      const guardedPreview = await buildPlanSubmissionPreview(transactionRedis, plan.plan_id, taskIds);
+      const activeReservationFlags = await Promise.all(taskIds.map(async (taskId) =>
+        Number(await transactionRedis.hget(keys.hash.task(taskId), 'wake_reservation_expires_at')) > Date.now()));
+      if (!samePlanSubmissionPreview(initialPreview, guardedPreview)
+          || guardedPreview.tasks.some((task, index) => task.status === 'pending'
+            && (task.lease_present || activeReservationFlags[index]))) {
+        await transactionRedis.unwatch();
+        return planSubmitStalePreview(guardedPreview);
+      }
+      const now = Date.now();
+      const previewByTask = new Map(guardedPreview.tasks.map((task) => [task.task_id, task]));
+      const transaction = transactionRedis.multi();
+      for (const { fm, body } of tasks) {
+        const snapshot = previewByTask.get(fm.task_id)!;
+        if (preservedRuntimeTaskIds.has(fm.task_id)) continue;
+        const createdAt = snapshot.status === 'missing'
+          ? now
+          : Number((await transactionRedis.hget(keys.hash.task(fm.task_id), 'created_at')) ?? now);
+        const priority = fm.priority ?? defaultPriority;
+        transaction.hset(keys.hash.task(fm.task_id), {
+          task_id: fm.task_id,
+          plan_id: plan.plan_id,
+          title: fm.title,
+          type: fm.type,
+          phase: fm.phase,
+          assignee: fm.assignee ?? 'auto',
+          priority: String(priority),
+          status: 'pending',
+          depends_on: (fm.depends_on ?? []).join(','),
+          ownership_files: (fm.ownership?.files ?? []).join(','),
+          ownership_modules: (fm.ownership?.modules ?? []).join(','),
+          timeout_seconds: String(fm.timeout_seconds ?? 1800),
+          max_retries: String(fm.max_retries ?? 2),
+          retries: '0',
+          model_override: fm.model_override ?? '',
+          acceptance_for: (fm.acceptance_for ?? []).join(','),
+          verify: JSON.stringify(fm.verify ?? []),
+          failed_reason: '',
+          fix_for: '',
+          repair_root_task_id: '',
+          resolution_status: '',
+          resolution_action: '',
+          resolution_task_id: '',
+          resolution_task_ids: '',
+          resolved_by_task: '',
+          resolution_generation: '0',
+          resolution_attempts: '0',
+          repair_ownership_extension: '',
+          pm_repair_ownership_required: '',
+          pm_repair_ownership_intent: '',
+          pm_rejection_resolution_mode: '',
+          goal_md: body,
+          project_path: plan.project_path,
+          created_at: String(createdAt),
+        });
+        transaction.zadd(keys.zset.status.pending, pendingScore(priority, createdAt), fm.task_id);
+        transaction.xadd(keys.stream.tasks, '*', 'task_id', fm.task_id, 'priority', String(priority));
+        transaction.sadd(keys.planStatusProjection.taskIdsByPlan(plan.plan_id), fm.task_id);
+        transaction.hincrby(keys.planStatusProjection.revisionByPlan, plan.plan_id, 1);
+        transaction.zrem(keys.intakeActionableFailed.pending, fm.task_id);
+      }
+      transaction.hset(keys.hash.plan(plan.plan_id), {
+        plan_id: plan.plan_id,
+        title: plan.title,
+        status: 'submitted',
+        project_path: plan.project_path,
+        default_assignee: plan.default_assignee ?? 'auto',
+        default_priority: String(defaultPriority),
+        phases: JSON.stringify(plan.phases ?? []),
+        task_count: String(tasks.length),
+        created_at: String(now),
+        pm_consumer: plan.pm_consumer ?? DEFAULT_PM_CONSUMER,
+      });
+      transaction.sadd(keys.planStatusProjection.planIds, plan.plan_id);
+      transaction.hincrby(keys.planStatusProjection.revisionByPlan, plan.plan_id, 1);
+      transaction.sadd(keys.planStatusProjection.dirtyPlans, plan.plan_id);
+      const outcomes = await transaction.exec();
+      if (outcomes === null) {
+        return planSubmitStalePreview(await buildPlanSubmissionPreview(redis, plan.plan_id, taskIds));
+      }
+      const commandFailure = outcomes.find(([error]) => error)?.[0];
+      if (commandFailure) throw commandFailure;
+    } finally {
+      transactionRedis.disconnect();
+    }
 
     // SQLite 双写：plan + 所有 task（INSERT OR REPLACE，防 FLUSHALL 丢数据）
     if (sqliteStore) {
@@ -1744,9 +2076,10 @@ export async function planSubmit(redis: Redis, planDir: string): Promise<ApiResp
         pm_consumer: plan.pm_consumer ?? DEFAULT_PM_CONSUMER,
       } as PlanRow);
       for (const { fm, body } of tasks) {
+        const currentRedisStatus = await redis.hget(keys.hash.task(fm.task_id), 'status');
         // Redis 中的非 pending 运行态已被明确保留，SQLite 必须同步同一个
         // 快照，不能在双写阶段又用 Plan MD 把 blocked/running/cancelled 改回 pending。
-        if (preservedRuntimeTaskIds.has(fm.task_id)) {
+        if (preservedRuntimeTaskIds.has(fm.task_id) || currentRedisStatus !== 'pending') {
           await persistTaskFromRedis(redis, fm.task_id);
           continue;
         }
@@ -1957,7 +2290,14 @@ async function agentRegisterUnlocked(
   endpoint?: string,
   projects?: string[],
   registrationId?: string,
-): Promise<ApiResponse<{ agent_id: string; registration_id: string; registration_generation: number; registered_at: number }>> {
+  projectBindings?: RegistrationProjectBinding[],
+): Promise<ApiResponse<{
+  agent_id: string;
+  registration_id: string;
+  registration_generation: number;
+  registered_at: number;
+  project_binding_results?: Array<{ ok: boolean; project_scope: string; binding?: ProjectAgentBinding; error?: string }>;
+}>> {
   const requestedRegistrationId = registrationId ?? generatedAgentRegistrationId();
   if (!AGENT_REGISTRATION_ID_PATTERN.test(requestedRegistrationId)) {
     return {
@@ -2047,15 +2387,51 @@ async function agentRegisterUnlocked(
   if (outcome !== 'CREATED' && outcome !== 'IDEMPOTENT') {
     throw new Error(`failed to register agent ${agentId}: ${outcome || 'UNKNOWN'}`);
   }
-  return {
-    ok: true,
-    data: {
-      agent_id: agentId,
-      registration_id: requestedRegistrationId,
-      registration_generation: Number(raw[2] ?? durableGeneration),
-      registered_at: Number(raw[1] ?? now),
-    },
+  const registrationData: {
+    agent_id: string;
+    registration_id: string;
+    registration_generation: number;
+    registered_at: number;
+    project_binding_results?: Array<{ ok: boolean; project_scope: string; binding?: ProjectAgentBinding; error?: string }>;
+  } = {
+    agent_id: agentId,
+    registration_id: requestedRegistrationId,
+    registration_generation: Number(raw[2] ?? durableGeneration),
+    registered_at: Number(raw[1] ?? now),
   };
+
+  // 注册成功后自动创建项目绑定（幂等：已存在同 (project_scope, agent_id) 绑定时返回现有绑定）
+  if (projectBindings && projectBindings.length > 0) {
+    const bindingResults: Array<{ ok: boolean; project_scope: string; binding?: ProjectAgentBinding; error?: string }> = [];
+    for (const pb of projectBindings) {
+      try {
+        const existing = sqliteStore?.getProjectAgentBindings(pb.project_scope)
+          .find((b) => b.agent_id === agentId);
+        if (existing) {
+          bindingResults.push({ ok: true, project_scope: pb.project_scope, binding: publicBinding(existing) });
+          continue;
+        }
+        const result = await createProjectAgentBinding(pb.project_scope, {
+          agent_id: agentId,
+          label: agentId,
+          harness_kind: agentType,
+          capabilities,
+          wake_mode: pb.wake_mode ?? 'external_worker',
+          policy: pb.policy ?? 'automatic',
+        });
+        if (result.ok && result.data) {
+          bindingResults.push({ ok: true, project_scope: pb.project_scope, binding: result.data });
+        } else {
+          bindingResults.push({ ok: false, project_scope: pb.project_scope, error: result.error?.message ?? '绑定创建失败' });
+        }
+      } catch (error) {
+        bindingResults.push({ ok: false, project_scope: pb.project_scope, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    registrationData.project_binding_results = bindingResults;
+  }
+
+  return { ok: true, data: registrationData };
 }
 
 export async function agentRegister(
@@ -2066,9 +2442,16 @@ export async function agentRegister(
   endpoint?: string,
   projects?: string[],
   registrationId?: string,
-): Promise<ApiResponse<{ agent_id: string; registration_id: string; registration_generation: number; registered_at: number }>> {
+  projectBindings?: RegistrationProjectBinding[],
+): Promise<ApiResponse<{
+  agent_id: string;
+  registration_id: string;
+  registration_generation: number;
+  registered_at: number;
+  project_binding_results?: Array<{ ok: boolean; project_scope: string; binding?: ProjectAgentBinding; error?: string }>;
+}>> {
   return withAgentEpochCommit(agentId, () => agentRegisterUnlocked(
-    redis, agentId, agentType, capabilities, endpoint, projects, registrationId,
+    redis, agentId, agentType, capabilities, endpoint, projects, registrationId, projectBindings,
   ));
 }
 
@@ -5159,6 +5542,268 @@ export async function reconcileRuntimeState(redis: Redis): Promise<ApiResponse<R
   return withMutationPermit(redis, () => reconcileRuntimeStateUnlocked(redis));
 }
 
+/**
+ * Supervisor 聚合 tick：一轮快照合成一次往返，减少局域网多机部署的请求开销。
+ *
+ * 语义与逐端点调用完全一致——reconcile 沿用现有 reconcileRuntimeState（含 permit 门控），
+ * 不另写一份逻辑。心跳不并入 tick（各 slot 心跳保持独立节流语义）。
+ */
+export interface SupervisorTickRequest {
+  /** PM consumer 列表（逗号分隔）；每个 consumer 各返回一份 intake 结果 */
+  consumers: string[];
+  /** 事件流游标增量（排他）；省略则不返回 events */
+  events_after?: string;
+  /** 是否返回绑定项目的 bindings + receipts */
+  binding_aware?: boolean;
+  /** 可选 plan 过滤列表 */
+  plan_ids?: string[];
+}
+
+export interface SupervisorTickResponse {
+  plans: BiaoPlanSummary[];
+  intakes: Array<{ consumer: string; cursor: string; counts: Record<string, number>; items: IntakeItem[] }>;
+  events: { events: BiaoEvent[]; next_cursor: string };
+  reconciliation: RuntimeReconciliationResult;
+  /** 仅 binding_aware=true 时返回；按 project_path 分组 */
+  bindings?: Array<{ project_scope: string; bindings: ProjectAgentBinding[] }>;
+  receipts?: Array<{ project_scope: string; receipts: PublicExecutionReceipt[] }>;
+}
+
+export async function supervisorTick(
+  redis: Redis,
+  req: SupervisorTickRequest,
+): Promise<ApiResponse<SupervisorTickResponse>> {
+  const consumers = [...new Set(req.consumers.map((value) => value.trim()).filter(Boolean))];
+  if (consumers.length === 0) consumers.push(DEFAULT_PM_CONSUMER);
+
+  // 并行执行所有只读查询；reconcile 是有状态操作但通过 permit 门控保证原子性。
+  const [plansResult, reconciliationResult, intakeResults, eventsResult] = await Promise.all([
+    getPlans(redis),
+    reconcileRuntimeState(redis),
+    Promise.all(consumers.map((consumer) => pmIntake(redis, { consumer, plan_id: req.plan_ids?.[0] }))),
+    req.events_after
+      ? getEvents(redis, { after: req.events_after, limit: 200 })
+      : Promise.resolve<null>(null),
+  ]);
+
+  if (!plansResult.ok) return { ok: false, data: null, error: plansResult.error };
+  if (!reconciliationResult.ok) return { ok: false, data: null, error: reconciliationResult.error };
+
+  const intakes = consumers.map((consumer, index) => {
+    const result = intakeResults[index];
+    if (!result?.ok) {
+      return { consumer, cursor: '', counts: {}, items: [] };
+    }
+    return { consumer, cursor: result.data!.cursor, counts: result.data!.counts, items: result.data!.items };
+  });
+
+  let events: { events: BiaoEvent[]; next_cursor: string } = { events: [], next_cursor: req.events_after ?? '0-0' };
+  if (eventsResult?.ok && eventsResult.data) {
+    if (Array.isArray(eventsResult.data)) {
+      events = { events: eventsResult.data, next_cursor: req.events_after ?? '0-0' };
+    } else {
+      events = { events: eventsResult.data.events, next_cursor: eventsResult.data.next_cursor };
+    }
+  }
+
+  // binding-aware 快照（如需要）
+  let bindings: Array<{ project_scope: string; bindings: ProjectAgentBinding[] }> | undefined;
+  let receipts: Array<{ project_scope: string; receipts: PublicExecutionReceipt[] }> | undefined;
+  if (req.binding_aware) {
+    const store = sqliteStore;
+    if (store) {
+      const plans = plansResult.data!.plans;
+      const allowed = req.plan_ids && req.plan_ids.length > 0 ? new Set(req.plan_ids) : undefined;
+      const activeProjects = [...new Set(
+        plans
+          .filter((plan) => !isPlanTerminalStatus(plan.status) && (!allowed || allowed.has(plan.plan_id)))
+          .map((plan) => plan.project_path)
+          .filter(Boolean),
+      )];
+      bindings = [];
+      receipts = [];
+      for (const projectScope of activeProjects) {
+        const bindingResult = await listProjectAgentBindings(projectScope);
+        if (bindingResult.ok) bindings.push({ project_scope: projectScope, bindings: bindingResult.data!.bindings });
+        const receiptResult = await listExecutionReceipts(projectScope);
+        if (receiptResult.ok) receipts.push({ project_scope: projectScope, receipts: receiptResult.data!.receipts });
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    data: {
+      plans: plansResult.data!.plans,
+      intakes,
+      events,
+      reconciliation: reconciliationResult.data!,
+      ...(bindings ? { bindings } : {}),
+      ...(receipts ? { receipts } : {}),
+    },
+  };
+}
+
+const RESERVE_PROJECT_AGENT_TASK = `
+local task_id = ARGV[1]
+local reservation_id = ARGV[2]
+local binding_id = ARGV[3]
+local agent_id = ARGV[4]
+local project_scope = ARGV[5]
+local capability = ARGV[6]
+local now = tonumber(ARGV[7])
+local expires_at = tonumber(ARGV[8])
+
+if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_CHANGED'} end
+if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'pending' then return {'TASK_NOT_PENDING'} end
+if not redis.call('ZSCORE', KEYS[2], task_id) then return {'TASK_NOT_PENDING'} end
+local existing_id = redis.call('HGET', KEYS[1], 'wake_reservation_id') or ''
+local existing_expires = tonumber(redis.call('HGET', KEYS[1], 'wake_reservation_expires_at') or '0') or 0
+if existing_id ~= '' and existing_expires > now then return {'ALREADY_RESERVED'} end
+
+redis.call('HSET', KEYS[1],
+  'wake_reservation_id', reservation_id,
+  'wake_reservation_binding_id', binding_id,
+  'wake_reservation_expires_at', tostring(expires_at))
+redis.call('HSET', KEYS[3],
+  'reservation_id', reservation_id,
+  'task_id', task_id,
+  'binding_id', binding_id,
+  'agent_id', agent_id,
+  'project_scope', project_scope,
+  'capability', capability,
+  'status', 'reserved',
+  'created_at', tostring(now),
+  'expires_at', tostring(expires_at),
+  'claim_attempt_id', '',
+  'registration_id', '')
+redis.call('PEXPIRE', KEYS[3], math.max(1, expires_at - now))
+return {'RESERVED'}
+`;
+
+const RELEASE_PROJECT_AGENT_RESERVATION = `
+local reservation_id = ARGV[1]
+local terminal_status = ARGV[2]
+if (redis.call('HGET', KEYS[2], 'reservation_id') or '') ~= reservation_id then return 0 end
+if (redis.call('HGET', KEYS[2], 'status') or '') ~= 'reserved' then return 0 end
+if (redis.call('HGET', KEYS[1], 'wake_reservation_id') or '') == reservation_id then
+  redis.call('HDEL', KEYS[1],
+    'wake_reservation_id', 'wake_reservation_binding_id', 'wake_reservation_expires_at')
+end
+redis.call('HSET', KEYS[2], 'status', terminal_status)
+redis.call('PEXPIRE', KEYS[2], 30000)
+return 1
+`;
+
+async function releaseProjectAgentReservation(
+  redis: Redis,
+  reservation: Record<string, string>,
+  status: 'failed' | 'ownership_unavailable' | 'cancelled',
+): Promise<void> {
+  if (!reservation.reservation_id || !reservation.task_id) return;
+  const released = Number(await redis.eval(
+    RELEASE_PROJECT_AGENT_RESERVATION,
+    2,
+    keys.hash.task(reservation.task_id),
+    projectAgentReservationKey(reservation.reservation_id),
+    reservation.reservation_id,
+    status,
+  ));
+  if (released === 1) {
+    await releaseOwnershipByAgent(redis, reservation.agent_id ?? '', reservation.task_id);
+  }
+}
+
+/** 为绑定原子挑选并短时保留一项与 claim 规则一致的 ready task。 */
+export async function reserveProjectAgentTask(
+  redis: Redis,
+  projectScope: string,
+  req: ProjectAgentReservationRequest,
+): Promise<ApiResponse<ProjectAgentTaskReservation | null>> {
+  const store = sqliteControlPlane();
+  if (!store) return controlPlaneUnavailable();
+  const bindingRow = store.getProjectAgentBinding(projectScope, req.binding_id);
+  if (!bindingRow) {
+    return { ok: false, data: null, error: { code: 'BINDING_NOT_FOUND', message: '项目绑定不存在' } };
+  }
+  const binding = publicBinding(bindingRow);
+  if (binding.policy === 'manual') return { ok: true, data: null };
+  const preferredPlans = new Set((req.preferred_plan_ids ?? []).filter(Boolean));
+  const pendingIds = req.task_id ? [req.task_id] : await redis.zrevrange(keys.zset.status.pending, 0, -1);
+  const candidates: TaskRecord[] = [];
+  for (const taskId of pendingIds) {
+    const hash = await redis.hgetall(keys.hash.task(taskId));
+    if (!hash.task_id || hash.status !== 'pending') continue;
+    if (await terminalizeSupersededPendingRepair(redis, hash)) continue;
+    const task = hashToTaskRecord(hash);
+    const assignee = task.assignee || 'auto';
+    if (task.project_path !== projectScope || !binding.capabilities.includes(task.type)) continue;
+    if (preferredPlans.size > 0 && !preferredPlans.has(task.plan_id)) continue;
+    if (assignee !== 'auto' && assignee !== binding.agent_id && assignee !== binding.harness_kind) continue;
+    if (!(await checkDependencies(redis, task)).ok) continue;
+    if (await acceptanceReviewerConflictTask(redis, task, binding.agent_id)) continue;
+    candidates.push(task);
+  }
+  candidates.sort((left, right) =>
+    (right.priority ?? 5) - (left.priority ?? 5) ||
+    (left.created_at ?? 0) - (right.created_at ?? 0) ||
+    left.task_id.localeCompare(right.task_id));
+
+  for (const task of candidates) {
+    const reservationId = `reservation_${randomUUID().replaceAll('-', '')}`;
+    const now = Date.now();
+    const expiresAt = now + PROJECT_AGENT_RESERVATION_TTL_MS;
+    const raw = await redis.eval(
+      RESERVE_PROJECT_AGENT_TASK,
+      3,
+      keys.hash.task(task.task_id),
+      keys.zset.status.pending,
+      projectAgentReservationKey(reservationId),
+      task.task_id,
+      reservationId,
+      binding.binding_id,
+      binding.agent_id,
+      projectScope,
+      task.type,
+      String(now),
+      String(expiresAt),
+    );
+    if (!Array.isArray(raw) || String(raw[0] ?? '') !== 'RESERVED') continue;
+    const ownershipFiles = task.ownership?.files ?? [];
+    const ownershipAcquired = ownershipFiles.length === 0 || await activateOwnership(
+      redis,
+      binding.agent_id,
+      task.task_id,
+      task.priority ?? 5,
+      ownershipFiles,
+      Math.ceil(PROJECT_AGENT_RESERVATION_TTL_MS / 1000),
+      await getGitHeadSha(task.project_path).catch(() => ''),
+      false,
+    );
+    if (!ownershipAcquired) {
+      await releaseProjectAgentReservation(redis, {
+        reservation_id: reservationId,
+        task_id: task.task_id,
+        agent_id: binding.agent_id,
+      }, 'ownership_unavailable');
+      continue;
+    }
+    return {
+      ok: true,
+      data: {
+        reservation_id: reservationId,
+        task_id: task.task_id,
+        plan_id: task.plan_id,
+        project_path: task.project_path,
+        capability: task.type,
+        binding_id: binding.binding_id,
+        expires_at: expiresAt,
+      },
+    };
+  }
+  return { ok: true, data: null };
+}
+
 const CLAIM_WITH_AGENT_EPOCH = `
 local registration_id = ARGV[1]
 local task_id = ARGV[2]
@@ -5170,6 +5815,7 @@ local plan_id = ARGV[7]
 local claim_request_id = ARGV[8]
 local claim_attempt_id = ARGV[9]
 local lease_ttl_ms = ARGV[10]
+local project_reservation_id = ARGV[11]
 
 if (redis.call('HGET', KEYS[12], 'request_id') or '') ~= claim_request_id or
    (redis.call('HGET', KEYS[12], 'attempt_id') or '') ~= claim_attempt_id or
@@ -5187,6 +5833,25 @@ if (redis.call('HGET', KEYS[1], 'task_id') or '') ~= task_id then return {'TASK_
 if (redis.call('HGET', KEYS[1], 'plan_id') or '') ~= plan_id then return {'TASK_CHANGED'} end
 if (redis.call('HGET', KEYS[1], 'status') or '') ~= 'pending' then return {'TASK_NOT_PENDING'} end
 if not redis.call('ZSCORE', KEYS[3], task_id) then return {'TASK_NOT_PENDING'} end
+local task_reservation_id = redis.call('HGET', KEYS[1], 'wake_reservation_id') or ''
+local task_reservation_expires = tonumber(redis.call('HGET', KEYS[1], 'wake_reservation_expires_at') or '0') or 0
+if project_reservation_id ~= '' then
+  if task_reservation_id ~= project_reservation_id or task_reservation_expires < tonumber(now) then
+    return {'PROJECT_RESERVATION_INVALID'}
+  end
+  if (redis.call('HGET', KEYS[13], 'reservation_id') or '') ~= project_reservation_id or
+     (redis.call('HGET', KEYS[13], 'task_id') or '') ~= task_id or
+     (redis.call('HGET', KEYS[13], 'agent_id') or '') ~= agent_id or
+     (redis.call('HGET', KEYS[13], 'status') or '') ~= 'reserved' or
+     tonumber(redis.call('HGET', KEYS[13], 'expires_at') or '0') < tonumber(now) then
+    return {'PROJECT_RESERVATION_INVALID'}
+  end
+elseif task_reservation_id ~= '' and task_reservation_expires >= tonumber(now) then
+  return {'TASK_RESERVED'}
+else
+  redis.call('HDEL', KEYS[1],
+    'wake_reservation_id', 'wake_reservation_binding_id', 'wake_reservation_expires_at')
+end
 if not redis.call('SET', KEYS[2], claim_token, 'PX', lease_ttl_ms, 'NX') then return {'LEASE_CHANGED'} end
 
 redis.call('ZREM', KEYS[3], task_id)
@@ -5211,7 +5876,8 @@ redis.call('HSET', KEYS[5],
   'status', 'busy',
   'claim_request_id', claim_request_id,
   'claim_request_task_id', task_id,
-  'claim_request_token', claim_token)
+  'claim_request_token', claim_token,
+  'claim_request_reservation_id', project_reservation_id)
 -- 旧版本曾在 Agent hash 复制完整 goal/question 正文；新 claim 主动清除该副本。
 redis.call('HDEL', KEYS[5], 'claim_request_payload')
 redis.call('SADD', KEYS[6], plan_id)
@@ -5225,6 +5891,16 @@ redis.call('XADD', KEYS[11], '*',
   'task_id', task_id,
   'agent_id', agent_id,
   'plan_id', plan_id)
+if project_reservation_id ~= '' then
+  redis.call('HSET', KEYS[13],
+    'status', 'claimed',
+    'claim_attempt_id', claim_attempt_id,
+    'registration_id', registration_id,
+    'claimed_at', now)
+  redis.call('PEXPIRE', KEYS[13], tonumber(lease_ttl_ms))
+  redis.call('HDEL', KEYS[1],
+    'wake_reservation_id', 'wake_reservation_binding_id', 'wake_reservation_expires_at')
+end
 redis.call('DEL', KEYS[12])
 return {'CLAIMED'}
 `;
@@ -5244,7 +5920,7 @@ if (redis.call('HGET', KEYS[2], 'task_id') or '') ~= task_id or
    (redis.call('HGET', KEYS[2], 'status') or '') ~= 'running' or
    (redis.call('HGET', KEYS[2], 'claimed_by') or '') ~= ARGV[3] then return {'NO_REPLAY'} end
 if (redis.call('GET', KEYS[3]) or '') ~= claim_token then return {'NO_REPLAY'} end
-return {'REPLAY', task_id, claim_token}
+return {'REPLAY', task_id, claim_token, redis.call('HGET', KEYS[1], 'claim_request_reservation_id') or ''}
 `;
 
 const CLAIM_RESERVATION_TTL_MS = 3_000;
@@ -5359,7 +6035,12 @@ function agentEpochError(
   return { code, message: messages[code] };
 }
 
-async function rebuildClaimPayload(redis: Redis, taskId: string, claimToken: string): Promise<ClaimedTask | undefined> {
+async function rebuildClaimPayload(
+  redis: Redis,
+  taskId: string,
+  claimToken: string,
+  reservationId = '',
+): Promise<ClaimedTask | undefined> {
   const taskHash = await redis.hgetall(keys.hash.task(taskId));
   if (!taskHash.task_id) return undefined;
   const task = hashToTaskRecord(taskHash);
@@ -5382,6 +6063,7 @@ async function rebuildClaimPayload(redis: Redis, taskId: string, claimToken: str
     verify: task.verify ?? [],
     project_path: task.project_path,
     plan_id: task.plan_id,
+    ...(reservationId ? { reservation_id: reservationId } : {}),
     ...(task.model_override?.trim() ? { model_override: task.model_override.trim() } : {}),
     ...(questionAnswer ? { question_answer: questionAnswer } : {}),
     ...(questionId ? { question_id: questionId } : {}),
@@ -5390,9 +6072,11 @@ async function rebuildClaimPayload(redis: Redis, taskId: string, claimToken: str
 }
 
 /** claim（核心，对应 06 号 md 完整流程） */
+type ClaimRequestWithReservation = ClaimRequest & { reservation_id?: string };
+
 async function claimUnlocked(
   redis: Redis,
-  req: ClaimRequest,
+  req: ClaimRequestWithReservation,
   signal?: AbortSignal,
 ): Promise<ApiResponse<ClaimedTask | null>> {
   if (req.timeout_ms !== undefined &&
@@ -5409,6 +6093,14 @@ async function claimUnlocked(
   const blockingTimeoutMs = Math.max(1, req.timeout_ms ?? DEFAULT_BLOCKING_CLAIM_TIMEOUT_MS);
   if (signal?.aborted) {
     return { ok: false, data: null, error: { code: 'CLAIM_ABORTED', message: 'claim 等待已由客户端取消' } };
+  }
+  const projectReservationId = req.reservation_id?.trim() ?? '';
+  if (projectReservationId && !/^reservation_[a-f0-9]{32}$/.test(projectReservationId)) {
+    return {
+      ok: false,
+      data: null,
+      error: { code: 'INVALID_PROJECT_AGENT_RESERVATION', message: 'reservation_id 格式无效' },
+    };
   }
   // 先快速失败，避免旧 epoch 触发回收/候选扫描；真正授权仍在领取 Lua 内
   // 与 task + presence 状态写入同一原子边界二次校验。
@@ -5465,8 +6157,9 @@ async function claimUnlocked(
     if (!Array.isArray(replayRaw) || String(replayRaw[0] ?? '') !== 'REPLAY') return undefined;
     const replayTaskId = String(replayRaw[1] ?? '');
     const replayToken = String(replayRaw[2] ?? '');
+    const replayReservationId = String(replayRaw[3] ?? '');
     const replayed = replayTaskId && replayToken
-      ? await rebuildClaimPayload(redis, replayTaskId, replayToken)
+      ? await rebuildClaimPayload(redis, replayTaskId, replayToken, replayReservationId)
       : undefined;
     if (!replayed) {
       return {
@@ -5479,6 +6172,26 @@ async function claimUnlocked(
   };
   const initialReplay = await tryReplayClaim();
   if (initialReplay) return initialReplay;
+
+  // A transport retry reaches this point after the original reservation has already changed from
+  // `reserved` to `claimed`. Replay must therefore run before this new-claim validity check; a
+  // different claim_request_id still fails closed here and cannot redeem the reservation twice.
+  let projectReservation: Record<string, string> | undefined;
+  if (projectReservationId) {
+    projectReservation = await redis.hgetall(projectAgentReservationKey(projectReservationId));
+    if (
+      projectReservation.reservation_id !== projectReservationId ||
+      projectReservation.status !== 'reserved' ||
+      projectReservation.agent_id !== req.agent_id ||
+      Number(projectReservation.expires_at ?? 0) < Date.now()
+    ) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'PROJECT_AGENT_RESERVATION_INVALID', message: 'reservation 已失效、已兑现或不属于当前 Agent' },
+      };
+    }
+  }
 
   // 同一 Agent 的 claim 先取得短 TTL 单飞 reservation。相同 request 的并发重试
   // 等待 owner 提交后走 replay；owner 崩溃则 reservation 自动过期，由重试接管。
@@ -5596,7 +6309,9 @@ async function claimUnlocked(
   const tryCandidates = async (): Promise<ClaimedTask | null> => {
     if (!reservationRenewal.owned()) return null;
     // Stream 只做唤醒通道；zset/hash 才是调度真相源，过滤不会消费或丢弃任务。
-    const pendingIds = await redis.zrange(keys.zset.status.pending, 0, -1);
+    const pendingIds = projectReservation
+      ? [projectReservation.task_id]
+      : await redis.zrange(keys.zset.status.pending, 0, -1);
     const candidates: TaskRecord[] = [];
     for (const taskId of pendingIds) {
       const hash = await redis.hgetall(keys.hash.task(taskId));
@@ -5623,6 +6338,29 @@ async function claimUnlocked(
       // Supervisor 指定 --plans 时必须在服务端领取前收窄范围；不能先把同项目的
       // 其它 plan 领走再由客户端退回，否则会短暂占有 lease / ownership。
       if (req.preferred_plan_ids?.length && !req.preferred_plan_ids.includes(task.plan_id)) continue;
+      const [taskReservationId = '', taskReservationExpiresRaw = '0'] = await redis.hmget(
+        keys.hash.task(task.task_id),
+        'wake_reservation_id',
+        'wake_reservation_expires_at',
+      );
+      const taskReservationExpiresAt = Number(taskReservationExpiresRaw ?? 0);
+      if (projectReservationId) {
+        if (taskReservationId !== projectReservationId || projectReservation?.task_id !== task.task_id) continue;
+      } else if (taskReservationId && taskReservationExpiresAt >= Date.now()) {
+        continue;
+      } else if (sqliteStore) {
+        // 一旦某个 ready lane 由 ProjectAgentBinding 管理，普通 legacy claim 不能在
+        // adapter/reservation 失败窗口偷走它；其它不相关任务仍继续扫描，不做全局抑制。
+        const bound = sqliteStore.getProjectAgentBindings(task.project_path).some((row) => {
+          const binding = publicBinding(row);
+          const bindingAssignee = task.assignee || 'auto';
+          return binding.capabilities.includes(task.type) && (
+            bindingAssignee === 'auto' || bindingAssignee === binding.agent_id ||
+            bindingAssignee === binding.harness_kind
+          );
+        });
+        if (bound) continue;
+      }
       if (!(await checkDependencies(redis, task)).ok) continue;
       if (!reservationRenewal.owned()) return null;
 
@@ -5644,6 +6382,7 @@ async function claimUnlocked(
           ownershipFiles,
           timeoutSeconds,
           baseSha,
+          !projectReservationId,
         );
         if (!ownershipAcquired) {
           await redis.eval(
@@ -5682,6 +6421,7 @@ async function claimUnlocked(
         verify: task.verify ?? [],
         project_path: task.project_path,
         plan_id: task.plan_id,
+        ...(projectReservationId ? { reservation_id: projectReservationId } : {}),
         ...(task.model_override?.trim() ? { model_override: task.model_override.trim() } : {}),
         ...(questionAnswer ? { question_answer: questionAnswer } : {}),
         ...(questionId ? { question_id: questionId } : {}),
@@ -5692,7 +6432,7 @@ async function claimUnlocked(
         if (!durableAgentEpochIsCurrent(req.agent_id, registrationId)) return ['AGENT_REGISTRATION_CHANGED'];
         return redis.eval(
         CLAIM_WITH_AGENT_EPOCH,
-        12,
+        13,
         keys.hash.task(task.task_id),
         leaseKey,
         keys.zset.status.pending,
@@ -5705,6 +6445,7 @@ async function claimUnlocked(
         keys.intakeActionableFailed.pending,
         keys.stream.events,
         reservationKey,
+        projectAgentReservationKey(projectReservationId || '__none__'),
         registrationId,
         task.task_id,
         claimToken,
@@ -5715,6 +6456,7 @@ async function claimUnlocked(
         claimRequestId,
         claimAttemptId,
         String(timeoutSeconds * 1000),
+        projectReservationId,
         );
       });
       const claimOutcome = Array.isArray(rawClaim) ? String(rawClaim[0] ?? '') : '';
@@ -5737,6 +6479,13 @@ async function claimUnlocked(
             claimOutcome as 'AGENT_NOT_REGISTERED' | 'AGENT_REGISTRATION_CHANGED' | 'AGENT_ALREADY_OFFLINE' | 'AGENT_BUSY',
             String((rawClaim as unknown[])[1] ?? ''),
           );
+          return null;
+        }
+        if (projectReservationId && claimOutcome === 'PROJECT_RESERVATION_INVALID') {
+          terminalClaimError = {
+            code: 'PROJECT_AGENT_RESERVATION_INVALID',
+            message: 'reservation 在 claim 提交前已失效或与目标 task 不一致',
+          };
           return null;
         }
         // task/lease 已被其它合法转换改变，继续尝试下一候选。
@@ -5863,7 +6612,7 @@ async function claimUnlocked(
 
 export async function claim(
   redis: Redis,
-  req: ClaimRequest,
+  req: ClaimRequestWithReservation,
   signal?: AbortSignal,
 ): Promise<ApiResponse<ClaimedTask | null>> {
   return claimUnlocked(redis, req, signal);

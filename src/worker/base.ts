@@ -41,11 +41,37 @@ const DEFAULT_BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
 const API_MAX_ATTEMPTS = 3;
 const API_RETRY_BASE_MS = 25;
 
-/** Agent 和 verify 子进程都不能继承 Biao 控制面/持久化凭据。 */
+/**
+ * 非 BIAO_ 前缀的凭据类变量剥离清单（22.3-06）。
+ * Biao 控制面/持久化的全部自产变量都以 BIAO_ 前缀剥离；这里只补
+ * 会泄露服务凭据的外部变量。新增敏感变量时同步维护此清单与单测。
+ */
+const CREDENTIAL_ENV_KEYS: ReadonlySet<string> = new Set([
+  'REDIS_URL',
+  'REDIS_PASSWORD',
+  'REDISCLI_AUTH',
+]);
+
+/** 单个 env 键是否属于"不得继承给子进程"的凭据类变量。 */
+function isSensitiveEnvKey(key: string): boolean {
+  // 前缀规则覆盖全部 BIAO_*（API token、SQLite/Redis 连接、V2 密钥环、
+  // 节点 owner token 等）——新增 BIAO_ 变量默认即被剥离，无需登记。
+  return key.startsWith('BIAO_') || CREDENTIAL_ENV_KEYS.has(key);
+}
+
+/**
+ * Agent 和 verify 子进程都不能继承 Biao 控制面/持久化凭据（22.3-06）。
+ * - 剥离全部 BIAO_* 前缀变量与凭据类服务变量（REDIS_URL 等）；
+ * - 白名单语义：其余变量（PATH/HOME/LANG、模型供应商 API key 等 Agent
+ *   自身运行所需）原样保留；
+ * - 返回全新对象，不修改 process.env 与传入的 overrides。
+ */
 export function sanitizedChildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   const childEnv: NodeJS.ProcessEnv = { ...process.env, ...overrides };
-  for (const key of ['BIAO_API_TOKEN', 'BIAO_REDIS_URL', 'BIAO_SQLITE_PATH', 'REDIS_URL']) {
-    delete childEnv[key];
+  for (const key of Object.keys(childEnv)) {
+    if (isSensitiveEnvKey(key)) {
+      delete childEnv[key];
+    }
   }
   return childEnv;
 }
@@ -88,6 +114,11 @@ export class BiaoClient {
     public readonly agentId: string,
     private readonly apiToken: string | undefined = process.env.BIAO_API_TOKEN,
   ) {}
+
+  /** Stable epoch identifier used by append-only ExecutionReceipt audit records. */
+  getRegistrationId(): string {
+    return this.registrationId;
+  }
 
   private async api(path: string, init?: RequestInit): Promise<any> {
     for (let attempt = 0; attempt < API_MAX_ATTEMPTS; attempt++) {
@@ -1425,12 +1456,33 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   if (heartbeatWhenIdle) await sendHeartbeat();
   const heartbeatTimer = setInterval(() => { void sendHeartbeat(); }, heartbeatMs);
   let preclaimedTask = cfg.preclaimedTask;
+  let consecutiveClaimTransportFailures = 0;
 
   try {
   while (!cfg.signal?.aborted && (maxTasks === 0 || count < maxTasks)) {
-    const claimRes = preclaimedTask
-      ? { ok: true, data: preclaimedTask }
-      : await client.claim({ blocking: false, timeout_ms: 5000, preferred_project: cfg.preferredProject });
+    let claimRes: { ok: boolean; data: ClaimedTask | null };
+    try {
+      claimRes = preclaimedTask
+        ? { ok: true, data: preclaimedTask }
+        : await client.claim({ blocking: false, timeout_ms: 5000, preferred_project: cfg.preferredProject });
+      consecutiveClaimTransportFailures = 0;
+    } catch (error) {
+      // 一次性 Worker 仍要把连接错误交给调用方；只有显式常驻的遗留入口在服务
+      // 闪断时留在进程内恢复。新的多 harness 模式由 Supervisor 按需唤醒，不依赖
+      // 这个循环轮询，但兼容入口也不能因约 150ms 的 SDK 重试耗尽而永久退出。
+      if (exitOnIdle) throw error;
+      consecutiveClaimTransportFailures += 1;
+      const backoffMs = Math.min(
+        60_000,
+        Math.max(10, idlePollMs) * (2 ** Math.min(consecutiveClaimTransportFailures - 1, 6)),
+      );
+      console.warn(
+        `[worker:${cfg.agentId}] 领取连接异常：${error instanceof Error ? error.message : String(error)}` +
+        `；保留常驻进程，${Math.ceil(backoffMs / 1000)}s 后重试`,
+      );
+      await waitForNextPoll(backoffMs, cfg.signal);
+      continue;
+    }
     preclaimedTask = undefined;
     if (!claimRes.ok || !claimRes.data) {
       if (!claimRes.ok) {
