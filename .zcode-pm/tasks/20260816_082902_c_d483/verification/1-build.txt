@@ -1,5 +1,0 @@
-$ npm run build  (build:server + build:web)
-dist/assets/index-DrS2SfGg.js   240.17 kB │ gzip: 73.73 kB
-
-✓ built in 72ms
-exit=0

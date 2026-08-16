@@ -21,3 +21,6 @@ scripts/agent-exec.sh
 
 # 本机 dogfooding 计划目录：plans 属于各部署的工作区数据，不入产品仓库
 /plans/
+
+# PM Worker internal runtime state (not source code)
+.zcode-pm/

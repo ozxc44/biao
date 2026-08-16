@@ -4,7 +4,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  NAS 119 (192.168.31.119)                                   │
+│  NAS 119 (<NAS_IP>)                                   │
 │                                                             │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
 │  │ agent-memory │    │  nas-gitea   │    │  biao-server │  │
@@ -34,10 +34,10 @@
 
 ```bash
 # 1. 上传仓库到 NAS
-scp -r biao/ user@192.168.31.119:/data_n004/biao/src/
+scp -r biao/ <user>@<NAS_IP>:/data_n004/biao/src/
 
 # 2. SSH 登录 NAS
-ssh user@192.168.31.119
+ssh <user>@<NAS_IP>
 
 # 3. 执行部署
 cd /data_n004/biao/src/deploy/nas
@@ -59,7 +59,7 @@ grep BIAO_API_TOKEN /data_n004/biao/src/deploy/nas/.env | cut -d= -f2
 
 ```bash
 # 设置环境变量
-export BIAO_URL=http://192.168.31.119:7331
+export BIAO_URL=http://<NAS_IP>:7331
 export BIAO_API_TOKEN=<从 NAS 获取的 token>
 
 # 测试连接
@@ -150,15 +150,15 @@ Biao V2 的 Git Workspace 功能可以使用 NAS 上的 Gitea 作为远程仓库
 
 ```bash
 # 在 Biao 项目配置中设置 repository_url
-# 格式：ssh://git@192.168.31.119:22022/<owner>/<repo>.git
+# 格式：ssh://git@<NAS_IP>:22022/<owner>/<repo>.git
 
 # 示例：创建 Gitea 仓库后，在 Biao 中配置
-curl -X POST http://192.168.31.119:7331/v2/projects \
+curl -X POST http://<NAS_IP>:7331/v2/projects \
   -H "Authorization: Bearer $BIAO_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "project_id": "my-project",
-    "repository_url": "ssh://git@192.168.31.119:22022/admin/my-project.git"
+    "repository_url": "ssh://git@<NAS_IP>:22022/admin/my-project.git"
   }'
 ```
 
