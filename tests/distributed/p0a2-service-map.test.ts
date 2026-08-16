@@ -24,7 +24,15 @@ const mapSource = readFileSync(mapPath, 'utf8');
 
 /** service.ts 直接导出的（async）function 名。 */
 function exportedFunctions(): string[] {
-  return [...serviceSource.matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
+  const declared = [...serviceSource.matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
+  // P12 车道 B（AttemptService 第一批迁移）起，已迁出的函数以 re-export 形式
+  // 留在 facade 导出面（export { ... } from './v2/attempt-service.js'）——仍是
+  // service.ts 的导出函数，台账继续跟踪其归属；maintenance.ts 的 0a-1 re-export
+  // 早于台账且已在文末单列，不纳入统计。
+  const reexported = [...serviceSource.matchAll(
+    /^export \{([^}]+)\} from '\.\/v2\/[a-z-]+service\.js';/gm,
+  )].flatMap((m) => m[1].split(',').map((name) => name.trim()).filter(Boolean));
+  return [...declared, ...reexported];
 }
 
 /** 解析台账：服务小节 → 函数清单；以及头部统计表。 */

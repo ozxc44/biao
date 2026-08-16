@@ -45,12 +45,22 @@ export function readCookie(cookieHeader: string | undefined, name: string): stri
   return undefined;
 }
 
+/**
+ * P12 §14：BIAO_HTTPS=1 时 Cookie 加 `Secure` flag（HTTPS 反向代理终止部署）。
+ * 未配置/非 HTTPS 部署返回空串，不改变现有行为。
+ */
+export function cookieSecureFlag(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.BIAO_HTTPS;
+  if (raw === undefined) return '';
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase()) ? '; Secure' : '';
+}
+
 export function localOwnerSetCookie(value: string): string {
-  return `${LOCAL_OWNER_COOKIE}=${value}; Path=/; Max-Age=${LOCAL_OWNER_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict`;
+  return `${LOCAL_OWNER_COOKIE}=${value}; Path=/; Max-Age=${LOCAL_OWNER_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict${cookieSecureFlag()}`;
 }
 
 export function localOwnerClearCookie(): string {
-  return `${LOCAL_OWNER_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict`;
+  return `${LOCAL_OWNER_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${cookieSecureFlag()}`;
 }
 
 export function isLoopbackHost(host: string): boolean {

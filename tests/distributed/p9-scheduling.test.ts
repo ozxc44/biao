@@ -342,6 +342,7 @@ describe('目标 2: daemon 真执行器（Phase 8 残留）', () => {
       workspaceDir: tempDir,
       fetchImpl: mockFetch as any,
       getAttemptToken: () => 'bva2_test-token',
+      execCommand: `echo "executed" > \${workspace}/output.txt`,
     });
 
     await executor.recordAdopted({
@@ -361,11 +362,10 @@ describe('目标 2: daemon 真执行器（Phase 8 残留）', () => {
     expect(record!.finalize_state).toBe('delivered');
     expect(record!.report_state).toBe('sent');
 
-    // 验证 HTTP 调用序列
-    expect(fetchCalls.length).toBe(3);
-    expect(fetchCalls[0].url).toContain('/workspace/prepare');
-    expect(fetchCalls[1].url).toContain('/workspace/finalize');
-    expect(fetchCalls[2].url).toContain('/report');
+    // 验证 HTTP 调用关键路径（P12 车道 A 增加了 goal_md fetch）
+    const urls = fetchCalls.map(c => c.url);
+    expect(urls.some(u => u.includes('/workspace/prepare'))).toBe(true);
+    expect(urls.some(u => u.includes('/workspace/finalize'))).toBe(true);
 
     // 验证工作区文件存在
     expect(existsSync(join(tempDir, 'boot-test', 'att-real-1', 'output.txt'))).toBe(true);

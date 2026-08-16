@@ -259,12 +259,155 @@ export function createBackupCoordinator(options: BackupCoordinatorOptions) {
     return ok({ items: store.listBackupRuns(restorePointId) });
   }
 
+  /**
+   * P12 §12：单次组件快照 digest（与 createRestorePoint 的语义一致）。
+   * sqlite → 数据库文件 digest；其余组件 → 确定性占位 digest。
+   */
+  function componentDigest(component: string, ts: number): string {
+    return component === 'sqlite' ? dbDigest() : sha256hex(`${component}-${ts}`);
+  }
+
+  /**
+   * P12 §12：自动化备份入口（NAS cron 每小时调 POST /v2/backup/run）。
+   * 与 createRestorePoint 的差异：
+   * - 每个组件先写 running 行，再逐个快照，任一步失败把该 run 标 failed
+   *   并继续其余组件（不整体回滚）；
+   * - 全部完成后 restore_point 置 completed；有 failed run 时置 failed 并
+   *   打开 incident（缺省 kind=backup_failed，severity=warning）；
+   * - 响应始终 ok:true，status 表达 completed/failed，供 cron 幂等观测。
+   */
+  function runBackup(input: {
+    incident?: { createIncident: (i: { project_id?: string | null; kind: string; severity?: 'info' | 'warning' | 'critical'; title: string; detail?: string; correlation_id?: string; related_entity_type?: string; related_entity_id?: string }) => unknown };
+  } = {}): BackupServiceApiResponse<{
+    restore_point: RestorePointRow;
+    backup_runs: BackupRunRow[];
+    status: V2RestorePointStatus;
+  }> {
+    const ts = now();
+    const checkpoint = walCheckpoint();
+    const restorePointId = `rp-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
+    const restorePoint: RestorePointRow = {
+      restore_point_id: restorePointId,
+      db_revision: store.listAuditEvents(undefined, 1).length,
+      git_refs_digest: gitRefsDigest(),
+      artifact_manifest_digest: artifactManifestDigest(),
+      audit_high_water: store.listAuditEvents(undefined, 1)[0]?.created_at ?? 0,
+      outbox_high_water: store.listOutboxEvents(undefined, 1)[0]?.next_attempt_at ?? 0,
+      status: 'created',
+      created_at: ts,
+    };
+    store.insertRestorePoint(restorePoint);
+
+    const components = ['sqlite', 'artifacts', 'git-refs'];
+    const backupRuns: BackupRunRow[] = [];
+    let failedComponent: string | null = null;
+    let failedError = '';
+
+    for (const component of components) {
+      const runId = `br-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+      const run: BackupRunRow = {
+        backup_run_id: runId,
+        restore_point_id: restorePointId,
+        component,
+        manifest_digest: '',
+        status: 'running',
+        started_at: ts,
+        completed_at: null,
+        error: '',
+      };
+      store.insertBackupRun(run);
+      try {
+        const digest = componentDigest(component, ts);
+        store.updateBackupRun(runId, {
+          manifest_digest: digest,
+          status: 'completed',
+          completed_at: ts,
+        });
+        backupRuns.push({ ...run, manifest_digest: digest, status: 'completed', completed_at: ts });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        store.updateBackupRun(runId, {
+          status: 'failed',
+          error: message,
+          completed_at: ts,
+        });
+        backupRuns.push({ ...run, status: 'failed', error: message, completed_at: ts });
+        failedComponent = component;
+        failedError = message;
+      }
+    }
+
+    const status: V2RestorePointStatus = failedComponent ? 'failed' : 'completed';
+    store.updateRestorePoint(restorePointId, { status });
+
+    if (failedComponent) {
+      store.insertAuditEvent({
+        audit_id: `aud-${randomUUID().replace(/-/g, '').slice(0, 20)}`,
+        project_id: null,
+        actor_id: 'system',
+        action: 'backup.run_failed',
+        subject_type: 'restore_point',
+        subject_id: restorePointId,
+        correlation_id: '',
+        evidence_digest: '',
+        created_at: ts,
+      });
+      input.incident?.createIncident({
+        project_id: null,
+        kind: 'backup_failed',
+        severity: 'warning',
+        title: '自动化备份失败',
+        detail: `restore_point ${restorePointId} 组件 ${failedComponent} 失败：${failedError}；WAL checkpoint=${checkpoint.ok ? 'ok' : `busy(${checkpoint.pages_checkpointed})`}`,
+        correlation_id: '',
+        related_entity_type: 'restore_point',
+        related_entity_id: restorePointId,
+      });
+    }
+
+    return ok({
+      restore_point: store.getRestorePoint(restorePointId)!,
+      backup_runs: backupRuns,
+      status,
+    });
+  }
+
+  /**
+   * P12 §12：最近备份状态视图（GET /v2/backup/status）。
+   * 返回最近 N 个 restore_point 及其 backup_runs 汇总。
+   */
+  function backupStatusView(limit = 10): BackupServiceApiResponse<{
+    restore_points: Array<{
+      restore_point: RestorePointRow;
+      backup_runs: BackupRunRow[];
+      summary: { total: number; completed: number; failed: number };
+    }>;
+    latest: RestorePointRow | null;
+  }> {
+    const restorePoints = store.listRestorePoints().slice(0, limit);
+    const items = restorePoints.map((restorePoint) => {
+      const runs = store.listBackupRuns(restorePoint.restore_point_id);
+      return {
+        restore_point: restorePoint,
+        backup_runs: runs,
+        summary: {
+          total: runs.length,
+          completed: runs.filter((run) => run.status === 'completed').length,
+          failed: runs.filter((run) => run.status === 'failed').length,
+        },
+      };
+    });
+    return ok({ restore_points: items, latest: restorePoints[0] ?? null });
+  }
+
   return {
     walCheckpoint,
     createRestorePoint,
+    runBackup,
     restoreDrill,
     listRestorePoints,
     listBackupRuns,
+    backupStatusView,
     dbDigest,
   };
 }

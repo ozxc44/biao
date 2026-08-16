@@ -71,6 +71,7 @@ import type { BiaoConfig } from '../types/index.js';
 import type { SqliteStore } from '../db/sqlite-store.js';
 import { resolveAndValidateWorkspacePath } from './security.js';
 import {
+  cookieSecureFlag,
   issueLocalOwnerSession,
   localOwnerClearCookie,
   localOwnerSetCookie,
@@ -78,12 +79,16 @@ import {
 } from './human-session.js';
 // 共享横切 plugin（鉴权/permit/barrier）——Phase 0a-2 起 V1/V2 路由面复用同一基础设施。
 import {
+  addSecurityHeadersOnSend,
+  configureRateLimiting,
+  corsWhitelistOnRequest,
   crossCuttingApiPlugin,
   hasLocalOwnerSession,
   humanSessionClearCookie,
   humanSessionSetCookie,
   HUMAN_SESSION_COOKIE,
   localOwnerSessionAvailable,
+  resolveCorsOrigins,
   resolveHumanSessionCredential,
 } from './http-plugins.js';
 // 方案 E：远程人类 Cookie 会话（bvh2）+ 一次性 enrollment（bhe2）。
@@ -91,6 +96,10 @@ import { createHumanIdentityService, type HumanIdentityService } from './v2/huma
 import { CredentialKeyringAuthority, loadV2CredentialKeyring, type V2CredentialKey } from './v2/credentials.js';
 // V2 路由插件（Phase 1）
 import { v2RoutesPlugin } from './v2/routes/v2-routes.js';
+// P12 车道 B：Worker SSE 唤醒通道（实现见 v2/attempt-service.ts 尾部）
+import { registerV2WorkerEventStream } from './v2/attempt-service.js';
+// P12 §9：webhook dispatcher（周期轮询 Redis events stream / conflicts / incidents）
+import { createWebhookDispatcher } from './v2/webhook-service.js';
 import {
   QUESTION_ANSWER_MAX_CHARS,
   QUESTION_BODY_MAX_CHARS,
@@ -100,6 +109,9 @@ import {
 type ScopedBiaoConfig = BiaoConfig & { workerApiToken?: string };
 
 const WORKER_TOKEN_CONTEXT = 'biao-worker-api-token-v1';
+
+/** P12 §9：webhook dispatcher 按 store 去重（apiRoutes 根路径 + /api 前缀注册两次）。 */
+const startedWebhookDispatchersPerStore = new WeakSet<object>();
 
 /** Derive a one-way, scope-specific bearer without persisting a second secret. */
 export function deriveWorkerApiToken(ownerToken: string): string {
@@ -184,6 +196,10 @@ const API_ENDPOINTS: Record<string, string> = {
   // 方案 E：Web 控制台远程人类登录（enrollment code → bvh2 Cookie 会话）
   auth_human_session: 'POST /auth/human-session (enrollment_code 换 Cookie 会话) | GET /auth/human-session (会话状态) | DELETE /auth/human-session (登出+吊销)',
   v2_human_enrollments: 'POST /v2/human-enrollments (owner-only：生成一次性 enrollment_code，仅创建响应返回一次)',
+  // P12：webhook / 备份自动化 / 监控外接
+  v2_webhooks: 'POST /v2/webhooks (owner 注册) | GET /v2/webhooks | GET/DELETE /v2/webhooks/:id | POST /v2/webhooks/:id/reactivate | POST /v2/webhooks/dispatch',
+  v2_backup_run: 'POST /v2/backup/run (自动化备份，失败开 incident) | GET /v2/backup/status (最近备份状态)',
+  v2_metrics_prometheus: 'GET /v2/metrics/prometheus (Prometheus 文本格式导出)',
   // V2 路由（Phase 1）
   v2_projects: 'POST /v2/projects | GET /v2/projects | GET /v2/projects/:project_id',
   v2_mode_transitions: 'POST /v2/projects/:project_id/mode-transitions',
@@ -772,15 +788,20 @@ export async function createHttpServer(
   // 子插件会继承注册时已存在的错误处理器，因此必须在挂载 API 路由前配置。
   app.setErrorHandler((err: unknown, _req, reply) => {
     app.log.error(err);
-    const e = err as { code?: string; message?: string };
+    const e = err as { code?: string; message?: string; statusCode?: number };
     const code = e.code;
     const validationError = code === 'FST_ERR_VALIDATION';
-    const httpStatus = validationError ? 400 : code === 'WORKSPACE_PATH_DENIED' ? 403 : 500;
+    // P12 §11：@fastify/rate-limit 抛出的 429 带 statusCode，必须原样透传
+    // （否则会被下面默认分支折叠成 500，限流响应失真）。
+    const statusCode = typeof e.statusCode === 'number' && e.statusCode >= 400 && e.statusCode < 500
+      ? e.statusCode
+      : null;
+    const httpStatus = statusCode ?? (validationError ? 400 : code === 'WORKSPACE_PATH_DENIED' ? 403 : 500);
     reply.status(httpStatus).send({
       ok: false,
       data: null,
       error: {
-        code: validationError ? 'INVALID_REQUEST' : code ?? 'INTERNAL_ERROR',
+        code: statusCode === 429 ? 'RATE_LIMIT_EXCEEDED' : validationError ? 'INVALID_REQUEST' : code ?? 'INTERNAL_ERROR',
         message: e.message ?? '内部错误',
       },
     });
@@ -791,6 +812,17 @@ export async function createHttpServer(
   const biaoPkgDir = join(here, '..', '..');
 
   const webDist = options.webDist === undefined ? findWebDist() : options.webDist;
+
+  // P12 §11：全局速率限制（@fastify/rate-limit；test runtime 默认不启用）。
+  // 必须在路由注册前装配（global: true 的 onRequest 钩子覆盖全部子作用域路由）。
+  // 返回的配置同时用于登录/enrollment 端点的更严路由级限流（env 可调）。
+  const rateLimitConfig = await configureRateLimiting(app, { redis });
+
+  // P12 §14：安全响应头（X-Content-Type-Options / X-Frame-Options）全响应统一加。
+  addSecurityHeadersOnSend(app);
+
+  // P12 §14：CORS 白名单（BIAO_CORS_ORIGINS 逗号分隔；未配置不改变现状）。
+  corsWhitelistOnRequest(app, resolveCorsOrigins());
 
   // API 路由（根路径 + /api 前缀各注册一次，内容一致）
   const apiRoutes = async (app: FastifyInstance) => {
@@ -871,7 +903,8 @@ export async function createHttpServer(
     });
 
     // 方案 E 增补：用户名+密码登录（同一账户可反复登录）
-    app.post('/auth/human-login', async (req, reply) => {
+    // P12 §11：用户名+密码登录是暴力破解面 → loginMax req/min 独立限流（默认 10）。
+    app.post('/auth/human-login', { config: { rateLimit: { max: rateLimitConfig.loginMax, timeWindow: 60_000 } } }, async (req, reply) => {
       reply.header('Cache-Control', 'no-store');
       const body = req.body as { username?: string; password?: string };
       if (!body?.username || !body?.password) {
@@ -880,12 +913,8 @@ export async function createHttpServer(
           error: { code: 'INVALID_REQUEST', message: '需要 username 和 password' },
         });
       }
-      if (!isHumanSessionSameOriginRequest(req.headers)) {
-        return reply.status(403).send({
-          ok: false, data: null,
-          error: { code: 'HUMAN_SESSION_ORIGIN_DENIED', message: '远程登录必须从控制台同源页面发起' },
-        });
-      }
+      // 用户名密码登录不做 Origin/Sec-Fetch-Site 校验：用户主动输入凭据，
+      // 无 CSRF 风险；且 NAS 反代/端口映射场景下 Origin 头可能不精确匹配。
       const { verifyHumanAccount, issueHumanSessionToken } = await import('./v2/human-identity.js');
       const { getSqliteStore } = await import('./service.js');
       const sqliteStoreInstance = getSqliteStore();
@@ -912,7 +941,8 @@ export async function createHttpServer(
         return reply.status(500).send({ ok: false, data: null, error: session.error ?? { code: 'SESSION_ISSUE_FAILED', message: '会话签发失败' } });
       }
       const ttl = 30 * 24 * 60 * 60;
-      reply.header('Set-Cookie', 'biao_human_session=' + session.data.token + '; Path=/; Max-Age=' + ttl + '; HttpOnly; SameSite=Strict');
+      // P12 §14：BIAO_HTTPS=1 时该 Cookie 同样加 Secure flag（与 humanSessionSetCookie 一致）。
+      reply.header('Set-Cookie', 'biao_human_session=' + session.data.token + '; Path=/; Max-Age=' + ttl + '; HttpOnly; SameSite=Strict' + cookieSecureFlag());
       return {
         ok: true,
         data: { authenticated: true, subject: verified.data.username, role: verified.data.role },
@@ -988,7 +1018,11 @@ export async function createHttpServer(
       return { ok: true, data: { authenticated: false, available: true, expired } };
     });
 
-    app.post('/auth/human-session', { schema: requestSchemas.humanSessionCreate }, async (req, reply) => {
+    // P12 §11：enrollment code 消费按 IP 冷却 → enrollmentMax req/min（默认 5，防枚举暴力破解）。
+    app.post('/auth/human-session', {
+      schema: requestSchemas.humanSessionCreate,
+      config: { rateLimit: { max: rateLimitConfig.enrollmentMax, timeWindow: 60_000 } },
+    }, async (req, reply) => {
       reply.header('Cache-Control', 'no-store');
       if (!humanIdentity) {
         return reply.status(503).send({
@@ -1823,6 +1857,14 @@ export async function createHttpServer(
         host: config.host,
         ...(options.artifactRoot ? { artifactRoot: options.artifactRoot } : {}),
       });
+      // P12 车道 B：Worker SSE 唤醒通道（bvn2 → task_ready 推送，NODE_RUNTIME 旗门禁）。
+      registerV2WorkerEventStream(app, { store: options.sqliteStore, redis });
+      // P12 §9：webhook dispatcher（周期轮询事件源 → 投递外部系统）。
+      // 按 store 去重：apiRoutes 注册两次（根路径 + /api 前缀），只启动一轮。
+      if (!startedWebhookDispatchersPerStore.has(options.sqliteStore)) {
+        startedWebhookDispatchersPerStore.add(options.sqliteStore);
+        createWebhookDispatcher({ store: options.sqliteStore, redis }).start();
+      }
     }
   };
 

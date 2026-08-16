@@ -25,13 +25,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, wr
 import { statfs } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  BIAO_EXEC_CMD_ENV,
   BIAO_NODE_INJECTED_CLOCK_OFFSET_ENV,
   BIAO_NODE_OWNER_TOKEN_ENV,
   type BiaoNodeRuntimeConfig,
   loadNodeConfig,
 } from './config.js';
 import { NodeClock } from './clock.js';
-import { NodeApiClient, type FetchImpl, type AuthMode } from './transport.js';
+import { NodeApiClient, type FetchImpl, type AuthMode, type WorkerEventStreamHandle } from './transport.js';
 import {
   NODE_PROTOCOL_VERSION_MAX,
   NODE_PROTOCOL_VERSION_MIN,
@@ -102,7 +103,21 @@ export interface DaemonStatusSnapshot {
   };
   clock: ReturnType<NodeClock['snapshot']>;
   slots: { capacity: number; in_use: number; attempts: Array<{ attempt_id: string; task_id: string; generation: number; status: string; deadline_at_wall: number | null; stop_reason?: string }> };
-  claim: { inbox_claimed: number; server_claim_attempts: number; server_claim_last_code: string | null; invalid_intake: number };
+  claim: {
+    inbox_claimed: number;
+    server_claim_attempts: number;
+    server_claim_last_code: string | null;
+    invalid_intake: number;
+    /** P12 车道 B：SSE 唤醒通道状态（task_ready → 立即 claim；断线降级轮询）。 */
+    sse: {
+      connected: boolean;
+      events: number;
+      wakes: number;
+      reconnects: number;
+      last_event_at: number | null;
+      last_error: string | null;
+    };
+  };
   drain: { requested: boolean; reason: string | null; requested_at_wall: number | null; timeout_ms: number | null; action: 'cancel' | 'wait' | null; completed_at_wall: number | null; offline_pending: boolean };
   orphans: Array<Pick<OrphanedAttempt, 'attempt_id' | 'task_id' | 'generation' | 'boot_id'>>;
   recent_errors: Array<{ code: string; message: string; at_wall: number }>;
@@ -157,8 +172,31 @@ export class NodeDaemon {
   private drainState: DaemonStatusSnapshot['drain'] = {
     requested: false, reason: null, requested_at_wall: null, timeout_ms: null, action: null, completed_at_wall: null, offline_pending: false,
   };
-  private claimStats = { inbox_claimed: 0, server_claim_attempts: 0, server_claim_last_code: null as string | null, invalid_intake: 0 };
+  private claimStats = {
+    inbox_claimed: 0,
+    server_claim_attempts: 0,
+    server_claim_last_code: null as string | null,
+    invalid_intake: 0,
+    /** SSE 唤醒通道观测（P12 车道 B）：断线时自动降级轮询，connected=false。 */
+    sse: {
+      connected: false,
+      events: 0,
+      wakes: 0,
+      reconnects: 0,
+      last_event_at: null as number | null,
+      last_error: null as string | null,
+    },
+  };
   private orphanList: DaemonStatusSnapshot['orphans'] = [];
+  /** attempt token 缓存（claim 响应 → executor 用于 workspace/report 鉴权） */
+  private readonly attemptTokenCache = new Map<string, string>();
+  /** SSE 唤醒通道（GET /v2/events/stream）：句柄 + 重连状态。 */
+  private sseHandle: WorkerEventStreamHandle | null = null;
+  private sseReconnectTimer: NodeJS.Timeout | null = null;
+  private sseReconnectAttempt = 0;
+  private sseStopped = false;
+  private sseLastEventId: string | null = null;
+  private serverClaimInFlight = false;
   private signalDrainRequested = false;
   private signalForced = false;
   private lastStatus: DaemonStatusSnapshot | null = null;
@@ -183,12 +221,16 @@ export class NodeDaemon {
     });
     this.slots = new SlotTable(config.slots);
     this.executor = new PlaceholderExecutor(config.state_sessions_dir, this.bootId);
-    // Phase 8：真执行器（useRealExecutor 或 realExecutorOptions 存在时启用）
-    this.realExecutor = (options.useRealExecutor || options.realExecutorOptions)
+    // Phase 8+P12：真执行器（useRealExecutor 或 realExecutorOptions 存在时启用）
+    // P12 车道 B：执行命令模板可经 BIAO_EXEC_CMD env 配置（显式选项优先）。
+    const execCommandFromEnv = this.env[BIAO_EXEC_CMD_ENV]?.trim() || undefined;
+    this.realExecutor = (options.useRealExecutor || options.realExecutorOptions || execCommandFromEnv)
       ? new RealExecutor({
           biaoApiUrl: config.biao_url,
           nodeCredential: credential.credential,
           fetchImpl: options.fetchImpl as unknown as typeof globalThis.fetch,
+          getAttemptToken: (attemptId) => this.attemptTokenCache.get(attemptId),
+          ...(execCommandFromEnv ? { execCommand: execCommandFromEnv } : {}),
           ...options.realExecutorOptions,
         })
       : null;
@@ -444,11 +486,15 @@ export class NodeDaemon {
     if (this.signalDrainRequested) {
       this.enterDraining('启动期间收到停止信号', this.config.drain_timeout_ms, this.config.drain_timeout_action);
     }
+    // P12 车道 B：SSE 唤醒通道（task_ready → 立即 claim）。轮询保留为
+    // fallback——SSE 断线/服务端未开 NODE_RUNTIME 旗时自动降级，行为不变。
+    this.startEventStream();
     while (this.currentPhase() === 'running' || this.currentPhase() === 'draining') {
       await this.tick();
       if (this.currentPhase() === 'drained' || this.currentPhase() === 'fenced') break;
       await sleep(Math.min(this.config.watchdog_tick_ms, 250));
     }
+    this.stopEventStream();
     this.writeStatus();
     return this.currentPhase() === 'fenced' ? 3 : 0;
   }
@@ -482,42 +528,22 @@ export class NodeDaemon {
     this.writeStatus();
   }
 
-  /* ---- claim（Phase 3：inbox 占位 + server stub 探测） ---- */
+  /* ---- claim（Phase 3 inbox + P12 V2 claim 集成：SSE 唤醒优先，轮询 fallback） ---- */
 
   private lastServerClaimWall = 0;
 
   private async claimTick(): Promise<void> {
     const free = this.slots.freeCount();
     if (free <= 0) return;
-    // 1) 真实 claim 通道探测：当前为 NOT_IMPLEMENTED stub（缺口清单 #7），
-    //    fail-closed 处理——记录并退避，不崩溃、不自行伪造 attempt。
+    // 1) 轮询 fallback：SSE 唤醒（wakeClaim）会即时刷新 lastServerClaimWall，
+    //    所以 SSE 在线时这里的间隔计时基本不会到期；SSE 断线后自动回到
+    //    每 claim_interval_ms 一轮的轮询节奏（P12 车道 B 降级语义）。
     const nowWall = this.clock.now();
     if (
       this.config.requested_project_ids.length > 0 &&
       nowWall - this.lastServerClaimWall >= this.config.claim_interval_ms
     ) {
-      this.lastServerClaimWall = nowWall;
-      this.claimStats.server_claim_attempts += 1;
-      const res = await this.client.claim({
-        project_id: this.config.requested_project_ids[0],
-        agent_id: this.config.node_id,
-        claim_request_id: `cr-${randomUUID()}`,
-      });
-      this.claimStats.server_claim_last_code = res.ok ? 'OK' : (res.error?.code ?? 'NETWORK');
-      if (!res.ok && res.failure !== 'NOT_IMPLEMENTED') {
-        this.recordError('CLAIM_FAILED', `server claim 失败（${this.claimStats.server_claim_last_code}）：${res.error?.message ?? ''}`);
-      }
-      if (res.ok && res.data && typeof (res.data as { attempt_id?: unknown }).attempt_id === 'string') {
-        // Phase 4 落地真实 claim 后走同一 adoption 路径。
-        this.adoptAttempt({
-          attempt_id: (res.data as { attempt_id: string }).attempt_id,
-          task_id: (res.data as { task_id?: string }).task_id ?? '',
-          attempt_generation: Number((res.data as { attempt_generation?: unknown }).attempt_generation ?? 1),
-          ...(typeof (res.data as { lease_duration_ms?: unknown }).lease_duration_ms === 'number'
-            ? { lease_duration_ms: (res.data as { lease_duration_ms: number }).lease_duration_ms }
-            : { lease_expires_at: Number((res.data as { lease_expires_at?: unknown }).lease_expires_at ?? Date.now() + 600_000) }),
-        });
-      }
+      await this.serverClaimOnce();
     }
     // 2) inbox 占位通道：原子 rename 认领（见 slots.ts 注释）。
     const { claimed, invalid } = claimInboxAttempts(
@@ -529,6 +555,127 @@ export class NodeDaemon {
     this.claimStats.invalid_intake += invalid.length;
     for (const message of invalid) this.recordError('INTAKE_INVALID', message);
     for (const intake of claimed) this.adoptAttempt(intake);
+  }
+
+  /**
+   * 真实 V2 claim（带 bvn2/过渡期凭据）：领到 → 缓存 attempt token →
+   * 走统一 adoption 路径（RealExecutor prepare→execute→finalize→report 全链）。
+   * tick 轮询与 SSE 唤醒共用；in-flight 防重入。
+   */
+  private async serverClaimOnce(): Promise<void> {
+    if (this.serverClaimInFlight) return;
+    this.serverClaimInFlight = true;
+    try {
+      this.lastServerClaimWall = this.clock.now();
+      this.claimStats.server_claim_attempts += 1;
+      const res = await this.client.claim({
+        project_id: this.config.requested_project_ids[0],
+        agent_id: this.config.node_id,
+        claim_request_id: `cr-${randomUUID()}`,
+      });
+      this.claimStats.server_claim_last_code = res.ok ? 'OK' : (res.error?.code ?? 'NETWORK');
+      if (!res.ok && res.failure !== 'NOT_IMPLEMENTED') {
+        this.recordError('CLAIM_FAILED', `server claim 失败（${this.claimStats.server_claim_last_code}）：${res.error?.message ?? ''}`);
+      }
+      if (res.ok && res.data && typeof (res.data as { attempt_id?: unknown }).attempt_id === 'string') {
+        // 缓存 attempt token（executor 用于 workspace/report 鉴权）
+        const attId = (res.data as { attempt_id: string }).attempt_id;
+        const attToken = (res.data as { attempt_token?: string }).attempt_token;
+        if (attToken) this.attemptTokenCache.set(attId, attToken);
+
+        // Phase 4+P12 落地真实 claim 后走同一 adoption 路径。
+        this.adoptAttempt({
+          attempt_id: attId,
+          task_id: (res.data as { task_id?: string }).task_id ?? '',
+          attempt_generation: Number((res.data as { attempt_generation?: unknown }).attempt_generation ?? 1),
+          ...(typeof (res.data as { lease_duration_ms?: unknown }).lease_duration_ms === 'number'
+            ? { lease_duration_ms: (res.data as { lease_duration_ms: number }).lease_duration_ms }
+            : { lease_expires_at: Number((res.data as { lease_expires_at?: unknown }).lease_expires_at ?? Date.now() + 600_000) }),
+        });
+      }
+    } finally {
+      this.serverClaimInFlight = false;
+    }
+  }
+
+  /* ---- SSE 唤醒通道（P12 车道 B：task_ready → 立即 claim，替代高频轮询） ---- */
+
+  private static readonly SSE_RECONNECT_BASE_MS = 3_000;
+  private static readonly SSE_RECONNECT_MAX_MS = 30_000;
+  /** 同一节点两次 wake claim 的最小间隔：任务风暴下合并唤醒，防 claim 洪泛。 */
+  private static readonly SSE_WAKE_CLAIM_MIN_INTERVAL_MS = 500;
+
+  /** running 状态下启动 SSE 订阅（幂等）；断线由 done 回调按退避重连。 */
+  private startEventStream(): void {
+    if (this.sseStopped || this.sseHandle || this.sseReconnectTimer) return;
+    if (this.currentPhase() !== 'running') return;
+    const handle = this.client.streamEvents({
+      lastId: this.sseLastEventId ?? undefined,
+      onOpen: () => {
+        this.sseReconnectAttempt = 0;
+        this.claimStats.sse.connected = true;
+        this.claimStats.sse.last_error = null;
+      },
+      onEvent: (event) => {
+        if (event.id) this.sseLastEventId = event.id;
+        const isTaskReady = event.event === 'task_ready' || event.data?.type === 'task_ready';
+        if (!isTaskReady) return;
+        this.claimStats.sse.events += 1;
+        this.claimStats.sse.last_event_at = this.clock.now();
+        void this.wakeClaim();
+      },
+    });
+    this.sseHandle = handle;
+    void handle.done.then(() => {
+      this.sseHandle = null;
+      const wasConnected = this.claimStats.sse.connected;
+      this.claimStats.sse.connected = false;
+      if (this.sseStopped || this.currentPhase() !== 'running') return;
+      // 断线自动降级轮询（claimTick 的间隔通道），并按退避重连 SSE。
+      if (wasConnected) {
+        this.claimStats.sse.last_error = '连接断开，降级轮询并重连中';
+        this.recordError('SSE_DISCONNECTED', 'task_ready 唤醒流断开：claim 回退轮询（claim_interval_ms），SSE 按退避重连');
+      }
+      this.scheduleSseReconnect();
+    });
+  }
+
+  private scheduleSseReconnect(): void {
+    if (this.sseStopped || this.sseReconnectTimer || this.sseHandle) return;
+    const delay = Math.min(
+      NodeDaemon.SSE_RECONNECT_MAX_MS,
+      NodeDaemon.SSE_RECONNECT_BASE_MS * 2 ** Math.min(this.sseReconnectAttempt, 4),
+    );
+    this.sseReconnectAttempt += 1;
+    this.claimStats.sse.reconnects += 1;
+    this.sseReconnectTimer = setTimeout(() => {
+      this.sseReconnectTimer = null;
+      this.startEventStream();
+    }, delay);
+    this.sseReconnectTimer.unref?.();
+  }
+
+  /** 收到 task_ready：立即 claim（间隔守门 + phase/slot 检查）。 */
+  private async wakeClaim(): Promise<void> {
+    if (this.currentPhase() !== 'running') return;
+    if (this.config.requested_project_ids.length === 0) return;
+    if (this.slots.freeCount() <= 0) return;
+    const nowWall = this.clock.now();
+    if (nowWall - this.lastServerClaimWall < NodeDaemon.SSE_WAKE_CLAIM_MIN_INTERVAL_MS) return;
+    this.claimStats.sse.wakes += 1;
+    await this.serverClaimOnce();
+  }
+
+  /** 停止 SSE 订阅与重连定时器（drain/fenced/进程收口时调用）。 */
+  private stopEventStream(): void {
+    this.sseStopped = true;
+    if (this.sseReconnectTimer) {
+      clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = null;
+    }
+    this.sseHandle?.close();
+    this.sseHandle = null;
+    this.claimStats.sse.connected = false;
   }
 
   private adoptAttempt(intake: AttemptIntake): void {
@@ -575,6 +722,7 @@ export class NodeDaemon {
     } else {
       this.executor.recordStopped(attempt, reason, this.config.state_recovery_dir);
     }
+    this.attemptTokenCache.delete(attempt.attempt_id);
     this.slots.release(attempt.attempt_id);
     // 上报（可能失败——report 通道为 stub 时落为 report_pending，本地审计）。
     this.reportQueue.push({ attempt, reason });
@@ -679,6 +827,8 @@ export class NodeDaemon {
   private enterDraining(reason: string, timeoutMs: number, action: 'cancel' | 'wait'): void {
     if (this.phase !== 'running') return;
     this.phase = 'draining';
+    // drain = 不再 claim：唤醒通道随之关闭（wakeClaim 的 phase 守门是第二道）。
+    this.stopEventStream();
     this.drainState = {
       requested: true,
       reason,
@@ -734,6 +884,7 @@ export class NodeDaemon {
     this.phase = 'fenced';
     this.recordError('SESSION_FENCED', reason);
     // fencing：全部本地工作立即停止（watchdog 记账 + recovery bundle 桩）。
+    this.stopEventStream();
     this.watchdog.cancelAll('fenced');
     this.ledgerEvent('fenced', { reason });
   }

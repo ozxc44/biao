@@ -714,6 +714,7 @@ describe('Phase 1 registry 门禁：credentialBinding 与 credentials.ts 对齐'
     'POST /v2/attempts/:attempt_id/lease/renew': { verifier: 'verifyAttemptToken', attemptScope: 'claim' },
     'POST /v2/attempts/:attempt_id/question': { verifier: 'verifyAttemptToken', attemptScope: 'question' },
     'POST /v2/attempts/:attempt_id/report': { verifier: 'verifyAttemptToken', attemptScope: 'report' },
+    'POST /v2/attempts/:attempt_id/cancel': { verifier: 'verifyAttemptToken', attemptScope: 'claim' },
     'POST /v2/artifacts/initiate': { verifier: 'verifyAttemptToken', attemptScope: 'report' },
     'PUT /v2/artifacts/:artifact_id/content': { verifier: 'verifyAttemptToken', attemptScope: 'report' },
     'POST /v2/artifacts/:artifact_id/complete': { verifier: 'verifyAttemptToken', attemptScope: 'report' },

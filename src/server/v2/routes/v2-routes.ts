@@ -55,6 +55,16 @@ import type { V2ActorContext } from '../domain-interfaces.js';
 import { createIncidentService } from '../incident-service.js';
 import { createBackupCoordinator } from '../backup.js';
 import { createMetricsService } from '../metrics.js';
+// P12 §9：webhook 注册 / 投递 / 手动 dispatch。
+import {
+  deleteWebhook,
+  dispatchEventToWebhooks,
+  getWebhook,
+  listWebhooks,
+  processDueDeliveries,
+  reactivateWebhook,
+  registerWebhook,
+} from '../webhook-service.js';
 import {
   describeV2FeatureFlags,
   requiredV2FeatureFlagForPath,
@@ -62,6 +72,7 @@ import {
   V2_FEATURE_FLAG_ENV_NAMES,
   type V2FeatureFlags,
 } from '../feature-flags.js';
+import { keys as redisKeys } from '../../../redis/keys.js';
 
 /** 已在本次进程启动执行过 resume 的 store（apiRoutes 双注册去重）。 */
 const resumedStoresPerProcess = new WeakSet<SqliteStore>();
@@ -81,6 +92,8 @@ export interface V2RoutesOptions {
    * 抛错（fail-fast，指明缺哪面旗）；显式注入仅测试用。
    */
   featureFlags?: V2FeatureFlags;
+  /** P12：Redis 客户端（report 成功后同步任务状态到 Redis hash + sorted set） */
+  redis?: import('ioredis').Redis | null;
 }
 
 /** 从 Authorization 头提取 bearer token。 */
@@ -601,14 +614,15 @@ export const v2RoutesPlugin: FastifyPluginAsync<V2RoutesOptions> = async (app, o
     if (body.task_id) {
       taskRow = store.getTask(body.task_id);
     } else {
-      // 从该节点绑定的项目中找 pending 任务
+      // 1) 先按 tasks.project_id 索引查（§20.2 扩展列，V2 任务的归属路径）
       const tasks = store.getTasksByProjectId(body.project_id);
       taskRow = tasks.find((t) => t.status === 'pending');
-      // V2/V1 桥接：project_id 查不到时，回退查 V1 pending 队列
-      // （V1 plan/create 的任务没有填 project_id 列）
+      // 2) V2/V1 桥接：project_id 查不到时，回退查 V1 pending 队列
+      // （V1 plan/create 的任务没有填 project_id 列）。走 status 索引 +
+      // LIMIT 1 的首行查询，替代旧 getAllTasks() 全表扫描——100 台 Worker
+      // 轮询 claim 时不再把整张 tasks 表读进内存。
       if (!taskRow && body.project_id) {
-        const allTasks = store.getAllTasks();
-        taskRow = allTasks.find((t) => t.status === 'pending' && !t.project_id);
+        taskRow = store.getFirstPendingTaskWithoutProject();
         if (taskRow) {
           v1Fallback = true;
         }
@@ -777,6 +791,82 @@ export const v2RoutesPlugin: FastifyPluginAsync<V2RoutesOptions> = async (app, o
     };
   });
 
+  // POST /v2/attempts/:attempt_id/cancel：bva2 或 owner → attempt cancelled → task pending
+  app.post('/v2/attempts/:attempt_id/cancel', async (req, reply) => {
+    const { attempt_id } = req.params as { attempt_id: string };
+
+    // bva2 或 owner 鉴权
+    const token = extractBearerToken(req.headers);
+    if (token?.startsWith('bva2_')) {
+      const attempt = store.getTaskAttempt(attempt_id);
+      if (!attempt) {
+        return reply.status(404).send({ ok: false, data: null, error: { code: 'NOT_FOUND', message: `attempt ${attempt_id} 不存在` } });
+      }
+      const verifyResult = verifyAttemptToken(token, {
+        attemptId: attempt_id, taskId: attempt.task_id,
+        generation: attempt.attempt_generation, scope: 'claim',
+      }, credOpts);
+      if (!verifyResult.ok) {
+        const status = verifyResult.reason === 'GENERATION_MISMATCH' ? 409 : 401;
+        return reply.status(status).send({
+          ok: false, data: null,
+          error: { code: verifyResult.reason, message: `bva2 验证失败: ${verifyResult.reason}` },
+        });
+      }
+    }
+    // owner bearer 由 crossCuttingApiPlugin 基础鉴权兜底
+
+    const attempt = store.getTaskAttempt(attempt_id);
+    if (!attempt) {
+      return reply.status(404).send({ ok: false, data: null, error: { code: 'NOT_FOUND', message: `attempt ${attempt_id} 不存在` } });
+    }
+
+    // 终态幂等：已取消/已完成直接返回
+    const terminalStatuses = new Set(['cancelled', 'done', 'failed']);
+    if (terminalStatuses.has(attempt.status)) {
+      return { ok: true, data: { attempt_id, status: attempt.status, message: 'attempt 已终态，幂等返回' } };
+    }
+
+    const now = Date.now();
+    store.updateTaskAttempt(attempt_id, {
+      status: 'cancelled',
+      completed_at: now,
+      updated_at: now,
+      failure_reason: 'cancelled',
+    });
+
+    // task 回 pending（允许新 attempt 重试）
+    const taskRow = store.getTask(attempt.task_id);
+    if (taskRow) {
+      store.upsertTask({
+        ...taskRow,
+        status: 'pending',
+        active_attempt_id: '',
+        claimed_by: '',
+        claimed_at: '',
+        updated_at: new Date(now).toISOString(),
+      });
+
+      // 同步 Redis
+      if (options.redis) {
+        const redis = options.redis;
+        const taskId = attempt.task_id;
+        const tx = redis.multi();
+        tx.hset(redisKeys.hash.task(taskId), {
+          status: 'pending',
+          updated_at: new Date(now).toISOString(),
+        });
+        for (const statusKey of Object.values(redisKeys.zset.status)) {
+          tx.zrem(statusKey, taskId);
+        }
+        tx.zadd(redisKeys.zset.status.pending, now, taskId);
+        tx.exec().catch(() => { /* Redis sync failure is non-fatal */ });
+      }
+    }
+
+    return { ok: true, data: { attempt_id, status: 'cancelled', task_id: attempt.task_id } };
+  });
+
   // POST /v2/attempts/:attempt_id/report：bva2 scope=report → reportV2WithArtifacts
   app.post('/v2/attempts/:attempt_id/report', async (req, reply) => {
     const { attempt_id } = req.params as { attempt_id: string };
@@ -860,12 +950,32 @@ export const v2RoutesPlugin: FastifyPluginAsync<V2RoutesOptions> = async (app, o
       // 同步更新 task 状态：done → done，failed → pending（允许重试）
       const taskRow = store.getTask(attempt.task_id);
       if (taskRow) {
+        const newTaskStatus = attemptStatus === 'done' ? 'done' : 'pending';
         store.upsertTask({
           ...taskRow,
-          status: attemptStatus === 'done' ? 'done' : 'pending',
+          status: newTaskStatus,
           done_at: attemptStatus === 'done' ? new Date().toISOString() : '',
           updated_at: new Date().toISOString(),
         });
+
+        // P12：同步更新 Redis 中的任务状态（hash + sorted set 迁移）
+        if (options.redis) {
+          const redis = options.redis;
+          const taskId = attempt.task_id;
+          const now = Date.now();
+          const tx = redis.multi();
+          tx.hset(redisKeys.hash.task(taskId), {
+            status: newTaskStatus,
+            done_at: attemptStatus === 'done' ? new Date().toISOString() : '',
+            updated_at: new Date().toISOString(),
+          });
+          // 从所有状态 sorted set 中移除，再加入新状态
+          for (const statusKey of Object.values(redisKeys.zset.status)) {
+            tx.zrem(statusKey, taskId);
+          }
+          tx.zadd(redisKeys.zset.status[newTaskStatus as keyof typeof redisKeys.zset.status] ?? redisKeys.zset.status.pending, now, taskId);
+          tx.exec().catch(() => { /* Redis sync failure is non-fatal */ });
+        }
       }
     }
 
@@ -1456,6 +1566,65 @@ export const v2RoutesPlugin: FastifyPluginAsync<V2RoutesOptions> = async (app, o
   app.get('/v2/metrics', async (_req, reply) => {
     const metrics = metricsService.generateMetrics();
     return reply.type('text/plain; version=0.0.4').send(metrics);
+  });
+
+  // P12 §13：Prometheus 文本格式导出（node_exporter 拉取 /v2/metrics/prometheus）。
+  app.get('/v2/metrics/prometheus', async (_req, reply) => {
+    const metrics = metricsService.generateMetrics();
+    return reply.type('text/plain; version=0.0.4; charset=utf-8').send(metrics);
+  });
+
+  // P12 §9：Webhook 注册 / 列表 / 详情 / 停用 / 手动 dispatch（owner-only，未登记
+  // 路由按 RBAC fail-closed 默认仅 owner）。
+  app.post('/v2/webhooks', async (req) => {
+    const body = req.body as { url: string; events?: string[]; secret?: string };
+    return registerWebhook(store, body);
+  });
+
+  app.get('/v2/webhooks', async (req) => {
+    const query = req.query as { status?: string };
+    return { ok: true, data: listWebhooks(store, query.status) };
+  });
+
+  app.get('/v2/webhooks/:webhook_id', async (req, reply) => {
+    const { webhook_id } = req.params as { webhook_id: string };
+    const result = getWebhook(store, webhook_id);
+    if (!result.ok) return reply.status(404).send(result);
+    return result;
+  });
+
+  app.delete('/v2/webhooks/:webhook_id', async (req, reply) => {
+    const { webhook_id } = req.params as { webhook_id: string };
+    const result = deleteWebhook(store, webhook_id);
+    if (!result.ok) return reply.status(404).send(result);
+    return result;
+  });
+
+  app.post('/v2/webhooks/:webhook_id/reactivate', async (req, reply) => {
+    const { webhook_id } = req.params as { webhook_id: string };
+    const result = reactivateWebhook(store, webhook_id);
+    if (!result.ok) return reply.status(404).send(result);
+    return result;
+  });
+
+  // 手动推进一轮投递（重试 pending 退避；owner/运维 cron 也可调用）。
+  app.post('/v2/webhooks/dispatch', async () => {
+    return { ok: true, data: await processDueDeliveries(store) };
+  });
+
+  // P12 §12：自动化备份（NAS cron 每小时调用）+ 最近备份状态。
+  app.post('/v2/backup/run', async () => {
+    return backupCoordinator.runBackup({
+      incident: {
+        createIncident: (input) => incidentService.createIncident(input as never),
+      },
+    });
+  });
+
+  app.get('/v2/backup/status', async (req) => {
+    const query = req.query as { limit?: string };
+    const limit = query.limit ? Math.min(Math.max(Number(query.limit) || 10, 1), 50) : 10;
+    return backupCoordinator.backupStatusView(limit);
   });
 
   // Backup/Restore routes（Phase 7a）
