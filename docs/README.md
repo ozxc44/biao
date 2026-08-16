@@ -5,6 +5,7 @@ Biao 操作文档
 README 说明产品、安装和最短路径；以下文档固定各角色的可执行边界：
 
 - [5 分钟快速上手](quickstart.md)：从 bootstrap 到第一次 PM 验收的最短路径。
+- [V2 项目接入](v2-project-onboarding.md)：分布式五步接入——project create → plan → 节点授权 → Worker 消费。
 - [Worker 接入契约](worker-integration.md)：内置、CLI 与 HTTP Worker 的领取、ownership、Question、验证和上报协议。
 - [一站式加入](agent-join.md)：新 Agent 一条命令注册、自动绑定并领取 Worker Token。
 - [MCP 接口](mcp.md)：biao-mcp LAN stdio 适配器的工具清单、客户端配置与安全模型。

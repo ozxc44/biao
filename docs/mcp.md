@@ -49,13 +49,15 @@
 
 ## 工具清单
 
-`src/mcp/tools.ts` 注册 13 个工具：
+`src/mcp/tools.ts` 注册 15 个工具：
 
 | 工具 | 对应 HTTP 语义 | 脱敏说明 |
 |---|---|---|
 | `health` | `GET /health`，校验 `data.version === 'v1'` | 无可疑字段 |
 | `plan_list` | `GET /plans` | 剥离 `project_path` 等服务端本地路径 |
 | `plan_status` | `GET /plan/{plan_id}` | 同上 |
+| `project_create` | `POST /v2/projects`（name/repo_path/default_branch/read_only） | 注册 V2 项目；需要 Owner API Token 作用域，凭据不足时中央直接拒绝 |
+| `project_list` | `GET /v2/projects` | 返回 project_id、Git 远端、默认分支、执行模式摘要 |
 | `task_list` | `GET /tasks?plan_id&status&limit&offset` | 同上 |
 | `task_get` | `GET /task/{task_id}` | 不返回 verify 命令、Artifact 字节或服务端路径 |
 | `ownership_check` | `GET /ownership?path&agent_id` | 只读中央 ownership 判定，不在本机重算或声明 ownership |
@@ -101,7 +103,7 @@
 - `src/mcp/stdio.ts` — stdio 传输：逐行 JSON-RPC、stdout 只出协议、日志走 stderr
 - `src/mcp/session.ts` — JSON-RPC 分发（`MCP_SERVER_NAME = 'biao-lan-mcp'`、initialize/tools/list/tools/call/ping）
 - `src/mcp/runtime.ts` — `createLanMcpRuntime`：读 `BIAO_URL`/`BIAO_API_TOKEN`/`BIAO_MCP_TIMEOUT_MS`，维护会话内 agent 注册态与 claim lease
-- `src/mcp/tools.ts` — 13 个工具注册表 + 输出脱敏投影
+- `src/mcp/tools.ts` — 15 个工具注册表 + 输出脱敏投影
 - `src/mcp/client.ts` — `BiaoHttpClient`：HTTP 请求、超时/大小上限、fail-closed 错误分类、secret scrub
 - `src/mcp/http-route.ts` — 中央 Streamable HTTP MCP 空插件（推迟到 RBAC 之后）
 - `src/server/http.ts` — MCP 装配点（挂载空插件）

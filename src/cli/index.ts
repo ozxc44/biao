@@ -253,6 +253,7 @@ const TOP_LEVEL_COMMANDS = new Set([
   '--version',
   '-V',
   'plan',
+  'project',
   'question',
   'task',
   'review',
@@ -266,6 +267,7 @@ const TOP_LEVEL_COMMANDS = new Set([
 const COMMAND_GROUPS: Record<string, readonly string[]> = {
   pm: ['start', 'heartbeat', 'intake', 'unacked', 'ack', 'watch'],
   plan: ['init', 'create', 'submit', 'list', 'status', 'revise', 'intake', 'supersede'],
+  project: ['create', 'list', 'nodes', 'authorize', 'deauthorize'],
   task: ['get', 'add', 'edit', 'cancel', 'block', 'resume', 'reset', 'list', 'supersede', 'resolution'],
   question: ['ask', 'list', 'get', 'answer'],
   db: ['status', 'restore'],
@@ -300,6 +302,14 @@ const QUESTION_OPTION_SPECS: Record<string, StrictOptionSpec> = {
   list: { values: ['consumer', 'status', 'plan'], booleans: ['json'], positionals: 0 },
   get: { values: ['consumer', 'plan'], booleans: ['json'], positionals: 1 },
   answer: { values: ['consumer', 'plan', 'answer'], booleans: ['json', 'approve-ownership', 'reject-ownership'], positionals: 1 },
+};
+
+const PROJECT_OPTION_SPECS: Record<string, StrictOptionSpec> = {
+  create: { values: ['repo', 'branch', 'legacy-scope'], booleans: ['read-only', 'json'], positionals: 1 },
+  list: { values: ['limit'], booleans: ['json'], positionals: 0 },
+  nodes: { values: ['limit'], booleans: ['json'], positionals: 0 },
+  authorize: { values: [], booleans: ['json'], positionals: 2 },
+  deauthorize: { values: [], booleans: ['json'], positionals: 2 },
 };
 
 const SUPERSEDE_OPTION_SPECS: Record<'task' | 'plan', StrictOptionSpec> = {
@@ -418,12 +428,38 @@ function printCommandGroupHelp(group: string): void {
     printQuestionHelp();
     return;
   }
+  if (group === 'project') {
+    printProjectHelp();
+    return;
+  }
   const commands = COMMAND_GROUPS[group];
   console.log(`用法：biao ${group} <${commands.join('|')}> [选项]\n\n运行 biao --help 查看完整命令与示例。`);
 }
 
 function printLeafCommandHelp(cmd: string): void {
   console.log(`用法：${LEAF_COMMAND_USAGE[cmd]}\n\n运行 biao --help 查看完整命令与示例。`);
+}
+
+function printProjectHelp(): void {
+  console.log(`用法：
+  biao project create <name> --repo <git-url> [--branch main] [--read-only] [--legacy-scope <path>]
+  biao project list [--json]
+  biao project nodes [--json]                列出 Worker 节点（authorize 前先查 node_id）
+  biao project authorize <project_id> <node_id>
+  biao project deauthorize <project_id> <node_id>
+
+V2 分布式接入序列（中央服务区 + Git 远端 + Worker 节点）：
+  1. 代码推到中央 Git（如 Gitea）的 main 分支
+  2. biao project create myproj --repo http://<gitea>/<org>/myproj.git --branch main
+  3. biao plan create <plan-id> --project <服务器工作区路径>   建 plan/任务（V2 claim 桥接回填归属）
+  4. biao project nodes                    查 Worker node_id
+  5. biao project authorize <project_id> <node_id>   授权 Worker 访问项目
+  6. Worker 配 BIAO_EXEC_CMD 后 biao-node run 开始消费
+
+注意：
+  - --repo 是 Worker clone 的 Git 远端（workspace 按任务从它 clone，不是服务器本地目录副本）。
+  - biao plan create 的 --project 是服务端 WORKSPACE_ROOTS 内的路径，与本命令注册的 V2 项目是两个概念。
+  - 需要 Owner API Token（BIAO_API_TOKEN）。`);
 }
 
 function printDbRestoreHelp(): void {
@@ -508,6 +544,142 @@ async function main() {
   if (cmd === 'health') {
     const r = await api('/health');
     printJson(r);
+    return;
+  }
+
+  if (cmd === 'project') {
+    // V2 项目注册面：POST /v2/projects 是唯一一等入口，这里补齐 CLI 封装
+    if (!sub || isHelpToken(sub)) {
+      printProjectHelp();
+      return;
+    }
+    const optionSpec = PROJECT_OPTION_SPECS[sub];
+    const parsedOptions = optionSpec
+      ? validateStrictOptions(`biao project ${sub}`, rest, optionSpec)
+      : undefined;
+    if (!parsedOptions) return;
+    if (parsedOptions.helpRequested) {
+      printProjectHelp();
+      return;
+    }
+
+    const projectFlagVal = (name: string): string | undefined => {
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === `--${name}` && i + 1 < rest.length) return rest[i + 1];
+      }
+      return undefined;
+    };
+    const projectValueFlags = new Set(['repo', 'branch', 'legacy-scope', 'limit']);
+    const projectPositionals: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      const token = rest[i];
+      if (isHelpToken(token)) continue;
+      if (token.startsWith('--')) {
+        if (projectValueFlags.has(token.slice(2))) i++;
+        continue;
+      }
+      projectPositionals.push(token);
+    }
+    const projectApiResult = (path: string, init?: { method: string; body?: string }) =>
+      api(path, init as RequestInit) as Promise<{ ok: boolean; data?: unknown }>;
+    const wantsJson = rest.includes('--json');
+
+    if (sub === 'create') {
+      const [name] = projectPositionals;
+      const repo = projectFlagVal('repo');
+      if (!name || !repo) {
+        console.error('用法：biao project create <name> --repo <git-url> [--branch main] [--read-only]');
+        process.exitCode = 1;
+        return;
+      }
+      const body: Record<string, unknown> = {
+        name,
+        repo_path: repo,
+        default_branch: projectFlagVal('branch') ?? 'main',
+        execution_mode: rest.includes('--read-only') ? 'read_only' : 'full',
+      };
+      const legacyScope = projectFlagVal('legacy-scope');
+      if (legacyScope) body.legacy_project_scope = legacyScope;
+      const r = await projectApiResult('/v2/projects', { method: 'POST', body: JSON.stringify(body) });
+      if (!r.ok) {
+        printJson(r);
+        process.exitCode = 1;
+        return;
+      }
+      if (wantsJson) {
+        printJson(r);
+        return;
+      }
+      const p = r.data as { project_id: string; name: string; repo_path: string; default_branch: string };
+      console.log(`已创建项目 ${p.project_id}（${p.name}）`);
+      console.log(`  repo：${p.repo_path}   默认分支：${p.default_branch}`);
+      console.log(`下一步：biao project nodes 查 node_id，再 biao project authorize ${p.project_id} <node_id>`);
+      return;
+    }
+
+    if (sub === 'list' || sub === 'nodes') {
+      const limit = projectFlagVal('limit');
+      const path = sub === 'list' ? '/v2/projects' : '/v2/nodes';
+      const r = await projectApiResult(limit ? `${path}?limit=${encodeURIComponent(limit)}` : path);
+      if (!r.ok) {
+        printJson(r);
+        process.exitCode = 1;
+        return;
+      }
+      if (wantsJson) {
+        printJson(r);
+        return;
+      }
+      const items = ((r.data as { items?: unknown[] })?.items ?? []) as Array<Record<string, unknown>>;
+      if (items.length === 0) {
+        console.log(sub === 'list' ? '暂无项目，用 biao project create <name> --repo <git-url> 注册' : '暂无节点');
+        return;
+      }
+      if (sub === 'list') {
+        console.log('PROJECT_ID                    NAME               BRANCH     MODE        STATUS    REPO');
+        console.log('─'.repeat(110));
+        for (const it of items) {
+          console.log(
+            `${String(it.project_id).padEnd(30)}${String(it.name).padEnd(18)}${String(it.default_branch).padEnd(11)}${String(it.execution_mode).padEnd(12)}${String(it.status).padEnd(10)}${String(it.repo_path)}`,
+          );
+        }
+      } else {
+        console.log('NODE_ID                       STATUS           SLOTS  HEARTBEAT');
+        console.log('─'.repeat(80));
+        for (const it of items) {
+          const hb = it.last_heartbeat_at ? new Date(Number(it.last_heartbeat_at)).toISOString().slice(0, 19) : '-';
+          console.log(
+            `${String(it.node_id).padEnd(30)}${String(it.status).padEnd(17)}${String(it.slots).padEnd(7)}${hb}`,
+          );
+        }
+        console.log('\n授权访问项目：biao project authorize <project_id> <node_id>');
+      }
+      return;
+    }
+
+    // authorize / deauthorize：project_id + node_id 两个位置参数
+    const [projectId, nodeId] = projectPositionals;
+    if (!projectId || !nodeId) {
+      console.error(`用法：biao project ${sub} <project_id> <node_id>`);
+      process.exitCode = 1;
+      return;
+    }
+    const authPath = `/v2/projects/${encodeURIComponent(projectId)}/nodes/${encodeURIComponent(nodeId)}`;
+    const r = sub === 'authorize'
+      ? await projectApiResult(`${authPath}/authorize`, { method: 'POST' })
+      : await projectApiResult(`${authPath}/authorization`, { method: 'DELETE' });
+    if (!r.ok) {
+      printJson(r);
+      process.exitCode = 1;
+      return;
+    }
+    if (wantsJson) {
+      printJson(r);
+      return;
+    }
+    console.log(sub === 'authorize'
+      ? `已授权节点 ${nodeId} 访问项目 ${projectId}（Worker 现在可以 claim 该项目任务）`
+      : `已撤销节点 ${nodeId} 对项目 ${projectId} 的授权`);
     return;
   }
 
@@ -2540,6 +2712,11 @@ verify: []
   biao plan intake --plan <id> --text "..." [--json]              存档人类需求（同名不覆盖）
   biao plan supersede <id> --preview                              预览历史待验收批量退出及快照 token
   biao plan supersede <id> --reason "..." --preview-token <token> --yes  按已预览快照批量退出
+  biao project create <name> --repo <git-url> [--branch main] [--read-only]  注册 V2 项目（Worker 从该 Git 远端 clone）
+  biao project list [--json]                                      列出 V2 项目
+  biao project nodes [--json]                                     列出 Worker 节点（authorize 前查 node_id）
+  biao project authorize <project_id> <node_id>                   授权 Worker 节点访问项目
+  biao project deauthorize <project_id> <node_id>                 撤销 Worker 节点授权
   biao task add --plan <id> --task-id <id> --title "..." [--verify-cmd <cmd>...] [--json] 生成可校验 MD + 自动 submit
   biao task edit <task_id> [--from-file <md>|--editor <path>|--verify-cmd <cmd>...] 编辑、校验、自动 submit；失败回滚
   biao task get <task_id>
@@ -2570,11 +2747,20 @@ verify: []
   biao pm ack --consumer pm --event-id <id>                           幂等确认事件（不影响其他 consumer）
   biao pm watch [--consumer pm] [--interval 60] [--once]              低频主动轮询（全部 Plan 闭环且无待办时自动退出）
 
-典型流程：
+典型流程（单机 V1）：
   biao plan init my-feature --project /path/to/repo
   # 编辑 plans/my-feature/*.md
   biao plan submit plans/my-feature
   # 启动 worker 消费
+
+典型流程（分布式 V2，中央服务区 + Worker 节点）：
+  biao project create myproj --repo http://<git>/<org>/myproj.git --branch main
+  biao plan create my-feature --project <服务器工作区路径>
+  biao project nodes                          # 查 Worker node_id
+  biao project authorize <project_id> <node_id>
+  # Worker 端配置 BIAO_EXEC_CMD 后 biao-node run 消费
+  # 注意：plan create 的 --project 必须是服务端 WORKSPACE_ROOTS 内的路径，
+  # 与 project create 注册的 Git 远端是两个概念，详见 biao project --help
 
 环境变量：
   BIAO_URL（默认 http://localhost:7331）

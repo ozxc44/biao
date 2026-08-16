@@ -1257,7 +1257,7 @@ Biao 当前定位是本地优先、局域网多机的多 Agent 研发控制台�
 - 局域网 V2 分布式（中央服务区 + 多 Worker 节点 + Git 工作空间 + 制品存储 + 合并队列）
 - 四层凭据体系（Owner → Node → Attempt → Human RBAC）
 - Web 控制台远程登录（enrollment code / 用户名密码）
-- MCP 接口（LAN stdio 适配器，13 个工具）
+- MCP 接口（LAN stdio 适配器，15 个工具）
 - 同步预检体系（六段门禁 + pre-push hook）
 
 尚未内置：
