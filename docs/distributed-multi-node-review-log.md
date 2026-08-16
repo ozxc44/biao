@@ -300,3 +300,4 @@ v0.8.0 方案 Phase 0a-1 → 0a-2 → 0b → 1 → 2 ∥ 3 → 2+3 统一门禁 
 | 登录修复 | 用户名密码表单移到 remoteAvailable 条件块；移除不必要的同源校验 | ✅ |
 
 全量基线：**139 文件 / 1744 用例全绿**（较 P12 前 +4 文件 +35 用例）
+| P12 合并到 main | ✅ 完成 | PR #5 合并（commit f0eacf1c），main CI 绿灯。NAS 最终部署验证：health/z-z 登录/Cookie/feature flags 全通。HANDOFF.md 快速接手文档已创建并链接到 README |
