@@ -76,7 +76,7 @@ describe('ProjectAgentRoster', () => {
     });
 
     expect(markup).toContain('暂无可用 Agent');
-    expect(markup).toContain('Agent 上线后可直接添加到项目');
+    expect(markup).toContain('Worker 领取任务成功即自动加入项目');
   });
 
   it('ignores transport and credential-shaped extra properties', () => {

@@ -12,7 +12,7 @@ describe('connection guides', () => {
     expect(guide).not.toMatch(/BIAO_API_TOKEN\s*=\s*[^<]|Authorization:\s*Bearer\s+\S+/);
   });
 
-  it('builds a plan-scoped Worker guide whose single join command creates the binding (no frontend re-bind)', () => {
+  it('builds a plan-scoped Worker guide led by MCP with all fallback entries collapsed into one pointer', () => {
     const guide = buildWorkerConnectionGuide('zh-CN', 'http://127.0.0.1:7331', {
       planId: 'plan-1', projectPath: "/srv/workspaces/team's app",
     });
@@ -21,14 +21,18 @@ describe('connection guides', () => {
     expect(guide).toContain('"BIAO_URL": "http://127.0.0.1:7331"');
     expect(guide).toContain('.biao/copy-token');
     expect(guide).toContain('task_claim');
+    expect(guide).toContain("preferred_project=/srv/workspaces/team's app");
+    expect(guide).toContain('其他接入方式');
+    expect(guide).toContain('docs/worker-integration.md');
     expect(guide).toContain('biao-agent-join');
-    expect(guide).toContain("--project-scope '/srv/workspaces/team'\"'\"'s app'");
-    expect(guide).toContain('--wake-mode background_executor');
-    expect(guide).toContain('--binding-id <第1步输出的binding_id>');
-    expect(guide).toContain("--plans 'plan-1'");
-    expect(guide).toContain('共享 Supervisor');
+    expect(guide).toContain('领取成功即自动加入项目');
     expect(guide).toContain('ownership');
     expect(guide).toContain('report');
+    // 备用入口只保留一行指引，不再展开多命令块。
+    expect(guide).not.toContain('--binding-id');
+    expect(guide).not.toContain('supervisor-config worker add');
+    expect(guide).not.toContain('--wake-mode background_executor');
+    expect(guide).not.toContain('.biao/supervisor --plans');
     expect(guide).not.toMatch(/BIAO_API_TOKEN\s*=\s*[^<]|Authorization:\s*Bearer\s+\S+/);
   });
 });
