@@ -12,6 +12,12 @@
 biao-agent-join --agent-id <id> --agent-type <type> --capabilities code --project-scope /abs/project
 ```
 
+## MCP 优先
+
+Harness 已配置 biao MCP（ZCode、Codex 等支持 MCP 的客户端）时，Agent 应优先使用 MCP 工具（`task_claim` / `task_get` / `task_heartbeat` / `task_report` / `task_block` 等），它们与本契约的 HTTP API 是同一套服务端真相，配置见 [MCP 接口](mcp.md)。下文的裸 HTTP 生命周期适用于无 MCP 能力的自定义 Worker 与运维排障。
+
+**加入即默认**：Agent 领取任务成功后即自动加入该项目（automatic 绑定），Web 控制台 roster 默认显示"已加入"；复制/克隆方式接入的 Worker 不需要再到前端点"添加"。前端的"添加"仅用于把其它在线 Agent 手工加入当前项目。
+
 ## 先决条件
 
 在 clone 后先完成一次显式配置：
@@ -91,8 +97,8 @@ Supervisor 只有一个本机锁和一个共享低频主循环。它本身就是
 .biao/agent-kit check --role project-agent --mode external_worker \
   --adapter /absolute/path/glm53-wake
 
-# 3. 登记 harness 级 slot。binding-id 可省略：用户在项目界面点“添加”后，
-#    Supervisor 会按 agent-id + harness-kind + wake-mode 匹配动态项目连接。
+# 3. 登记 harness 级 slot。binding-id 可省略：复制进入的 Worker 在首次领取成功后
+#    自动加入项目；Supervisor 按 agent-id + harness-kind + wake-mode 匹配动态项目连接。
 .biao/supervisor-config worker add --id glm5.3 --kind custom \
   --project /absolute/path/project --types code,docs,review \
   --command /absolute/path/glm53-wake \

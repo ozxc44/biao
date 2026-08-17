@@ -69,6 +69,7 @@ import {
   normalizePmConsumer,
   projectAgentReservationKey,
   publicBinding,
+  connectProjectAgent,
   persistTaskFromRedis,
   withMutationPermit,
   acquireMutationSection,
@@ -655,14 +656,15 @@ async function claimUnlocked(
       } else if (taskReservationId && taskReservationExpiresAt >= Date.now()) {
         continue;
       } else if (sqliteStore) {
-        // 一旦某个 ready lane 由 ProjectAgentBinding 管理，普通 legacy claim 不能在
-        // adapter/reservation 失败窗口偷走它；其它不相关任务仍继续扫描，不做全局抑制。
+        // 只有指派给特定 Agent/harness 的 binding 管理 lane 才对普通 claim 关闭；
+        // auto lane 对所有已注册 Agent 开放（复制进入的 Worker 领取成功即自动加入
+        // 项目，无需前端"添加"）。claimer 自己的 binding 不构成对自己的排除，
+        // 活跃 reservation 由上方 taskReservationId 分支继续保护 wake 窗口。
         const bound = sqliteStore.getProjectAgentBindings(task.project_path).some((row) => {
           const binding = publicBinding(row);
           const bindingAssignee = task.assignee || 'auto';
-          return binding.capabilities.includes(task.type) && (
-            bindingAssignee === 'auto' || bindingAssignee === binding.agent_id ||
-            bindingAssignee === binding.harness_kind
+          return binding.agent_id !== req.agent_id && binding.capabilities.includes(task.type) && (
+            bindingAssignee === binding.agent_id || bindingAssignee === binding.harness_kind
           );
         });
         if (bound) continue;
@@ -804,6 +806,15 @@ async function claimUnlocked(
         claimed_at: String(now),
         expire_at: String(expireAt),
       });
+
+      // 领取成功即视为已加入该项目：从注册真相补全 automatic 绑定，复制进入的
+      // Worker 默认"已添加"，无需再到前端点添加。roster 记账失败只影响显示，
+      // 绝不影响已提交的领取结果。
+      try {
+        await connectProjectAgent(redis, task.project_path, req.agent_id);
+      } catch {
+        // 绑定竞态或 SQLite 异常不构成 claim 失败。
+      }
 
       return claimPayload;
     }
