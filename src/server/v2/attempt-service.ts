@@ -17,6 +17,9 @@
 
 import type Redis from 'ioredis';
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { SqliteStore } from '../../db/sqlite-store.js';
 import { verifyNodeCredential, type IssueCredentialOptions } from './credentials.js';
@@ -936,6 +939,13 @@ export async function claim(
 }
 
 /** report（核心） */
+function workspaceInlineResultError(error: unknown): ApiResponse<never> {
+  const code = (error as { code?: string })?.code === 'WORKSPACE_PATH_DENIED'
+    ? 'WORKSPACE_PATH_DENIED'
+    : 'RESULT_MATERIALIZE_FAILED';
+  return { ok: false, data: null, error: { code, message: '内联产物无法在中央工作区落盘' } };
+}
+
 async function reportUnlocked(
   redis: Redis,
   req: ReportRequest,
@@ -977,12 +987,36 @@ async function reportUnlocked(
     };
   }
 
+  // 远程 Worker（经 MCP 接入的 harness 会话）没有中央工作区的文件系统访问：
+  // report 可直接携带产物正文，由中央在受控 work 目录落盘；显式路径仍然优先。
+  const inlineResultMd = typeof req.result_md === 'string' ? req.result_md : undefined;
+  const inlineResultJson = typeof req.result_json === 'string' ? req.result_json : undefined;
+  let serverProjectRoot: string | undefined;
+  let serverWorkDir: string | undefined;
+  if (inlineResultMd !== undefined || inlineResultJson !== undefined || req.execute_verify === true) {
+    try {
+      serverProjectRoot = resolveAndValidateWorkspacePath(taskHash.project_path, configuredWorkspaceRoots());
+      serverWorkDir = join(serverProjectRoot, 'work', req.task_id);
+      mkdirSync(serverWorkDir, { recursive: true });
+    } catch (error) {
+      return workspaceInlineResultError(error);
+    }
+  }
+
   const reportFailureReason = req.status === 'done'
     ? ''
     : failureReasonForReport(req.status, req.verify_results ?? []);
 
   let resultPath = req.result_path ?? '';
   let resultJsonPath = req.result_json_path ?? '';
+  if (inlineResultMd !== undefined && !resultPath) {
+    resultPath = join(serverWorkDir!, 'result.md');
+    writeFileSync(resultPath, inlineResultMd);
+  }
+  if (inlineResultJson !== undefined && !resultJsonPath) {
+    resultJsonPath = join(serverWorkDir!, 'result.json');
+    writeFileSync(resultJsonPath, inlineResultJson);
+  }
 
   // 所有 done 闸门都在 lease/ownership/状态变更之前执行。
   if (req.status === 'done') {
@@ -996,7 +1030,30 @@ async function reportUnlocked(
         error: { code: 'VERIFY_DECLARATION_INVALID', message: '任务 verify 声明不是有效 JSON' },
       };
     }
-    const verifyResults = req.verify_results ?? [];
+    let verifyResults = req.verify_results ?? [];
+    // execute_verify：中央在任务工作区代执行声明的 verify 并记录真实退出码。
+    // verify 命令本身不回传 Agent；远程 Worker 不必能在本地复现服务端路径。
+    if (req.execute_verify === true && verifyResults.length === 0 && declaredVerify.length > 0) {
+      if (!serverProjectRoot) {
+        return workspaceInlineResultError(new Error('missing project root'));
+      }
+      verifyResults = declaredVerify.map((declared) => {
+        const run = spawnSync(declared.cmd, {
+          shell: true,
+          cwd: serverProjectRoot,
+          timeout: 120_000,
+          encoding: 'utf8',
+          maxBuffer: 1024 * 1024,
+        });
+        const exitCode = run.status ?? 1;
+        return {
+          cmd: declared.cmd,
+          exit_code: exitCode,
+          passed: exitCode === (declared.expect_exit ?? 0),
+          output: `${run.stdout ?? ''}${run.stderr ?? ''}`.slice(0, 4096) || '(no output)',
+        };
+      });
+    }
     if (declaredVerify.length > 0 && verifyResults.length === 0) {
       return {
         ok: false,

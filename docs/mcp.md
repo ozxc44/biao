@@ -49,7 +49,7 @@
 
 ## 工具清单
 
-`src/mcp/tools.ts` 注册 15 个工具：
+`src/mcp/tools.ts` 注册 23 个工具：
 
 | 工具 | 对应 HTTP 语义 | 脱敏说明 |
 |---|---|---|
@@ -59,23 +59,33 @@
 | `project_create` | `POST /v2/projects`（name/repo_path/default_branch/read_only） | 注册 V2 项目；需要 Owner API Token 作用域，凭据不足时中央直接拒绝 |
 | `project_list` | `GET /v2/projects` | 返回 project_id、Git 远端、默认分支、执行模式摘要 |
 | `task_list` | `GET /tasks?plan_id&status&limit&offset` | 同上 |
-| `task_get` | `GET /task/{task_id}` | 不返回 verify 命令、Artifact 字节或服务端路径 |
+| `task_get` | `GET /task/{task_id}` | 返回 goal 正文；不返回 verify 命令、Artifact 字节或服务端路径 |
 | `ownership_check` | `GET /ownership?path&agent_id` | 只读中央 ownership 判定，不在本机重算或声明 ownership |
 | `pm_review_list` | `GET /reviews/pending?plan_id` | 只列待验收交付摘要 |
 | `pm_review_read` | `GET /task/{task_id}/review` | 只给验收状态与证据摘要；`changed_files` 过滤绝对路径，产出 `verify_summary` / `result_ref` |
-| `task_claim` | 自动 `POST /register` 后 `POST /claim` | claim 回执（`claim_token`）只保存在进程内运行时；输出剥离 `claim_token`/`project_path`/`verify`，仅给 `goal_available`/`verify_count` 摘要 |
+| `task_claim` | 自动 `POST /register` 后 `POST /claim` | claim 回执（`claim_token`）只保存在进程内运行时；输出含 `goal_md` 正文，剥离 `claim_token`/`project_path`/`verify`（命令不外泄，报告时可用 `execute_verify` 由中央代执行） |
 | `task_heartbeat` | `POST /heartbeat`（持 lease 时再 `POST /lease/renew`） | 只用本会话 registration epoch 与内部 lease |
-| `task_report` | `POST /report` | 上报 done/failed/partial；done 仍需独立 PM Review |
+| `task_report` | `POST /report` | 上报 done/failed/partial；可内联携带 `result_md`/`result_json`（中央受控落盘，远程 Worker 无需服务器文件系统）并传 `execute_verify` 让中央在工作区代执行声明的 verify；done 仍需独立 PM Review |
 | `task_block` | `POST /task/{task_id}/block` | 成功后释放本地 lease 句柄 |
 | `question_ask` | `POST /question` | 成功后旧 lease 失效 |
+| `plan_create` | `POST /plan/create` | `skeleton=false` 只建空计划，配合 `task_upsert` 逐个建任务 |
+| `task_upsert` | `POST /plan/{plan_id}/tasks` | 结构化直建/更新单个任务（pending 覆盖、运行态/终态平台保护）；远程 Agent 无需服务器 shell |
+| `pm_review_decide` | `POST /task/{task_id}/review` | PM 验收决策（accept/reject）；需要 Owner 作用域，Worker token 被 `REMOTE_FORBIDDEN` 拒绝 |
+| `question_list` | `GET /questions` | PM 列出待处理 Question 最小路由信息（默认 consumer=pm） |
+| `question_get` | `GET /question/{question_id}` | PM 读取 Question 正文、checkpoint 与扩权申请 |
+| `question_answer` | `POST /question/{question_id}/answer` 后自动 `POST /intake/ack` | 答复完成即 ack 对应门铃；任务回 pending，Worker 以新 claim 恢复 |
+| `pm_next` | `GET /intake` | PM 一站式最小待办门铃汇总；空数据表示无事可做 |
+| `agent_offline` | `POST /agent/offline` | Worker 正常退出收口（幂等，只用本会话 registration） |
 
-**验收只读**：MCP 工具面只暴露 `pm_review_list` / `pm_review_read`，**不开放** review accept/reject/write 等验收写入口——验收是 PM 职责，留在 CLI 与平台侧。`tests/mcp-lan-adapter.test.ts` 断言工具名不匹配 `review_(accept|reject|write)`。
+**身份记忆**：`task_claim` 首次携带 `agent_id` 后，本 MCP 会话会记住身份；`task_heartbeat` / `task_report` / `task_block` / `question_ask` / `ownership_check` / `agent_offline` 的后续调用可省略 `agent_id`。
+
+**PM 写操作的作用域**：`pm_review_decide` / `question_answer` / `plan_create` / `task_upsert` 走 Owner API Token 作用域；仅持 Worker token 的会话会被中央 `REMOTE_FORBIDDEN` 拒绝。验收独立性与 done≠accepted 的闭环不变。
 
 ## 安全模型
 
 - **Owner token 只在本机 env**：`BIAO_API_TOKEN` 只由 MCP 客户端注入 stdio 子进程的环境变量，`createLanMcpRuntime` 读入后只放进 `Authorization: Bearer` 请求头（`src/mcp/client.ts`）；不拼进 URL、不提供 getter，也不出现在协议输出里。
-- **协议输出脱敏**：读响应经 `projectEnvelope` 的 `smallMetadata` 投影，剥掉 `claim_token`、`project_path`、`verify`、`cmd`、`output`、`goal_md` 等敏感键（`src/mcp/tools.ts`）；`BiaoHttpClient` 还会把错误 details 中出现的 token 串替换为 `[REDACTED]`（`src/mcp/client.ts`）。
-- **验收写入口不开放**：见上文工具清单。
+- **协议输出脱敏**：读响应经 `projectEnvelope` 的 `smallMetadata` 投影，剥掉 `claim_token`、`project_path`、`verify`、`cmd`、`output` 等敏感键（`src/mcp/tools.ts`）；`goal_md` 是 PM 写给 Worker 的任务正文，在 `task_claim` / `task_get` 显式返回。`BiaoHttpClient` 还会把错误 details 中出现的 token 串替换为 `[REDACTED]`（`src/mcp/client.ts`）。
+- **错误信息白名单透传**：不含路径/凭据/长十六进制形态的短业务消息按原样透传，含敏感形态的一律回退为固定文案（`sanitizeRemoteMessage`）。
 - **fail-closed**：适配器对远程错误一律 fail closed，不做本地回退（`src/mcp/client.ts`）。
 
 | 错误码 | 触发条件 |

@@ -15,6 +15,9 @@ export interface LanMcpRuntime {
   claimToken(agentId: string, taskId: string): string;
   rememberClaim(agentId: string, taskId: string, claimToken: string): void;
   forgetClaim(agentId: string, taskId: string): void;
+  /** 首次显式携带 agent_id 的调用后记住身份；后续调用可省略该参数。 */
+  rememberDefaultAgent(agentId: string): void;
+  defaultAgent(): string | undefined;
 }
 
 function randomRuntimeId(prefix: 'reg' | 'claim'): string {
@@ -39,6 +42,7 @@ export function createLanMcpRuntime(
   if (!apiToken) throw new BiaoRemoteError('REMOTE_CONFIG_INVALID', '必须通过本机运行时提供 BIAO_API_TOKEN');
 
   const states = new Map<string, AgentRuntimeState>();
+  let defaultAgentId: string | undefined;
   const client = new BiaoHttpClient(biaoUrl, apiToken, {
     ...options,
     timeoutMs: options.timeoutMs ?? configuredTimeout(env),
@@ -68,6 +72,12 @@ export function createLanMcpRuntime(
     },
     forgetClaim(agentId, taskId) {
       states.get(agentId)?.claims.delete(taskId);
+    },
+    rememberDefaultAgent(agentId) {
+      defaultAgentId = agentId;
+    },
+    defaultAgent() {
+      return defaultAgentId;
     },
   };
 }

@@ -374,6 +374,11 @@ export interface ReportRequest {
   result_path?: string;
   result_json_path?: string;
   verify_results?: VerifyResult[];
+  /** 远程 Worker 无服务端文件系统访问时，直接携带产物正文，由中央受控落盘。 */
+  result_md?: string;
+  result_json?: string;
+  /** 由中央在任务工作区代执行声明的 verify 并记录真实退出码；verify 命令本身仍不外泄。 */
+  execute_verify?: boolean;
 }
 
 export interface VerifyResult {

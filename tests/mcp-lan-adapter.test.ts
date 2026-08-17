@@ -211,7 +211,7 @@ describe('LAN stdio MCP adapter', () => {
     expect(observedUrls.every((url) => !url.includes(OWNER_TOKEN))).toBe(true);
   });
 
-  it('report done 只进入待验收，MCP 不开放验收写入口', async () => {
+  it('report done 只进入待验收；PM 决策工具仅 Owner 作用域可用', async () => {
     const planDir = join(rootDir, 'plans', 'review-plan');
     mkdirSync(join(planDir, 'tasks'), { recursive: true });
     writeFileSync(join(planDir, 'index.md'), [
@@ -287,8 +287,23 @@ describe('LAN stdio MCP adapter', () => {
       'health', 'plan_list', 'plan_status', 'task_list', 'task_get', 'ownership_check',
       'pm_review_list', 'pm_review_read', 'task_claim', 'task_heartbeat', 'task_report',
       'task_block', 'question_ask', 'project_create', 'project_list',
+      'plan_create', 'task_upsert', 'pm_review_decide', 'question_list', 'question_get',
+      'question_answer', 'pm_next', 'agent_offline',
     ]);
     expect(names.some((name) => /review_(?:accept|reject|write)/.test(name))).toBe(false);
+
+    // PM 决策写入口只对 Owner 作用域开放：Worker token 调用必须被中央拒绝。
+    const workerScopedRuntime = createLanMcpRuntime({
+      BIAO_URL: baseUrl,
+      BIAO_API_TOKEN: deriveWorkerApiToken(OWNER_TOKEN),
+    });
+    const workerDecide = await toolPayload(workerScopedRuntime, 'pm_review_decide', {
+      task_id: 'mcp-review-task',
+      verdict: 'accept',
+      reviewed_by: 'worker-scope',
+    });
+    expect(workerDecide.payload).toMatchObject({ ok: false, error: { code: 'REMOTE_FORBIDDEN' } });
+    expect(workerDecide.serialized).not.toContain(OWNER_TOKEN);
   });
 
   it('Question ask 与 task block 只使用会话内 lease，不接受凭据参数', async () => {
