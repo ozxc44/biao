@@ -97,7 +97,7 @@ WorkerToken = HMAC-SHA256(OwnerToken, "biao-worker-api-token-v1")
 ## 常见问题
 
 **Q: 注册成功但绑定失败怎么办？**
-A: 注册和绑定是解耦的。注册成功后，绑定失败不会影响注册本身。响应中的 `project_binding_results` 会逐项报告绑定状态。绑定即加入项目，没有独立的手工绑定 API；Agent 保持在线后，可在 Web 控制台一键加入项目（`POST /project/agent-connections`），或重新执行 join。
+A: 注册和绑定是解耦的。注册成功后，绑定失败不会影响注册本身。响应中的 `project_binding_results` 会逐项报告绑定状态。绑定即加入项目：领取任务成功也会自动创建 automatic 绑定（无需任何手工动作）；仍可在 Web 控制台一键加入项目（`POST /project/agent-connections`），或重新执行 join。
 
 **Q: 重复执行 join 会怎样？**
 A: 注册是幂等的（相同 registration_id 会返回已有注册）。已存在的绑定会被跳过，不会报错。

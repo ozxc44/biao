@@ -90,7 +90,7 @@ export function ProjectAgentRoster({
       {rows.length === 0 ? (
         <div className="project-agent-roster-empty">
           <p>暂无可用 Agent</p>
-          <small>Agent 上线后可直接添加到项目；加入后默认自动接单。</small>
+          <small>Worker 领取任务成功即自动加入项目；此处用于手工加入其它在线 Agent。</small>
         </div>
       ) : (
         <ul className="project-agent-roster-list">
