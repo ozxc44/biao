@@ -303,9 +303,9 @@ const zhCN = {
   'connection.otherEntriesTitle': '其他接入方式',
   'connection.otherEntriesPointer': 'CLI 一条龙（biao-agent-join）、Supervisor slot 托管与单 Worker 兼容入口（.biao/worker-codex/kimi/custom）统一见 docs/worker-integration.md；Worker 领取成功即自动加入项目，无需在本页重复添加。',
   'connection.mcpSectionTitle': '方式一：MCP 接入（推荐——一条配置即拥有全部工具）',
-  'connection.pmMcpHint': 'PM 用 MCP 做省 token 的只读巡查：health / plan_status / task_list / pm_review_list / pm_review_read（证据摘要，不回传全文）。验收写入口只在 CLI：biao review <task> --accept/--reject 与 biao pm ack 仍是 PM 的操作契约。',
+  'connection.pmMcpHint': 'PM 可全程用 MCP：pm_next 一站式待办，plan_create / task_upsert 建计划与任务，question_list → question_get → question_answer（答复后自动 ack），pm_review_list / pm_review_read 看证据摘要后用 pm_review_decide 验收。CLI 保留为人工运维兼容入口。',
   'connection.mcpConfigIntro': '把下面的配置加入你的 MCP 客户端（mcpServers），接入后直接用工具在平台上工作。command 用已安装的 biao-mcp，或改写为 node <biao 仓库>/scripts/mcp-server.mjs：',
-  'connection.mcpToolsHint': '工具直达：plan_list → task_claim（领取）→ task_heartbeat → task_report（done/failed）；遇到产品决策用 question_ask；验收证据只读用 pm_review_list / pm_review_read。完整清单见 docs/mcp.md。',
+  'connection.mcpToolsHint': '工具直达：plan_list → task_claim（领取即返回 goal 正文）→ task_heartbeat → task_report；交付可直接内联 result_md / result_json 并传 execute_verify 让中央代执行声明的 verify——无需服务器文件系统。遇到产品决策用 question_ask。完整清单见 docs/mcp.md。',
   'connection.mcpTokenHint': 'BIAO_API_TOKEN 由 Owner 在 Biao 机器上执行 .biao/copy-token 提供；不要写进聊天、代码或文档。',
   'connection.security': '安全：不要索要、复制或输出浏览器 Cookie、Bearer Token 或 BIAO_API_TOKEN；使用安装时生成的 `.biao/*` 启动器。',
 
@@ -643,9 +643,9 @@ const enUS: Record<TranslationKey, string> = {
   'connection.otherEntriesTitle': 'Other entry points',
   'connection.otherEntriesPointer': 'The CLI one-liner (biao-agent-join), Supervisor slots, and single-Worker compat launchers (.biao/worker-codex/kimi/custom) all live in docs/worker-integration.md; a successful claim auto-joins the project, no manual add needed here.',
   'connection.mcpSectionTitle': 'Option 1: MCP (recommended — one config unlocks every tool)',
-  'connection.pmMcpHint': 'PM uses MCP for token-lean read-only checks: health / plan_status / task_list / pm_review_list / pm_review_read (evidence summaries, no full text). Write access stays CLI-only: biao review <task> --accept/--reject and biao pm ack remain the PM contract.',
+  'connection.pmMcpHint': 'PM can now work fully over MCP: pm_next one-stop intake, plan_create / task_upsert for plans and tasks, question_list → question_get → question_answer (auto-acks the doorbell), then pm_review_decide after checking pm_review_list / pm_review_read evidence summaries. CLI remains the manual-ops fallback.',
   'connection.mcpConfigIntro': 'Add this to your MCP client (mcpServers); then work on the platform directly through tools. Use the installed biao-mcp as command, or node <biao repo>/scripts/mcp-server.mjs for a repo checkout:',
-  'connection.mcpToolsHint': 'Tool flow: plan_list → task_claim → task_heartbeat → task_report (done/failed); use question_ask for product decisions; inspect reviews read-only via pm_review_list / pm_review_read. Full list in docs/mcp.md.',
+  'connection.mcpToolsHint': 'Tool flow: plan_list → task_claim (returns the goal body) → task_heartbeat → task_report; deliver inline result_md / result_json with execute_verify so the central plane runs the declared verify for you — no server filesystem needed. Use question_ask for product decisions. Full list in docs/mcp.md.',
   'connection.mcpTokenHint': 'The BIAO_API_TOKEN is provided by the Owner via .biao/copy-token on the Biao machine; never paste it into chats, code, or docs.',
   'connection.security': 'Security: never request, copy, or print browser cookies, Bearer tokens, or BIAO_API_TOKEN. Use the generated `.biao/*` launchers.',
 
