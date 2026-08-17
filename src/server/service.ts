@@ -1606,6 +1606,163 @@ import type {
   OwnershipCheckResult,
 } from '../types/index.js';
 
+/** 示例骨架任务：保留 plan create 的开箱可跑体验；Agent 可传 skeleton=false 关闭。 */
+async function writePlanSkeletonTasks(planDir: string, planId: string): Promise<void> {
+  const { writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+
+  writeFileSync(
+    join(planDir, `tasks/${planId}-01-impl.md`),
+    `---
+task_id: ${planId}-01-impl
+title: 实现任务
+type: code
+phase: impl
+assignee: auto
+ownership:
+  files:
+    - src/**
+priority: 5
+timeout_seconds: 1800
+verify: []
+---
+
+# 实现任务
+
+## Objective
+
+<描述任务目标>
+
+## Required Work
+
+1. ...
+
+## Acceptance Criteria
+
+- [ ] 实现符合目标
+`,
+  );
+
+  writeFileSync(
+    join(planDir, `tasks/${planId}-02-qa.md`),
+    `---
+task_id: ${planId}-02-qa
+title: 验收
+type: acceptance
+phase: qa
+depends_on:
+  - ${planId}-01-impl
+assignee: auto
+priority: 7
+acceptance_for:
+  - ${planId}-01-impl
+verify:
+  - cmd: "printf 'PASS: acceptance evidence recorded\\\\n'"
+    expect_exit: 0
+---
+
+# 验收
+
+## Objective
+
+验收实现任务。
+`,
+  );
+}
+
+/** POST /plan/:plan_id/tasks —— 结构化直建/更新单个任务（PM/远程 Agent 一等入口） */
+export interface PlanTaskUpsertRequest {
+  task_id: string;
+  title: string;
+  type?: 'code' | 'review' | 'research' | 'docs' | 'acceptance';
+  phase?: string;
+  assignee?: string;
+  priority?: number;
+  timeout_seconds?: number;
+  goal_md?: string;
+  verify?: Array<{ cmd: string; expect_exit?: number }>;
+  ownership?: { files?: string[]; modules?: string[] };
+  depends_on?: string[];
+  acceptance_for?: string[];
+}
+
+const PLAN_TASK_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+export async function planTaskUpsert(
+  redis: Redis,
+  planId: string,
+  req: PlanTaskUpsertRequest,
+): Promise<ApiResponse<{ plan_id: string; task_id: string; created: number; updated: number }>> {
+  try {
+    const { mkdirSync, writeFileSync, existsSync } = await import('node:fs');
+    const { join, resolve, relative } = await import('node:path');
+    const { stringify: yamlStringify } = await import('yaml');
+
+    if (!PLAN_TASK_ID_PATTERN.test(req.task_id)) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'INVALID_TASK_ID', message: `task_id 必须由小写字母、数字和单个连字符组成：${req.task_id}` },
+      };
+    }
+    const planHash = await redis.hgetall(keys.hash.plan(planId));
+    if (!planHash.plan_id || !planHash.project_path) {
+      return { ok: false, data: null, error: { code: 'PLAN_NOT_FOUND', message: `plan 不存在：${planId}` } };
+    }
+    const projectRoot = resolveAndValidateWorkspacePath(planHash.project_path, configuredWorkspaceRoots());
+    const plansRoot = resolve(projectRoot, 'plans');
+    const planDir = resolve(plansRoot, planId);
+    const rel = relative(plansRoot, planDir);
+    if (!rel || rel.startsWith('..') || resolve(plansRoot, rel) !== planDir) {
+      return { ok: false, data: null, error: { code: 'INVALID_PLAN_ID', message: `plan_id 不能用于定位安全目录：${planId}` } };
+    }
+    if (!existsSync(join(planDir, 'index.md'))) {
+      return { ok: false, data: null, error: { code: 'PLAN_DIR_MISSING', message: `plan 目录缺少 index.md：${planId}` } };
+    }
+
+    const type = req.type ?? 'code';
+    if (type === 'acceptance' && (!req.acceptance_for || req.acceptance_for.length === 0)) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'ACCEPTANCE_FOR_REQUIRED', message: 'acceptance 任务必须声明非空 acceptance_for' },
+      };
+    }
+    const frontmatter: Record<string, unknown> = {
+      task_id: req.task_id,
+      title: req.title,
+      type,
+      phase: req.phase ?? (type === 'acceptance' ? 'qa' : 'impl'),
+      assignee: req.assignee ?? 'auto',
+      priority: req.priority ?? 5,
+      ...(req.timeout_seconds !== undefined ? { timeout_seconds: req.timeout_seconds } : {}),
+      ...(req.depends_on?.length ? { depends_on: req.depends_on } : {}),
+      ...(req.ownership?.files?.length || req.ownership?.modules?.length ? { ownership: req.ownership } : {}),
+      ...(req.acceptance_for?.length ? { acceptance_for: req.acceptance_for } : {}),
+      verify: req.verify ?? [],
+    };
+    const body = req.goal_md?.trim() ? req.goal_md.trim() : `# ${req.title}`;
+    const markdown = `---\n${yamlStringify(frontmatter).trimEnd()}\n---\n\n${body}\n`;
+
+    mkdirSync(join(planDir, 'tasks'), { recursive: true });
+    // pending 语义的覆盖与运行态/终态保护由 planSubmit 统一裁决。
+    writeFileSync(join(planDir, 'tasks', `${req.task_id}.md`), markdown);
+    const submit = await planSubmit(redis, planDir);
+    if (!submit.ok) return { ok: false, data: null, error: submit.error };
+    return {
+      ok: true,
+      data: {
+        plan_id: planId,
+        task_id: req.task_id,
+        created: submit.data?.created ?? 0,
+        updated: submit.data?.updated ?? 0,
+      },
+    };
+  } catch (error) {
+    return { ok: false, data: null, error: workspaceError(error, 'PLAN_TASK_UPSERT_FAILED') };
+  }
+}
+
 /** plan create：通过 API 生成 plan 骨架并立即提交（对应前端创建项目） */
 export interface PlanCreateRequest {
   plan_id: string;
@@ -1615,6 +1772,8 @@ export interface PlanCreateRequest {
   base_dir?: string;
   /** 是否立即提交到 Redis（默认 true） */
   submit?: boolean;
+  /** 是否生成示例骨架任务（默认 true；Agent 用 task upsert 逐个建任务时可关闭） */
+  skeleton?: boolean;
   /** 该 plan 的 PM consumer 标识（PM 主动轮询时按此路由提醒）；不传用默认值 pm */
   pm_consumer?: string;
 }
@@ -1686,64 +1845,10 @@ global_constraints:
 `,
     );
 
-    // 示例 tasks
-    writeFileSync(
-      join(planDir, `tasks/${planId}-01-impl.md`),
-      `---
-task_id: ${planId}-01-impl
-title: 实现任务
-type: code
-phase: impl
-assignee: auto
-ownership:
-  files:
-    - src/**
-priority: 5
-timeout_seconds: 1800
-verify: []
----
-
-# 实现任务
-
-## Objective
-
-<描述任务目标>
-
-## Required Work
-
-1. ...
-
-## Acceptance Criteria
-
-- [ ] 实现符合目标
-`,
-    );
-
-    writeFileSync(
-      join(planDir, `tasks/${planId}-02-qa.md`),
-      `---
-task_id: ${planId}-02-qa
-title: 验收
-type: acceptance
-phase: qa
-depends_on:
-  - ${planId}-01-impl
-assignee: auto
-priority: 7
-acceptance_for:
-  - ${planId}-01-impl
-verify:
-  - cmd: "printf 'PASS: acceptance evidence recorded\\\\n'"
-    expect_exit: 0
----
-
-# 验收
-
-## Objective
-
-验收实现任务。
-`,
-    );
+    // 示例骨架任务（Agent 用 task upsert 逐个建任务时传 skeleton=false 关闭）
+    if (req.skeleton !== false) {
+      await writePlanSkeletonTasks(planDir, planId);
+    }
 
     // 是否立即提交
     const shouldSubmit = req.submit !== false;

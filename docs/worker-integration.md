@@ -18,6 +18,8 @@ Harness 已配置 biao MCP（ZCode、Codex 等支持 MCP 的客户端）时，Ag
 
 **加入即默认**：Agent 领取任务成功后即自动加入该项目（automatic 绑定），Web 控制台 roster 默认显示"已加入"；复制/克隆方式接入的 Worker 不需要再到前端点"添加"。前端的"添加"仅用于把其它在线 Agent 手工加入当前项目。
 
+**远程 Worker 交付**：没有中央工作区文件系统访问的 Agent，`task_report` 可直接内联 `result_md` / `result_json` 正文（由中央受控落盘到 `work/<task_id>/`），并传 `execute_verify` 让中央在任务工作区代执行声明的 verify；claim / task_get 返回 `goal_md` 正文，verify 命令本身不外泄。
+
 ## 先决条件
 
 在 clone 后先完成一次显式配置：

@@ -15,6 +15,7 @@ import { createMcpHttpRoutes } from '../mcp/http-route.js';
 import {
   planSubmit,
   planCreate,
+  planTaskUpsert,
   agentRegister,
   agentHeartbeat,
   agentOffline,
@@ -387,6 +388,7 @@ const requestSchemas = {
         project_path: absolutePath,
         base_dir: absolutePath,
         submit: { type: 'boolean' },
+        skeleton: { type: 'boolean' },
         pm_consumer: safeIdentifier,
       },
     },
@@ -421,6 +423,47 @@ const requestSchemas = {
             },
           },
         },
+      },
+    },
+  },
+  planTaskUpsert: {
+    params: planParamsSchema,
+    body: {
+      type: 'object',
+      required: ['task_id', 'title'],
+      additionalProperties: false,
+      properties: {
+        task_id: safeIdentifier,
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+        type: { type: 'string', enum: ['code', 'review', 'research', 'docs', 'acceptance'] },
+        phase: nonEmptyString,
+        assignee: nonEmptyString,
+        priority: { type: 'integer', minimum: 0, maximum: 9 },
+        timeout_seconds: { type: 'integer', minimum: 60, maximum: 86_400 },
+        goal_md: { type: 'string', maxLength: 65_536 },
+        verify: {
+          type: 'array',
+          maxItems: 32,
+          items: {
+            type: 'object',
+            required: ['cmd'],
+            additionalProperties: false,
+            properties: {
+              cmd: { type: 'string', minLength: 1, maxLength: 2_000 },
+              expect_exit: { type: 'integer', minimum: 0, maximum: 255 },
+            },
+          },
+        },
+        ownership: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            files: { type: 'array', maxItems: 64, items: nonEmptyString },
+            modules: { type: 'array', maxItems: 64, items: nonEmptyString },
+          },
+        },
+        depends_on: { type: 'array', maxItems: 64, items: nonEmptyString },
+        acceptance_for: { type: 'array', maxItems: 64, items: nonEmptyString },
       },
     },
   },
@@ -519,6 +562,9 @@ const requestSchemas = {
         status: { type: 'string', enum: ['done', 'failed', 'partial'] },
         result_path: nonEmptyString,
         result_json_path: nonEmptyString,
+        result_md: { type: 'string', maxLength: 131072 },
+        result_json: { type: 'string', maxLength: 262144 },
+        execute_verify: { type: 'boolean' },
         verify_results: {
           type: 'array',
           items: {
@@ -1467,6 +1513,13 @@ export async function createHttpServer(
     app.get('/plan/:plan_id', async (req) => {
       const { plan_id } = req.params as { plan_id: string };
       return getPlan(redis, plan_id);
+    });
+
+    // POST /plan/:plan_id/tasks —— 结构化直建/更新单个任务（PM/远程 Agent 无需
+    // 服务器 shell 生成 MD；写盘与提交仍走 plan_dir 的权威解析路径）。
+    app.post('/plan/:plan_id/tasks', { schema: requestSchemas.planTaskUpsert }, async (req) => {
+      const { plan_id } = req.params as { plan_id: string };
+      return planTaskUpsert(redis, plan_id, req.body as Parameters<typeof planTaskUpsert>[2]);
     });
 
     app.post('/project/agent-connections', {

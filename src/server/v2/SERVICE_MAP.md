@@ -16,7 +16,7 @@
 
 | 服务 | V1 对照函数数 | 说明 |
 | --- | ---: | --- |
-| ProjectService | 14 | Project/Binding/Plan 导入与 plan 级退出 |
+| ProjectService | 15 | Project/Binding/Plan 导入与 plan 级退出 |
 | NodeService | 5 | Agent（≈V2 Node）生命周期 + 执行回执 |
 | AttemptService | 17 | claim/lease/report/Question/block/ownership/任务读写 |
 | DeliveryService | 7 | Review/resolution/repair/reverify 及其副作用回放 |
@@ -37,6 +37,7 @@ Plan Snapshot（D-014）。
 | V1 函数 | V2 接口方法（domain-interfaces.ts） | 备注 |
 | --- | --- | --- |
 | `planCreate` | `ProjectService.importPlan` | V2 走 snapshot 上传 |
+| `planTaskUpsert` | `ProjectService.importPlan` | 结构化单任务 upsert（写 MD 后走 planSubmit 权威路径）；V2 走 snapshot 上传 |
 | `previewPlanSubmission` | `ProjectService.validateProject` | 路径校验部分 |
 | `planSubmit` | `ProjectService.importPlan` | durable-first + outbox |
 | `getPlan` | `ProjectService.getProject`（plan 读面并入项目读面） | |
