@@ -595,6 +595,9 @@ export function bootstrap(options) {
     `BIAO_PM_AGENT_ROUTES=${shellQuote('')}`,
     `BIAO_PM_SLOTS=${shellQuote('')}`,
     `BIAO_WORKER_SLOTS=${shellQuote('')}`,
+    '# 完成事件自愈：设为 1 后，task 上报 / pm ack / question answer 成功时会',
+    '# 自动确保 .biao/pm-watch 留守监视器在本机运行（无 worker slot、低频轮询）。',
+    `BIAO_SUPERVISOR_AUTO_ENSURE=${shellQuote('0')}`,
     '',
   ].join('\n');
 
@@ -867,6 +870,77 @@ exec "$SCRIPT_DIR/pm" pm heartbeat --once "$@"
   writeExecutable(
     join(setupDir, 'supervisor'),
     runtimeWrapper('exec node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" "$@"'),
+  );
+  writeExecutable(
+    join(setupDir, 'pm-watch'),
+    runtimeWrapper(`# 中央 Biao PM 门铃留守监视器：无本地 server、无 worker slot，只按需唤醒 PM Agent。
+# 与 start 的区别：不启动本地服务进程，不注册 worker slot；所有计划闭环后
+# 留守低频复查。中央失联导致 supervisor 退出时，按 BIAO_PM_WATCH_RESTART_DELAY
+# （默认 30s）退避后自动重新轮询。
+BIAO_WORKER_SLOTS=''
+export BIAO_WORKER_SLOTS
+
+lock_dir="$SCRIPT_DIR/pm-watch.lock"
+if [ "\${1:-}" = "--ensure" ]; then
+  # 自愈入口：有活实例时立刻返回；否则拉起一个后台副本。判活竞态由下方
+  # mkdir 原子锁兜底，因此重复调用 --ensure 是幂等的。
+  if [ -f "$lock_dir/pid" ]; then
+    lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then exit 0; fi
+  fi
+  ( nohup "$0" >/dev/null 2>&1 & )
+  exit 0
+fi
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "[pm-watch] 已有实例运行（pid \${lock_pid}），本次启动退出。" >&2
+    exit 0
+  fi
+  rm -rf "$lock_dir"
+  mkdir "$lock_dir" || exit 0
+fi
+echo $$ > "$lock_dir/pid"
+
+log_dir="\${BIAO_LOG_DIR:-$SCRIPT_DIR/logs}"
+mkdir -p "$log_dir"
+log_file="$log_dir/pm-watch.log"
+if [ -f "$log_file" ] && [ "$(wc -c < "$log_file")" -gt "\${BIAO_LOG_MAX_BYTES:-5242880}" ]; then
+  mv -f "$log_file" "$log_file.1"
+fi
+echo "[pm-watch] $(date '+%F %T') 启动：BIAO_URL=\${BIAO_URL}（PM 门铃留守监视，无 worker slot）" >> "$log_file"
+
+child_pid=''
+cleanup() {
+  rc=$?
+  if [ -n "$child_pid" ]; then
+    kill "$child_pid" 2>/dev/null || true
+  fi
+  rm -rf "$lock_dir" 2>/dev/null || true
+  exit "$rc"
+}
+trap cleanup INT TERM EXIT
+
+while :; do
+  node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" --stay-resident >> "$log_file" 2>&1 &
+  child_pid=$!
+  if wait "$child_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  child_pid=''
+  # --stay-resident 正常不会自行退出；退出码 0 几乎总是"另一本机实例已持有
+  # supervisor 锁"（例如本包装器被强杀后 supervisor 成为孤儿）。此时安静退出，
+  # 把监视交给那个孤儿实例，避免 30s 一次的空转重启循环。
+  if [ "$status" -eq 0 ]; then
+    echo "[pm-watch] $(date '+%F %T') supervisor 已由其他本机实例接管，本包装器退出。" >> "$log_file"
+    exit 0
+  fi
+  echo "[pm-watch] $(date '+%F %T') supervisor 异常退出（exit=\${status}），\${BIAO_PM_WATCH_RESTART_DELAY:-30}s 后重试" >> "$log_file"
+  sleep "\${BIAO_PM_WATCH_RESTART_DELAY:-30}"
+done
+`),
   );
   writeExecutable(
     join(setupDir, 'agent-kit'),

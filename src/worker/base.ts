@@ -36,6 +36,7 @@ import {
   unlinkWorkerArtifact,
   type WorkerArtifactContext,
 } from './artifact-security.js';
+import { maybeEnsureSupervisor } from './ensure-supervisor.js';
 
 const DEFAULT_BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
 const API_MAX_ATTEMPTS = 3;
@@ -218,7 +219,7 @@ export class BiaoClient {
     resultJsonPath?: string,
     verifyResults?: VerifyResult[],
   ): Promise<any> {
-    return this.api('/report', {
+    const response = await this.api('/report', {
       method: 'POST',
       body: JSON.stringify({
         task_id: taskId,
@@ -230,6 +231,9 @@ export class BiaoClient {
         verify_results: verifyResults,
       }),
     });
+    // 上报成功即可能挂起新的 PM 门铃；opt-in 时顺带确认本机留守监视器在运行。
+    if (response?.ok === true) maybeEnsureSupervisor();
+    return response;
   }
 
   async checkOwnership(path: string): Promise<any> {
