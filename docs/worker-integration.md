@@ -342,3 +342,15 @@ curl -X POST http://127.0.0.1:7331/agent/offline \
 ```
 
 允许的 reason 为 `worker_exit`、`worker_signal`、`plans_terminal`、`supervisor_signal`、`supervisor_exit`。该调用幂等，会标记离线并把最后任务、离线原因和时间保留为历史审计；任务已终结时清除 `current_task`，任务仍为 `running` 时则保留该指针并停止续租，确保 `/status` 与 watchdog 能在 lease 到期前后持续看到并安全回收它。接口不会删除注册记录、任务、报告或 Review。进程异常崩溃来不及调用时，平台才以心跳超时和 watchdog 兜底。
+
+## PM 门铃自愈（pm-watch）
+
+多台机器共用同一个中央 Biao 时，PM 唤醒依赖某台机器上常驻的门铃监视器。`.biao/pm-watch` 是低资源留守入口：不启动本地 server、不注册 worker slot，只消费 PM 门铃并按需唤醒 PM Agent；所有计划闭环后留守低频复查，中央失联时按 `BIAO_PM_WATCH_RESTART_DELAY`（默认 30s）退避重试。
+
+在 `.biao/config.env` 设置 `BIAO_SUPERVISOR_AUTO_ENSURE=1` 后，以下完成事件会在成功时自动确认本机的 `pm-watch` 仍在运行（幂等，重复触发只做一次判活）：
+
+- MCP `task_report` / `pm_review_decide` / `question_answer` 成功返回；
+- worker runtime 的 `/report` 上报成功（共享 Supervisor 管理的 slot worker 同样覆盖）；
+- CLI `biao pm ack` 与 `biao question answer` 成功。
+
+自愈入口是 `pm-watch --ensure`：有活实例时立即返回，否则拉起一个后台副本。单实例由 `.biao/pm-watch.lock` 原子目录锁保证；包装器被强杀后遗留的孤儿 supervisor 会因 supervisor 级锁让新包装器安静退出，不会形成重启空转。该行为默认关闭（bootstrap 生成 `0`），只在显式开启的机器上生效，符合"不偷偷安装常驻"的边界。注意它是事件驱动兜底：本机没有任何 worker/PM 活动时（例如远程机器上报后中央挂铃），不会触发自愈；对可用性要求更高的机器可再叠加系统级保活（macOS LaunchAgent KeepAlive / systemd）。

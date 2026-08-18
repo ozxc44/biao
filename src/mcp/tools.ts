@@ -1,6 +1,11 @@
 import type { BiaoApiEnvelope } from './client.js';
 import type { LanMcpRuntime } from './runtime.js';
 import { remoteErrorEnvelope, randomRuntimeId } from './runtime.js';
+import { maybeEnsureSupervisor } from '../worker/ensure-supervisor.js';
+
+// 这些工具成功后意味着本机刚产生/刚消费了会改变门铃队列的事件；
+// opt-in 时顺带确认留守监视器在运行（pm-watch --ensure 幂等）。
+const SUPERVISOR_ENSURE_TOOLS = new Set(['task_report', 'pm_review_decide', 'question_answer']);
 
 export interface McpToolResult {
   payload: BiaoApiEnvelope;
@@ -800,6 +805,7 @@ export async function callMcpTool(
   if (!tool) throw new McpToolInputError(`未知工具：${name}`);
   try {
     const payload = await tool.handler(args, runtime);
+    if (payload.ok && SUPERVISOR_ENSURE_TOOLS.has(name)) maybeEnsureSupervisor();
     return { payload, ok: payload.ok };
   } catch (error) {
     if (error instanceof McpToolInputError) throw error;

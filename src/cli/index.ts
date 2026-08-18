@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { isPlanTerminalStatus } from '../plan/status.js';
 import { startServer } from '../server/main.js';
 import { analyzeDag, type ActiveOwnershipFact, type DagTaskFact } from './dag-analysis.js';
+import { maybeEnsureSupervisor } from '../worker/ensure-supervisor.js';
 import { runPlanIntake, runPlanRevise, runPlanSubmit, runTaskAdd, runTaskEdit } from './planning.js';
 
 const BIAO_URL = process.env.BIAO_URL ?? 'http://localhost:7331';
@@ -1134,6 +1135,8 @@ async function main() {
       })) as { ok: boolean; data?: { event_id: string; already_acked: boolean }; error?: { message: string } };
       if (r.ok) {
         console.log(`✓ 已确认事件 ${r.data?.event_id}${r.data?.already_acked ? '（已是确认状态，幂等）' : ''}`);
+        // PM 消费完门铃后，opt-in 时确认本机留守监视器仍在，接住后续新门铃。
+        maybeEnsureSupervisor();
       } else {
         console.error(`✗ ack 失败：${r.error?.message ?? '未知错误'}`);
         process.exit(1);
@@ -1745,6 +1748,7 @@ verify: []
         printJson(r);
       } else if (isApiSuccess(r)) {
         console.log(`✓ 已回答 ${questionId}；任务将作为 pending 由 Worker 使用新 claim token 重新领取。`);
+        maybeEnsureSupervisor();
         const data = (r as { data?: { plan_id?: string; pm_consumer?: string; asked_event_id?: string } }).data;
         if (data?.asked_event_id) {
           const planArg = data.plan_id ? ` --plan ${data.plan_id}` : '';
