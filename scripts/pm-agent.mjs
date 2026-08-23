@@ -28,6 +28,7 @@ import {
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isPmActionableItem } from './pm-actionable.mjs';
 
 const EXIT_CONFIG = 3;
 const EXIT_UNHANDLED = 4;
@@ -44,18 +45,6 @@ const DEFAULT_PM_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const MIN_PM_AGENT_TIMEOUT_MS = 100;
 const MAX_PM_AGENT_TIMEOUT_MS = 60 * 60 * 1000;
 const PM_AGENT_KILL_GRACE_MS = 250;
-const PM_ACTIONABLE_KINDS = new Set([
-  'review_requested',
-  'question_asked',
-  'resolution_required',
-  // 兼容未来服务把 resolution 状态直接投影为 kind 的版本。
-  'needs_pm_decision',
-  'failed',
-  'blocked',
-  // 服务端只会把仍持有 running task 的 stale agent 投影到 intake；普通 idle/stale
-  // 注册已在服务端过滤，不能由唤醒器重新制造 PM 噪声。
-  'stale_agent',
-]);
 
 function usage() {
   console.log(`Biao PM Agent 唤醒器（一次性、被动平台适配）
@@ -384,7 +373,7 @@ function summarizeActionable(items, planIds) {
     if (!item || typeof item !== 'object') continue;
     const kind = typeof item.kind === 'string' ? item.kind : '';
     // 历史 repair 排队不应唤醒 PM；只有真正要求 PM 决策的 resolution 才会出现在 intake。
-    if (!PM_ACTIONABLE_KINDS.has(kind) || (kind === 'resolution_required' && item.resolution_action === 'repair')) continue;
+    if (!isPmActionableItem(item)) continue;
     const planId = typeof item.plan_id === 'string' ? item.plan_id : '';
     // 服务端仍可接收 plan_id 过滤；这里故意不传，确保多 plan 情形只有一次低成本读取，
     // 并在客户端做精确且可预测的范围过滤。
