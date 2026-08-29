@@ -20,6 +20,9 @@ import {
 } from '../src/server/service.js';
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import { keys } from '../src/redis/keys.js';
+import { SqliteStore } from '../src/db/sqlite-store.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6380/5';
 const PROJECT_PATH = '/tmp/biao-pm-accept-reverify';
@@ -112,12 +115,35 @@ describe('Bors-lite accept 复验闸门', () => {
     expect(hash.pm_review_status ?? '').toBe('');
   });
 
-  it('复验通过则 accepted，结果并入审计与证据卡', async () => {
+  it('复验通过则 accepted，结果并入审计与证据卡（含真实 SQLite 双写）', async () => {
     writeFileSync(join(PROJECT_PATH, 'marker.txt'), 'ok');
     await deliver('reverify-pass', 'worker-pass');
 
+    // 生产回归（2026-08-29 实测）：真实 SQLite store 必须先经 migration 017 拿到
+    // accept_verify_results 列，否则 accept 在 Redis 提交后因双写缺列报 SQLITE_ERROR。
+    const storeDir = mkdtempSync(join(tmpdir(), 'biao-accept-reverify-sqlite-'));
+    const store = new SqliteStore(join(storeDir, 'biao.sqlite'), {});
+    store.upsertPlan({
+      plan_id: 'pm-accept-reverify-plan',
+      title: 'PM accept reverify',
+      status: 'active',
+      project_path: PROJECT_PATH,
+      default_assignee: 'auto',
+      default_priority: 5,
+      phases: '[]',
+      task_count: 1,
+      created_at: '1',
+      submitted_at: '1',
+      pm_consumer: 'pm-accept-reverify',
+    });
+    setSqliteStore(store);
+
     const accepted = await pmReview(redis, 'reverify-pass', { verdict: 'accept', reviewed_by: 'pm', reverify: true });
     expect(accepted.ok).toBe(true);
+    const persisted = store.getTask('reverify-pass') as unknown as Record<string, unknown>;
+    expect(String(persisted.accept_verify_results)).toContain(VERIFY_CMD);
+    store.close();
+    setSqliteStore(null);
 
     const hash = await redis.hgetall(keys.hash.task('reverify-pass'));
     expect(hash.pm_review_status).toBe('accepted');

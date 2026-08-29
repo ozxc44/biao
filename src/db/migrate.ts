@@ -16,6 +16,7 @@ import * as evidenceAcceptances from './migrations/012_evidence_acceptances.js';
 import * as recoveryDecisions from './migrations/013_recovery_decisions.js';
 import * as humanEnrollments from './migrations/014_human_enrollments.js';
 import * as webhooks from './migrations/016_webhooks.js';
+import * as acceptVerifyResults from './migrations/017_accept_verify_results.js';
 
 export interface Migration {
   version: string;
@@ -125,6 +126,11 @@ const DEFAULT_MIGRATIONS: readonly Migration[] = Object.freeze([
     version: webhooks.version,
     checksumMaterial: webhooks.checksumMaterial,
     up: webhooks.up,
+  },
+  {
+    version: acceptVerifyResults.version,
+    checksumMaterial: acceptVerifyResults.checksumMaterial,
+    up: acceptVerifyResults.up,
   },
 ]);
 

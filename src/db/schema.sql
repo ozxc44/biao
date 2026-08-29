@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   supersede_preview_token TEXT,
   supersede_batch_size INTEGER,
   verify_results TEXT DEFAULT '[]',
+  accept_verify_results TEXT DEFAULT '',
   goal_md       TEXT,
   created_at    TEXT,
   updated_at    TEXT,
