@@ -16,7 +16,7 @@ import {
   existsSync,
 } from 'node:fs';
 import { join, isAbsolute, relative, resolve, sep } from 'node:path';
-import { spawn, spawnSync, execSync } from 'node:child_process';
+import { spawn, spawnSync, execSync, execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   ClaimRequest,
@@ -795,6 +795,36 @@ export function runAgentCli(
 }
 
 /** 写 result.md + result.json（对应 P4 真实格式） */
+export interface ResultDiffStats {
+  files: number;
+  insertions: number;
+  deletions: number;
+}
+
+/** PM 证据卡的 diff 统计：best-effort 读 git（HEAD vs 工作区，含已暂存）。
+ *  非 git 项目、git 不可用或解析失败时返回 undefined，绝不阻塞交付。 */
+export function collectDiffStats(projectPath: string): ResultDiffStats | undefined {
+  try {
+    const out = execFileSync('git', ['-C', projectPath, 'diff', '--numstat', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }) as string;
+    const stats: ResultDiffStats = { files: 0, insertions: 0, deletions: 0 };
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const [ins, del] = line.split('\t');
+      // 二进制文件行是 "-\t-\tpath"，计入文件数但不计入行数。
+      stats.files += 1;
+      if (/^\d+$/.test(ins)) stats.insertions += Number(ins);
+      if (/^\d+$/.test(del)) stats.deletions += Number(del);
+    }
+    return stats.files > 0 ? stats : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function writeResult(
   workDir: string,
   task: ClaimedTask,
@@ -844,6 +874,7 @@ ${failedCount > 0 ? `## 失败详情\n${verifyResults.filter((v) => !v.passed).m
     timed_out: agentRun.timedOut,
     verify_results: verifyResults,
     changed_files: changedFiles,
+    diff_stats: collectDiffStats(task.project_path || process.cwd()),
     duration_seconds: Number((agentRun.durationMs / 1000).toFixed(1)),
     stdout_tail: agentRun.stdout.slice(-2000),
     stderr_tail: agentRun.stderr.slice(-2000),
