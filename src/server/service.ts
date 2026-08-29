@@ -15,6 +15,7 @@
  */
 
 import type Redis from 'ioredis';
+import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -6812,6 +6813,8 @@ export interface ReviewEvidenceCard {
     verify_declared: number;
     verify_reported: number;
   };
+  /** Bors-lite accept 复验结果（reverify=true 验收时中央重跑的声明 verify）。 */
+  accept_reverify?: Array<{ cmd: string; exit_code: number; passed: boolean }>;
 }
 
 function buildReviewEvidence(
@@ -6826,6 +6829,21 @@ function buildReviewEvidence(
     Boolean(entry) && typeof (entry as { cmd?: unknown }).cmd === 'string'
       && typeof (entry as { passed?: unknown }).passed === 'boolean');
   const diffStats = sources.resultJson.diff_stats as ReviewEvidenceCard['diff_stats'] | undefined;
+  let acceptReverify: Array<{ cmd: string; exit_code: number; passed: boolean }> | undefined;
+  if (hash.accept_verify_results) {
+    try {
+      const parsed = JSON.parse(hash.accept_verify_results) as unknown;
+      if (Array.isArray(parsed)) {
+        acceptReverify = parsed
+          .filter((entry): entry is { cmd: string; exit_code: number; passed: boolean } =>
+            Boolean(entry) && typeof (entry as { cmd?: unknown }).cmd === 'string'
+              && typeof (entry as { passed?: unknown }).passed === 'boolean')
+          .map((entry) => ({ cmd: entry.cmd, exit_code: entry.exit_code, passed: entry.passed }));
+      }
+    } catch {
+      // 损坏的复验记录不构成证据；evidence 卡片省略该字段
+    }
+  }
   return {
     verify,
     replay: parseTaskReplayCommands(hash.verify),
@@ -6851,6 +6869,7 @@ function buildReviewEvidence(
       verify_declared: parseTaskReplayCommands(hash.verify).length,
       verify_reported: verify.length,
     },
+    ...(acceptReverify ? { accept_reverify: acceptReverify } : {}),
   };
 }
 
@@ -6862,6 +6881,12 @@ interface PmReviewRequest {
   repair_ownership?: RepairOwnershipExtension;
   /** acceptance reject 的显式处置：默认 repair；reverify 表示来源无需修改，只重做验收证据。 */
   resolution_mode?: 'repair' | 'reverify';
+  /**
+   * Bors-lite 集成闸门（可选）：accept 时中央在任务工作区重跑声明的 verify。
+   * report 时刻的通过只证明当时的快照；并行任务或工作区漂移可能已让集成结果
+   * 变挂——验收是集成时刻，复验必须发生在验收时刻。任一失败则拒绝本次 accept。
+   */
+  reverify?: boolean;
   reviewed_by: string;
 }
 
@@ -6916,6 +6941,45 @@ redis.call('SADD', KEYS[7], plan_id)
 redis.call('ZREM', KEYS[8], task_id)
 return {'COMMITTED'}
 `;
+
+/** accept 时中央复验（Bors-lite）：与 execute_verify 相同的项目根、相同的声明语义。 */
+function runAcceptReverify(
+  hash: Record<string, string>,
+): { results: Array<{ cmd: string; exit_code: number; passed: boolean; output: string }>; failed: string[] } | { error: string } {
+  let declared: Array<{ cmd: string; expect_exit?: number }> = [];
+  try {
+    declared = hash.verify ? JSON.parse(hash.verify) : [];
+  } catch {
+    return { error: '任务 verify 声明不是有效 JSON' };
+  }
+  if (!Array.isArray(declared) || declared.length === 0) return { results: [], failed: [] };
+  let projectRoot: string;
+  try {
+    projectRoot = resolveAndValidateWorkspacePath(hash.project_path, configuredWorkspaceRoots());
+  } catch (e) {
+    return { error: `任务工作区不可信：${(e as Error).message}` };
+  }
+  const results = declared.map((entry) => {
+    if (typeof entry?.cmd !== 'string' || !entry.cmd) {
+      return { cmd: String(entry?.cmd ?? ''), exit_code: 1, passed: false, output: '声明缺少 cmd' };
+    }
+    const run = spawnSync(entry.cmd, {
+      shell: true,
+      cwd: projectRoot,
+      timeout: 120_000,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+    });
+    const exitCode = run.status ?? 1;
+    return {
+      cmd: entry.cmd,
+      exit_code: exitCode,
+      passed: exitCode === (entry.expect_exit ?? 0),
+      output: `${run.stdout ?? ''}${run.stderr ?? ''}`.slice(0, 4096) || '(no output)',
+    };
+  });
+  return { results, failed: results.filter((entry) => !entry.passed).map((entry) => entry.cmd) };
+}
 
 async function commitPmReviewAudit(
   redis: Redis,
@@ -8441,6 +8505,31 @@ async function pmReviewLocked(
       },
     };
   }
+  // Bors-lite 集成闸门（opt-in，reverify=true）：report 时刻的 verify 通过只证明
+  // 当时快照；PM accept 是集成时刻，中央在当前工作区重跑声明 verify，任一失败
+  // 拒绝本次 accept（PM 需显式走 reject/repair）。通过则把复验结果并入验收审计。
+  let acceptVerifyResults: string | undefined;
+  if (req.verdict === 'accept' && req.reverify === true) {
+    const reverify = runAcceptReverify(hash);
+    if ('error' in reverify) {
+      return {
+        ok: false,
+        data: null,
+        error: { code: 'ACCEPT_REVERIFY_FAILED', message: `accept 复验未执行：${reverify.error}` },
+      };
+    }
+    if (reverify.failed.length > 0) {
+      return {
+        ok: false,
+        data: null,
+        error: {
+          code: 'ACCEPT_REVERIFY_FAILED',
+          message: `accept 复验失败（${reverify.failed.join(', ')}）：工作区当前状态不满足任务声明的 verify；请走 reject/repair 修复后重新交付。`,
+        },
+      };
+    }
+    if (reverify.results.length > 0) acceptVerifyResults = JSON.stringify(reverify.results);
+  }
   const now = Date.now();
 
   if (req.verdict === 'accept') {
@@ -8449,6 +8538,7 @@ async function pmReviewLocked(
       pm_reviewed_by: req.reviewed_by,
       pm_reviewed_at: String(now),
       pm_review_comment: req.comment ?? '',
+      ...(acceptVerifyResults !== undefined ? { accept_verify_results: acceptVerifyResults } : {}),
     }, lockToken);
     if (!accepted) {
       return {
@@ -8465,6 +8555,7 @@ async function pmReviewLocked(
       pm_reviewed_by: req.reviewed_by,
       pm_reviewed_at: String(now),
       pm_review_comment: req.comment ?? '',
+      ...(acceptVerifyResults !== undefined ? { accept_verify_results: acceptVerifyResults } : {}),
     });
     // PM accept 是普通下游真正的 dependency-ready 边界。副作用通过同一个幂等
     // replay 入口提交，使网络重试和低频 reconcile 都能补偿 accepted 写入后的崩溃。

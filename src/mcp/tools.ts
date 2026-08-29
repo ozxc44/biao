@@ -685,7 +685,7 @@ const tools: McpToolSpec[] = [
   },
   {
     name: 'pm_review_decide',
-    description: 'PM 验收决策（Owner 作用域）：accept 或 reject 当前交付；done 不等于 accepted。',
+    description: 'PM 验收决策（Owner 作用域）：accept 或 reject 当前交付；done 不等于 accepted。reverify=true 时 accept 前中央在当前工作区重跑声明的 verify（Bors-lite 集成闸门），任一失败拒绝验收。',
     inputSchema: objectSchema({
       task_id: nonEmptyString,
       verdict: { type: 'string', enum: ['accept', 'reject'] },
@@ -693,9 +693,10 @@ const tools: McpToolSpec[] = [
       reject_reason: nonEmptyString,
       fix_instructions: nonEmptyString,
       reviewed_by: nonEmptyString,
+      reverify: { type: 'boolean' },
     }, ['task_id', 'verdict', 'reviewed_by']),
     handler: async (args, runtime) => {
-      assertExactKeys(args, ['task_id', 'verdict', 'comment', 'reject_reason', 'fix_instructions', 'reviewed_by']);
+      assertExactKeys(args, ['task_id', 'verdict', 'comment', 'reject_reason', 'fix_instructions', 'reviewed_by', 'reverify']);
       const taskId = stringArg(args, 'task_id');
       const body: Record<string, unknown> = {
         verdict: enumArg(args, 'verdict', ['accept', 'reject'] as const),
@@ -707,6 +708,7 @@ const tools: McpToolSpec[] = [
       if (comment !== undefined) body.comment = comment;
       if (rejectReason !== undefined) body.reject_reason = rejectReason;
       if (fixInstructions !== undefined) body.fix_instructions = fixInstructions;
+      if (args.reverify === true) body.reverify = true;
       return projectEnvelope(await runtime.client.request(`/task/${encodeURIComponent(taskId)}/review`, {
         method: 'POST',
         body: JSON.stringify(body),
