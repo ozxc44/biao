@@ -286,6 +286,42 @@ const tools: McpToolSpec[] = [
       const changedFiles = Array.isArray(data.changed_files)
         ? data.changed_files.filter((entry): entry is string => typeof entry === 'string' && !entry.startsWith('/'))
         : [];
+      // 证据卡片（proof-of-work）：verify 输出 / 回放命令 / 变更文件与 diff 统计 /
+      // 运行元数据 / 完整度旗标。只做投影与输出截断，事实全部来自中央 evidence。
+      const evidence = (typeof data.evidence === 'object' && data.evidence !== null)
+        ? data.evidence as Record<string, unknown>
+        : undefined;
+      const evidenceCard = evidence
+        ? {
+          verify: Array.isArray(evidence.verify)
+            ? evidence.verify.map((entry) => {
+              const item = entry as { cmd?: unknown; exit_code?: unknown; passed?: unknown; output?: unknown };
+              return {
+                cmd: typeof item.cmd === 'string' ? item.cmd : '',
+                exit_code: typeof item.exit_code === 'number' ? item.exit_code : -1,
+                passed: item.passed === true,
+                ...(typeof item.output === 'string' && item.output
+                  ? { output: item.output.slice(0, 1000) }
+                  : {}),
+              };
+            })
+            : [],
+          replay: Array.isArray(evidence.replay)
+            ? evidence.replay.filter((entry): entry is { cmd: string; expect_exit: number } =>
+              Boolean(entry) && typeof (entry as { cmd?: unknown }).cmd === 'string')
+            : [],
+          changed_files: Array.isArray(evidence.changed_files)
+            ? evidence.changed_files.filter((entry): entry is string => typeof entry === 'string')
+            : [],
+          ...(evidence.diff_stats && typeof evidence.diff_stats === 'object'
+            ? { diff_stats: evidence.diff_stats }
+            : {}),
+          run: (typeof evidence.run === 'object' && evidence.run !== null) ? evidence.run : {},
+          completeness: (typeof evidence.completeness === 'object' && evidence.completeness !== null)
+            ? evidence.completeness
+            : {},
+        }
+        : undefined;
       return {
         ok: true,
         data: {
@@ -296,6 +332,7 @@ const tools: McpToolSpec[] = [
             passed: verify.filter((entry) => Boolean((entry as { passed?: unknown })?.passed)).length,
             failed: verify.filter((entry) => (entry as { passed?: unknown })?.passed === false).length,
           },
+          ...(evidenceCard ? { evidence_card: evidenceCard } : {}),
           result_ref: {
             task_id: data.task_id,
             result_md_available: typeof data.result_md === 'string' && data.result_md.length > 0,

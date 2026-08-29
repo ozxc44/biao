@@ -6752,6 +6752,14 @@ export async function getReviewInfo(
       // 权威 verify 证据在 task hash（report 时统一写入，含 execute_verify 的
       // 中央执行结果）；result.json 里的自报副本只作为旧数据回退。
       verify_results: parseTaskVerifyResults(hash.verify_results, resultJson.verify_results),
+      // 结构化证据包（proof-of-work）：把 PM 验收要看的四类材料——verify 输出、
+      // 回放命令、变更文件与 diff 统计、运行元数据——组装成一张卡片，CLI/Web/MCP
+      // 共用同一投影；各字段仍来自上方已验证的权威来源，不引入新的可信面。
+      evidence: buildReviewEvidence(hash, {
+        verifyResults: parseTaskVerifyResults(hash.verify_results, resultJson.verify_results),
+        resultJson,
+        resultMdPresent: Boolean(resultMd),
+      }),
       plan_md_violations: planMdViolations,
     },
   };
@@ -6767,6 +6775,83 @@ function parseTaskVerifyResults(hashField: string | undefined, legacyFromResultJ
     }
   }
   return Array.isArray(legacyFromResultJson) ? legacyFromResultJson : [];
+}
+
+/** 证据卡片的回放命令：只暴露声明过的 cmd/expect_exit，不含运行输出。 */
+function parseTaskReplayCommands(verifyField: string | undefined): Array<{ cmd: string; expect_exit: number }> {
+  if (!verifyField) return [];
+  try {
+    const declared = JSON.parse(verifyField) as unknown;
+    if (!Array.isArray(declared)) return [];
+    return declared
+      .filter((entry): entry is { cmd: string; expect_exit?: number } =>
+        Boolean(entry) && typeof (entry as { cmd?: unknown }).cmd === 'string')
+      .map((entry) => ({ cmd: entry.cmd, expect_exit: entry.expect_exit ?? 0 }));
+  } catch {
+    return [];
+  }
+}
+
+export interface ReviewEvidenceCard {
+  verify: Array<{ cmd: string; exit_code: number; passed: boolean; output?: string }>;
+  replay: Array<{ cmd: string; expect_exit: number }>;
+  changed_files: string[];
+  diff_stats?: { files: number; insertions: number; deletions: number };
+  run: {
+    worker?: string;
+    backend?: string;
+    model?: string;
+    status?: string;
+    returncode?: number;
+    timed_out?: boolean;
+    duration_seconds?: number;
+  };
+  completeness: {
+    result_md: boolean;
+    result_json: boolean;
+    verify_declared: number;
+    verify_reported: number;
+  };
+}
+
+function buildReviewEvidence(
+  hash: Record<string, string>,
+  sources: {
+    verifyResults: unknown[];
+    resultJson: Record<string, unknown>;
+    resultMdPresent: boolean;
+  },
+): ReviewEvidenceCard {
+  const verify = sources.verifyResults.filter((entry): entry is { cmd: string; exit_code: number; passed: boolean; output?: string } =>
+    Boolean(entry) && typeof (entry as { cmd?: unknown }).cmd === 'string'
+      && typeof (entry as { passed?: unknown }).passed === 'boolean');
+  const diffStats = sources.resultJson.diff_stats as ReviewEvidenceCard['diff_stats'] | undefined;
+  return {
+    verify,
+    replay: parseTaskReplayCommands(hash.verify),
+    changed_files: (sources.resultJson.changed_files as string[]) ?? [],
+    ...(diffStats
+      && typeof diffStats.files === 'number'
+      && typeof diffStats.insertions === 'number'
+      && typeof diffStats.deletions === 'number'
+      ? { diff_stats: diffStats }
+      : {}),
+    run: {
+      worker: typeof sources.resultJson.worker === 'string' ? sources.resultJson.worker : undefined,
+      backend: typeof sources.resultJson.backend === 'string' ? sources.resultJson.backend : undefined,
+      model: typeof sources.resultJson.model === 'string' ? sources.resultJson.model : undefined,
+      status: typeof sources.resultJson.status === 'string' ? sources.resultJson.status : undefined,
+      returncode: typeof sources.resultJson.returncode === 'number' ? sources.resultJson.returncode : undefined,
+      timed_out: sources.resultJson.timed_out === true,
+      duration_seconds: typeof sources.resultJson.duration_seconds === 'number' ? sources.resultJson.duration_seconds : undefined,
+    },
+    completeness: {
+      result_md: sources.resultMdPresent,
+      result_json: Object.keys(sources.resultJson).length > 0,
+      verify_declared: parseTaskReplayCommands(hash.verify).length,
+      verify_reported: verify.length,
+    },
+  };
 }
 
 interface PmReviewRequest {

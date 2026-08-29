@@ -223,6 +223,14 @@ describe('Agent 一等操作面（纯 MCP 全流程）', () => {
     expect(reviewRead.payload.data).toMatchObject({ status: 'done', awaiting_independent_review: true });
     // execute_verify 的中央执行结果必须持久化为 PM 可见的 verify 证据。
     expect(reviewRead.payload.data.verify_summary).toMatchObject({ total: 1, passed: 1, failed: 0 });
+    // 证据卡片：verify 输出 / 回放命令 / 运行元数据 / 完整度。
+    const card = reviewRead.payload.data.evidence_card;
+    expect(card).toBeDefined();
+    expect(card.verify).toHaveLength(1);
+    expect(card.verify[0]).toMatchObject({ cmd: 'test -f work/ops-impl-1/result.md', exit_code: 0, passed: true });
+    expect(card.replay).toEqual([{ cmd: 'test -f work/ops-impl-1/result.md', expect_exit: 0 }]);
+    expect(card.run).toBeDefined();
+    expect(card.completeness).toMatchObject({ result_md: true, result_json: true, verify_declared: 1, verify_reported: 1 });
 
     const decided = await toolPayload(pm, 'pm_review_decide', {
       task_id: 'ops-impl-1',
@@ -250,13 +258,16 @@ describe('Agent 一等操作面（纯 MCP 全流程）', () => {
       task_id: 'ops-acc-1',
       status: 'done',
       result_md: '# 验收结论\n\n复核通过。',
-      result_json: '{"ok":true,"verdict":"pass"}',
+      result_json: '{"ok":true,"verdict":"pass","backend":"zcode","model":"glm","returncode":0,"duration_seconds":12.5,"changed_files":["src/a.ts","src/b.ts"],"diff_stats":{"files":2,"insertions":30,"deletions":4}}',
       execute_verify: true,
     });
     expect(reported.payload).toMatchObject({ ok: true });
 
     const accReviewRead = await toolPayload(pm, 'pm_review_read', { task_id: 'ops-acc-1' });
     expect(accReviewRead.payload.data.verify_summary).toMatchObject({ total: 1, passed: 1, failed: 0 });
+    // worker 自报的 run 元数据与 diff 统计经 evidence 卡片原样透传给 PM。
+    expect(accReviewRead.payload.data.evidence_card.run).toMatchObject({ backend: 'zcode', model: 'glm', returncode: 0 });
+    expect(accReviewRead.payload.data.evidence_card.diff_stats).toMatchObject({ files: 2, insertions: 30, deletions: 4 });
 
     const decided = await toolPayload(pm, 'pm_review_decide', {
       task_id: 'ops-acc-1',
