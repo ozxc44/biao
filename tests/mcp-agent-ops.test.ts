@@ -221,6 +221,8 @@ describe('Agent 一等操作面（纯 MCP 全流程）', () => {
 
     const reviewRead = await toolPayload(pm, 'pm_review_read', { task_id: 'ops-impl-1' });
     expect(reviewRead.payload.data).toMatchObject({ status: 'done', awaiting_independent_review: true });
+    // execute_verify 的中央执行结果必须持久化为 PM 可见的 verify 证据。
+    expect(reviewRead.payload.data.verify_summary).toMatchObject({ total: 1, passed: 1, failed: 0 });
 
     const decided = await toolPayload(pm, 'pm_review_decide', {
       task_id: 'ops-impl-1',
@@ -252,6 +254,9 @@ describe('Agent 一等操作面（纯 MCP 全流程）', () => {
       execute_verify: true,
     });
     expect(reported.payload).toMatchObject({ ok: true });
+
+    const accReviewRead = await toolPayload(pm, 'pm_review_read', { task_id: 'ops-acc-1' });
+    expect(accReviewRead.payload.data.verify_summary).toMatchObject({ total: 1, passed: 1, failed: 0 });
 
     const decided = await toolPayload(pm, 'pm_review_decide', {
       task_id: 'ops-acc-1',

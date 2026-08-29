@@ -6749,10 +6749,24 @@ export async function getReviewInfo(
       result_md: resultMd,
       result_json: resultJson,
       changed_files: (resultJson.changed_files as string[]) ?? [],
-      verify_results: (resultJson.verify_results as unknown[]) ?? [],
+      // 权威 verify 证据在 task hash（report 时统一写入，含 execute_verify 的
+      // 中央执行结果）；result.json 里的自报副本只作为旧数据回退。
+      verify_results: parseTaskVerifyResults(hash.verify_results, resultJson.verify_results),
       plan_md_violations: planMdViolations,
     },
   };
+}
+
+function parseTaskVerifyResults(hashField: string | undefined, legacyFromResultJson: unknown): unknown[] {
+  if (hashField) {
+    try {
+      const parsed = JSON.parse(hashField);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {
+      // 损坏的 hash 字段回退到 result.json 副本
+    }
+  }
+  return Array.isArray(legacyFromResultJson) ? legacyFromResultJson : [];
 }
 
 interface PmReviewRequest {
