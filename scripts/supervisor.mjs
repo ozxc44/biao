@@ -644,6 +644,8 @@ process.on('SIGTERM', onSigterm);
 try {
   const slots = parseSlots();
   const intervalMs = Math.max(10_000, Number.isFinite(intervalSeconds) ? intervalSeconds * 1000 : 60_000);
+  // 留守模式的定时长睡眠可被 SSE 事件打断（每轮重新武装；shutdown 仍然立即生效）。
+  const residentWake = { controller: new AbortController() };
   const runtime = new BiaoSupervisorRuntime({
     biaoUrl,
     consumer,
@@ -674,6 +676,10 @@ try {
       return handled;
     },
     onError: (message) => console.error(`[supervisor] ${message}`),
+    // SSE 事件唤醒（默认关，BIAO_SUPERVISOR_EVENT_WAKE=1 开启）：中央事件到达即
+    // 提前进入下一共享轮次；轮询定时器保留兜底，断流只损失"提前"，不损失正确性。
+    eventWake: process.env.BIAO_SUPERVISOR_EVENT_WAKE === '1',
+    onExternalWake: () => residentWake.controller.abort(),
   });
   if (once) {
     const active = await runtime.runOnce();
@@ -700,7 +706,8 @@ try {
         residentAnnounced = true;
         console.log(`[supervisor] 全部受管计划已闭环；留守待命（每 ${Math.round(intervalMs / 1000)}s 低频复查新计划，Ctrl-C 退出）。`);
       }
-      await sleepInterruptible(intervalMs, shutdown.signal);
+      residentWake.controller = new AbortController();
+      await sleepInterruptible(intervalMs, AbortSignal.any([shutdown.signal, residentWake.controller.signal]));
     }
     if (receivedSignal) process.exitCode = signalExitCode(receivedSignal);
     else if (terminalDrained) console.log('[supervisor] 所有受管项目已完成并验收，已停止监视。');

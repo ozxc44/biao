@@ -1520,6 +1520,14 @@ export interface BiaoSupervisorRuntimeOptions {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   /**
+   * 订阅中央 GET /events/stream（SSE）：任何事件到达立即唤醒共享轮次，替代
+   * 纯定时等待。断流自动指数退避重连；轮询定时器始终保留作为兜底，SSE 只会
+   * 提前唤醒，绝不会延长轮次间隔。默认关闭（BIAO_SUPERVISOR_EVENT_WAKE=1 开启）。
+   */
+  eventWake?: boolean;
+  /** SSE 事件唤醒时同步通知调用方（用于打断留守模式的定时睡眠）。 */
+  onExternalWake?: () => void;
+  /**
    * 仅传最小事项给 PM 的本地提醒出口。该回调不得 ack；显式返回 false 表示未完成
    * 交付/处置，运行时会在下一共享轮次重试同一事项。
    */
@@ -1562,6 +1570,11 @@ export class BiaoSupervisorRuntime {
     wakeMode: ProjectAgentWakeMode;
   }>;
   private readonly supervisor: Supervisor;
+  private readonly eventWakeEnabled: boolean;
+  private readonly onExternalWake?: () => void;
+  private readonly fetchImpl: typeof fetch;
+  private eventStreamController?: AbortController;
+  private lastEventStreamError?: string;
   private questionsWakeCount = 0;
   /** 同一段连续 transport 故障只报一次，避免低频重试把终端刷屏。 */
   private lastTransportError?: string;
@@ -1707,6 +1720,10 @@ export class BiaoSupervisorRuntime {
         appendReceipt: (projectScope, receipt) => this.transport.appendExecutionReceipt(projectScope, receipt),
       });
     }
+    this.eventWakeEnabled = Boolean(opts.eventWake);
+    this.onExternalWake = opts.onExternalWake;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
+    if (this.eventWakeEnabled) this.startEventStream();
   }
 
   /** 一次性运行：供 cron/launchd 或 CLI smoke 使用。 */
@@ -1735,6 +1752,90 @@ export class BiaoSupervisorRuntime {
 
   workerWakeCount(): number {
     return this.questionsWakeCount;
+  }
+
+  /** 立即停止 SSE 事件唤醒（进程收口/测试清理用；轮询定时器不受影响）。 */
+  stopEventStream(): void {
+    this.eventStreamController?.abort();
+    this.eventStreamController = undefined;
+  }
+
+  private startEventStream(): void {
+    if (this.eventStreamController) return;
+    const controller = new AbortController();
+    this.eventStreamController = controller;
+    const stop = () => controller.abort();
+    this.opts.signal?.addEventListener('abort', stop, { once: true });
+    void this.runEventStreamLoop(controller).finally(() => {
+      this.opts.signal?.removeEventListener('abort', stop);
+      if (this.eventStreamController === controller) this.eventStreamController = undefined;
+    });
+  }
+
+  /**
+   * SSE 订阅循环：事件到达只做唤醒，不解析业务正文（正文仍由共享轮次从
+   * /intake 等被动接口读取）。断流按 1s→2s→…→60s 指数退避重连；任何失败都
+   * 只影响"提前唤醒"这一增强路径，绝不影响轮询兜底。
+   */
+  private async runEventStreamLoop(controller: AbortController): Promise<void> {
+    let retryMs = 1_000;
+    while (!controller.signal.aborted) {
+      try {
+        const headers: Record<string, string> = { Accept: 'text/event-stream' };
+        if (this.opts.apiToken) headers.Authorization = `Bearer ${this.opts.apiToken}`;
+        const response = await this.fetchImpl(`${this.opts.biaoUrl.replace(/\/$/, '')}/events/stream`, {
+          headers,
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) throw new SupervisorTransportError(
+          `事件流订阅失败：HTTP ${response.status}`,
+          response.status >= 500 || response.status === 429,
+        );
+        retryMs = 1_000;
+        this.lastEventStreamError = undefined;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary >= 0) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            for (const line of frame.split('\n')) {
+              if (line.startsWith('data: ')) this.handleEventStreamPayload(line.slice('data: '.length));
+            }
+            boundary = buffer.indexOf('\n\n');
+          }
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.lastEventStreamError !== message) {
+          this.lastEventStreamError = message;
+          this.opts.onError?.(`SSE 事件唤醒中断（轮询兜底不受影响）：${message}`);
+        }
+      }
+      if (controller.signal.aborted) return;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, retryMs);
+        controller.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+      });
+      retryMs = Math.min(60_000, retryMs * 2);
+    }
+  }
+
+  /** SSE data 帧：合法 JSON 即唤醒一次（burst 由 wakePending 合并）。 */
+  private handleEventStreamPayload(raw: string): void {
+    try {
+      JSON.parse(raw);
+    } catch {
+      return;
+    }
+    this.supervisor.wake();
+    this.onExternalWake?.();
   }
 
   private async refresh(): Promise<void> {
