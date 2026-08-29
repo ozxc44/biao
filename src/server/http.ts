@@ -693,6 +693,7 @@ const requestSchemas = {
         reject_reason: { type: 'string' },
         fix_instructions: { type: 'string' },
         resolution_mode: { type: 'string', enum: ['repair', 'reverify'] },
+        reverify: { type: 'boolean' },
         repair_ownership: {
           type: 'object',
           minProperties: 1,
