@@ -196,6 +196,7 @@ export class BiaoClient {
 
   async claim(
     req: Omit<ClaimRequest, 'agent_id' | 'registration_id' | 'claim_request_id'>,
+    options?: { signal?: AbortSignal },
   ): Promise<{ ok: boolean; data: ClaimedTask | null }> {
     // 每次业务 claim 产生新 ID，api() 内的传输/5xx 重试复用同一 body。
     // 服务端因此可在“已提交但响应丢失”时重放原 claim token。
@@ -208,6 +209,7 @@ export class BiaoClient {
         registration_id: this.registrationId,
         claim_request_id: claimRequestId,
       }),
+      ...(options?.signal ? { signal: options.signal } : {}),
     });
   }
 
@@ -1375,6 +1377,12 @@ export interface WorkerConfig {
   maxTasks?: number; // 0 = 无限
   /** 空队列轮询间隔；maxTasks=0 时默认常驻轮询 */
   idlePollMs?: number;
+  /**
+   * 常驻空闲时的 claim 长轮询上限（ms）。>0 时空闲 claim 改为 blocking 长轮询，
+   * 等待发生在服务端、任务出现即返回；0 关闭（退回本地 idlePollMs 节拍）。
+   * 一次性 worker（exitOnIdle）不受影响，始终用即时非阻塞 claim。
+   */
+  blockingClaimTimeoutMs?: number;
   /** 显式要求空队列立即退出（一次性 worker） */
   exitOnIdle?: boolean;
   /** agent 心跳间隔 */
@@ -1419,6 +1427,8 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   const maxTasks = cfg.maxTasks ?? 0;
   const idlePollMs = Math.max(10, cfg.idlePollMs ?? 5000);
   const exitOnIdle = cfg.exitOnIdle ?? maxTasks > 0;
+  const blockingClaimTimeoutMs = Math.min(60_000, Math.max(0, cfg.blockingClaimTimeoutMs ?? 50_000));
+  let useBlockingClaim = !exitOnIdle && blockingClaimTimeoutMs > 0;
   const heartbeatMs = Math.max(1000, cfg.heartbeatMs ?? 30_000);
   const heartbeatWhenIdle = cfg.heartbeatWhenIdle ?? true;
 
@@ -1461,16 +1471,27 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   const heartbeatTimer = setInterval(() => { void sendHeartbeat(); }, heartbeatMs);
   let preclaimedTask = cfg.preclaimedTask;
   let consecutiveClaimTransportFailures = 0;
+  // 优雅停止必须立刻打断挂起中的 blocking 长轮询，不能等 timeout_ms 自然到期。
+  const claimAbort = new AbortController();
+  const abortClaimOnShutdown = () => claimAbort.abort();
+  cfg.signal?.addEventListener('abort', abortClaimOnShutdown, { once: true });
 
   try {
   while (!cfg.signal?.aborted && (maxTasks === 0 || count < maxTasks)) {
     let claimRes: { ok: boolean; data: ClaimedTask | null };
+    const claimStartedAt = Date.now();
     try {
       claimRes = preclaimedTask
         ? { ok: true, data: preclaimedTask }
-        : await client.claim({ blocking: false, timeout_ms: 5000, preferred_project: cfg.preferredProject });
+        : useBlockingClaim
+          ? await client.claim(
+            { blocking: true, timeout_ms: blockingClaimTimeoutMs, preferred_project: cfg.preferredProject },
+            { signal: claimAbort.signal },
+          )
+          : await client.claim({ blocking: false, timeout_ms: 5000, preferred_project: cfg.preferredProject });
       consecutiveClaimTransportFailures = 0;
     } catch (error) {
+      if (cfg.signal?.aborted) break;
       // 一次性 Worker 仍要把连接错误交给调用方；只有显式常驻的遗留入口在服务
       // 闪断时留在进程内恢复。新的多 harness 模式由 Supervisor 按需唤醒，不依赖
       // 这个循环轮询，但兼容入口也不能因约 150ms 的 SDK 重试耗尽而永久退出。
@@ -1489,14 +1510,24 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
     }
     preclaimedTask = undefined;
     if (!claimRes.ok || !claimRes.data) {
-      if (!claimRes.ok) {
+      const claimElapsedMs = Date.now() - claimStartedAt;
+      if (!claimRes.ok && useBlockingClaim && claimElapsedMs < 2_000) {
+        // 旧中央不认识 blocking 参数（立即拒绝而不是挂起）：本会话降级回
+        // 非阻塞 + 本地节拍，行为与升级前一致。
+        useBlockingClaim = false;
+        console.warn(`[worker:${cfg.agentId}] 中央拒绝 blocking claim（${(claimRes as any).error?.code ?? 'UNKNOWN'}），退回本地 idle 轮询`);
+      } else if (!claimRes.ok) {
         console.warn(`[worker:${cfg.agentId}] 领取失败：${(claimRes as any).error?.code ?? 'UNKNOWN'}，稍后重试`);
       }
       if (exitOnIdle) {
         console.log(`[worker:${cfg.agentId}] 无更多任务，退出（共完成 ${count} 个）`);
         break;
       }
-      await waitForNextPoll(idlePollMs, cfg.signal);
+      // blocking 空返回的等待已经发生在服务端，本地不再重复睡 idlePollMs；
+      // 只有秒回空结果（timeout 被忽略或已降级）才回退本地节拍，防止热循环。
+      if (!useBlockingClaim || claimElapsedMs < Math.min(2_000, idlePollMs)) {
+        await waitForNextPoll(idlePollMs, cfg.signal);
+      }
       continue;
     }
 
@@ -1898,6 +1929,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
   }
   } finally {
     clearInterval(heartbeatTimer);
+    cfg.signal?.removeEventListener('abort', abortClaimOnShutdown);
     if (ownsRegistration && typeof client.offline === 'function') {
       try {
         const offline = await client.offline(cfg.signal?.aborted ? 'worker_signal' : 'worker_exit');
