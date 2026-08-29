@@ -1007,6 +1007,10 @@ async function reportUnlocked(
     ? ''
     : failureReasonForReport(req.status, req.verify_results ?? []);
 
+  // execute_verify 的中央执行结果必须与 Worker 自报结果走同一条持久化路径；
+  // 否则 PM Review 只能看到空 verify 证据，done≠accepted 的证据链断裂。
+  let finalVerifyResults = req.verify_results ?? [];
+
   let resultPath = req.result_path ?? '';
   let resultJsonPath = req.result_json_path ?? '';
   if (inlineResultMd !== undefined && !resultPath) {
@@ -1054,6 +1058,7 @@ async function reportUnlocked(
         };
       });
     }
+    finalVerifyResults = verifyResults;
     if (declaredVerify.length > 0 && verifyResults.length === 0) {
       return {
         ok: false,
@@ -1226,7 +1231,7 @@ async function reportUnlocked(
             status: 'done',
             result_path: resultPath,
             result_json_path: resultJsonPath,
-            verify_results: JSON.stringify(req.verify_results ?? []),
+            verify_results: JSON.stringify(finalVerifyResults),
             done_at: String(now),
             failed_reason: '',
             // 每次成功 report 都开启新的 review round。即使历史/人工修复留下了
@@ -1250,7 +1255,7 @@ async function reportUnlocked(
             status: 'failed',
             result_path: resultPath,
             result_json_path: resultJsonPath,
-            verify_results: JSON.stringify(req.verify_results ?? []),
+            verify_results: JSON.stringify(finalVerifyResults),
             done_at: String(now),
             failed_reason: reportFailureReason,
             pm_review_status: '',
@@ -1378,7 +1383,7 @@ async function reportUnlocked(
       status: finalStatus,
       result_path: resultPath,
       result_json_path: resultJsonPath,
-      verify_results: JSON.stringify(req.verify_results ?? []),
+      verify_results: JSON.stringify(finalVerifyResults),
       done_at: String(committedAt),
     });
   }
@@ -1396,9 +1401,9 @@ async function reportUnlocked(
 
   // 失败统一进入可审计 repair 分派。普通 code 失败、独立 acceptance 失败和 repair
   // 自身失败都走此处；不再让任一失败孤立在 failed 桶里等待人工盯盘。
-  const verifyFailed = (req.verify_results ?? []).some((v) => !v.passed);
+  const verifyFailed = finalVerifyResults.some((v) => !v.passed);
   if (req.status !== 'done') {
-    const failures = summarizeVerifyFailures(req.verify_results ?? []);
+    const failures = summarizeVerifyFailures(finalVerifyResults);
     // acceptance 是针对一个或多个原实现的验收：修复源是原实现，而不是失败的
     // acceptance task；这样 repair 不会依赖 failed acceptance 形成 DAG 死锁。
     if (reportedTaskHash.type === 'acceptance') {
