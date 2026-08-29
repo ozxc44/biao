@@ -264,6 +264,8 @@ macOS 使用系统 `pbcopy`。Linux 需要 `wl-copy`、`xclip` 或 `xsel` 中任
 
 `.biao/start` 会托管同一个常驻 Supervisor：Worker 每完成一项任务，Supervisor 立即检查同一轮调度是否还能继续；如果 Supervisor 进程异常退出，启动器会在 `BIAO_SUPERVISOR_RESTART_DELAY`（默认 5 秒）后自动重启。正常计划暂时闭环时才按 `BIAO_SUPERVISOR_INTERVAL`（默认 60 秒）低频重查。无需再额外手动拉一个监视器。在 `.biao/config.env` 设 `BIAO_SUPERVISOR_STAY_RESIDENT=1`（或给 `.biao/supervisor` 传 `--stay-resident`）后，Supervisor 全部闭环时不再退出，而是按同一间隔留守复查新计划，消除“退出后等重启才发现新计划”的空窗；此时启动器只承担崩溃重启。
 
+再设 `BIAO_SUPERVISOR_EVENT_WAKE=1` 可开启 SSE 事件唤醒：Supervisor 对中央 `GET /events/stream` 保持一条长连接，任何平台事件（新任务、PM 门铃、Question）到达时立即进入下一共享轮次，留守睡眠也会被打断——反应延迟从“最长一个轮询间隔”降为“约 1 秒”，空闲期间不再产生周期性轮询请求。断流自动按 1s→2s→…→60s 指数退避重连；轮询定时器始终保留为兜底，SSE 只会提前唤醒，绝不会延长轮次间隔。
+
 要声明 Worker，不必再手改 JSON。用 Owner-only 配置命令添加 slot，随后运行 `.biao/start` 即会自动登记、领取和续作：
 
 ```bash
