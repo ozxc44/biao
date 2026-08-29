@@ -16,9 +16,10 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isPmActionableItem } from './pm-actionable.mjs';
+import { ensureAgentProtocolBlock } from './agent-protocol.mjs';
 import {
   BiaoSupervisorRuntime,
   releaseLocalLock,
@@ -643,6 +644,26 @@ process.on('SIGTERM', onSigterm);
 
 try {
   const slots = parseSlots();
+  // 零配置 harness 接入：向每个 slot 的 project 目录幂等注入 Biao 协议块
+  // （AGENTS.md/CLAUDE.md）。任何新 harness 在自己的 cwd 就能读到任务书规则；
+  // BIAO_AGENT_PROTOCOL=0 停用。注入失败只记一行日志，不影响监视。
+  if (process.env.BIAO_AGENT_PROTOCOL !== '0') {
+    for (const project of [...new Set(slots.map((slot) => slot.preferredProject).filter(Boolean))]) {
+      // project 目录可能尚未 clone（V2 动态项目）；不存在时静默跳过，目录就绪后的
+      // 下次 supervisor 启动会补注入。
+      if (!existsSync(project) || !statSync(project).isDirectory()) continue;
+      try {
+        const result = ensureAgentProtocolBlock(project);
+        const injected = result.files.filter((entry) => entry.changed).map((entry) => entry.file);
+        if (injected.length > 0) console.log(`[supervisor] 已注入 Biao 协作协议块：${project}（${injected.join(', ')}）`);
+        for (const entry of result.files) {
+          if (entry.error) console.error(`[supervisor] 协议块注入失败 ${project}/${entry.file}：${entry.error}`);
+        }
+      } catch (error) {
+        console.error(`[supervisor] 协议块注入异常 ${project}（不影响监视）：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
   const intervalMs = Math.max(10_000, Number.isFinite(intervalSeconds) ? intervalSeconds * 1000 : 60_000);
   // 留守模式的定时长睡眠可被 SSE 事件打断（每轮重新武装；shutdown 仍然立即生效）。
   const residentWake = { controller: new AbortController() };

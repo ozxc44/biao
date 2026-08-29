@@ -24,6 +24,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { ensureAgentProtocolBlock } from './agent-protocol.mjs';
+
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\"'\"'`)}'`;
 }
@@ -555,6 +557,8 @@ export function bootstrap(options) {
   if (configExists && !options.force && !upgrading) {
     assertCompleteRuntime(repoRoot, '检查已有配置');
     prepareRuntimeDirectory(setupDir);
+    // 已有安装也补一次协议块（幂等）：升级路径与全新安装拿到同样的零配置 harness 接入。
+    injectAgentProtocolBlocks([workspace]);
     return { created: false, setupDir, configPath, runtimeLayout };
   }
 
@@ -1126,6 +1130,7 @@ Supervisor 只给最小门铃，永不自动 ack；每个事项必须在读取�
     : guideTemplate;
   atomicWriteGeneratedFile(join(setupDir, 'PM_AGENT.md'), guide, 0o644);
 
+  injectAgentProtocolBlocks([workspace]);
   return {
     created: !upgrading,
     upgraded: upgrading,
@@ -1134,6 +1139,23 @@ Supervisor 只给最小门铃，永不自动 ack；每个事项必须在读取�
     tokenGenerated: !upgrading && options.token == null,
     runtimeLayout,
   };
+}
+
+/**
+ * 向 workspace 根注入 AGENTS.md/CLAUDE.md 协议块（幂等；BIAO_AGENT_PROTOCOL=0 停用）。
+ * 只打印一条汇总，失败不阻塞 bootstrap——协议注入是增强路径，不是安装闸门。
+ */
+function injectAgentProtocolBlocks(roots) {
+  if (process.env.BIAO_AGENT_PROTOCOL === '0') return;
+  try {
+    for (const root of roots) {
+      const result = ensureAgentProtocolBlock(root);
+      const injected = result.files.filter((entry) => entry.changed).map((entry) => entry.file);
+      if (injected.length > 0) console.log(`[bootstrap] 已注入 Biao 协作协议块：${root}（${injected.join(', ')}）`);
+    }
+  } catch {
+    // 注入失败不影响安装正确性
+  }
 }
 
 export function formatCompletion(result) {

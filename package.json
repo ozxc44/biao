@@ -25,6 +25,7 @@
     "scripts/verify-package.mjs",
     "scripts/pm-agent.mjs",
     "scripts/pm-actionable.mjs",
+    "scripts/agent-protocol.mjs",
     "scripts/codex-pm-agent.mjs",
     "scripts/adapter-kit.mjs",
     "scripts/worker-agent.mjs",
