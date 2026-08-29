@@ -322,10 +322,14 @@ const tools: McpToolSpec[] = [
             : {},
         }
         : undefined;
+      // smallMetadata 会把 evidence 里的 cmd/verify/output 键剥掉，留下半截副本；
+      // 完整证据只经 evidence_card 出口，顶层删掉以免误导 PM。
+      const projected = smallMetadata(data) as Record<string, unknown>;
+      delete projected.evidence;
       return {
         ok: true,
         data: {
-          ...(smallMetadata(data) as Record<string, unknown>),
+          ...projected,
           changed_files: changedFiles,
           verify_summary: {
             total: verify.length,
