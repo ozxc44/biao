@@ -21,7 +21,7 @@ import {
 import { writePlanToRedis, writeTaskToRedis } from '../src/redis/ownership.js';
 import { keys } from '../src/redis/keys.js';
 
-const REDIS_URL = process.env.PM_ACCEPT_REVERIFY_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/17';
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6380/5';
 const PROJECT_PATH = '/tmp/biao-pm-accept-reverify';
 const VERIFY_CMD = 'test -f marker.txt';
 

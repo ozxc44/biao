@@ -24,7 +24,7 @@ import { keys } from '../src/redis/keys.js';
 
 // Dedicated non-production Redis DB. This suite must never share the product DB or
 // another suite's DB because it deliberately seeds ten thousand historical tasks.
-const REDIS_URL = process.env.STATUS_PROJECTION_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/16';
+const REDIS_URL = process.env.STATUS_PROJECTION_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380/8';
 const PLAN_ID = 'status-projection-plan';
 const PROJECT_PATH = join(tmpdir(), 'biao-status-projection-project');
 
