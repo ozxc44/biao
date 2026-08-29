@@ -765,6 +765,7 @@ export async function persistTaskFromRedis(redis: Redis, taskId: string): Promis
     supersede_preview_token: h.supersede_preview_token ?? '',
     supersede_batch_size: Number(h.supersede_batch_size ?? 0),
     verify_results: h.verify_results ?? '[]',
+    accept_verify_results: h.accept_verify_results ?? '',
     goal_md: h.goal_md ?? '',
     created_at: h.created_at ?? nowIso,
     updated_at: nowIso,

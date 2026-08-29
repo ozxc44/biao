@@ -136,6 +136,7 @@ export interface TaskRow {
   supersede_preview_token?: string;
   supersede_batch_size?: number;
   verify_results: string;
+  accept_verify_results?: string;
   goal_md: string;
   created_at: string;
   updated_at: string;
@@ -498,6 +499,7 @@ export class SqliteStore {
       supersede_preview_token: task.supersede_preview_token ?? '',
       supersede_batch_size: task.supersede_batch_size ?? 0,
       verify_results: task.verify_results ?? '[]',
+      accept_verify_results: task.accept_verify_results ?? '',
     };
     this.db
       .prepare(
@@ -508,7 +510,7 @@ export class SqliteStore {
           pm_review_comment, pm_accept_effects_applied, pm_reject_reason, pm_fix_instructions, pm_rejection_resolution_mode, repair_ownership_extension, pm_repair_ownership_required, pm_repair_ownership_intent, failure_reason, fix_for, repair_root_task_id, trigger_review_task_id, resolution_status,
           resolution_action, resolution_task_id, resolution_task_ids, acceptance_repair_task_ids, resolved_by_task, resolution_generation, resolution_attempts, resolution_decision_reason,
           blocked_at, block_reason, blocked_question_id,
-          blocked_lease_remaining, last_question_id, last_question_answer, cancelled_at, cancel_reason, superseded_at, superseded_by, superseded_reason, supersede_preview_token, supersede_batch_size, verify_results, goal_md, created_at, updated_at)
+          blocked_lease_remaining, last_question_id, last_question_answer, cancelled_at, cancel_reason, superseded_at, superseded_by, superseded_reason, supersede_preview_token, supersede_batch_size, verify_results, accept_verify_results, goal_md, created_at, updated_at)
          VALUES
          (@task_id, @plan_id, @title, @type, @phase, @status, @priority, @assignee, @ownership_files, @ownership_modules, @depends_on,
           @timeout_seconds, @max_retries, @model_override, @acceptance_for, @verify, @claimed_by, @claimed_at, @expire_at,
@@ -516,7 +518,7 @@ export class SqliteStore {
           @pm_review_comment, @pm_accept_effects_applied, @pm_reject_reason, @pm_fix_instructions, @pm_rejection_resolution_mode, @repair_ownership_extension, @pm_repair_ownership_required, @pm_repair_ownership_intent, @failure_reason, @fix_for, @repair_root_task_id, @trigger_review_task_id, @resolution_status,
           @resolution_action, @resolution_task_id, @resolution_task_ids, @acceptance_repair_task_ids, @resolved_by_task, @resolution_generation, @resolution_attempts, @resolution_decision_reason,
           @blocked_at, @block_reason, @blocked_question_id,
-          @blocked_lease_remaining, @last_question_id, @last_question_answer, @cancelled_at, @cancel_reason, @superseded_at, @superseded_by, @superseded_reason, @supersede_preview_token, @supersede_batch_size, @verify_results, @goal_md, @created_at, @updated_at)
+          @blocked_lease_remaining, @last_question_id, @last_question_answer, @cancelled_at, @cancel_reason, @superseded_at, @superseded_by, @superseded_reason, @supersede_preview_token, @supersede_batch_size, @verify_results, @accept_verify_results, @goal_md, @created_at, @updated_at)
          ON CONFLICT(task_id) DO UPDATE SET
            plan_id = excluded.plan_id, title = excluded.title, type = excluded.type, phase = excluded.phase,
            status = excluded.status, priority = excluded.priority, assignee = excluded.assignee,
@@ -528,7 +530,7 @@ export class SqliteStore {
            result_path = excluded.result_path, result_json_path = excluded.result_json_path,
            done_at = excluded.done_at, retries = excluded.retries,
            pm_review_status = excluded.pm_review_status, pm_reviewed_by = excluded.pm_reviewed_by,
-           pm_reviewed_at = excluded.pm_reviewed_at, pm_review_comment = excluded.pm_review_comment,
+           pm_reviewed_at = excluded.pm_reviewed_at, pm_review_comment = excluded.pm_review_comment, accept_verify_results = excluded.accept_verify_results,
            pm_accept_effects_applied = excluded.pm_accept_effects_applied,
            pm_reject_reason = excluded.pm_reject_reason, pm_fix_instructions = excluded.pm_fix_instructions,
            pm_rejection_resolution_mode = excluded.pm_rejection_resolution_mode,
