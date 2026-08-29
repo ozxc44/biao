@@ -1383,6 +1383,11 @@ export class SharedWorkerCoordinator {
         if (unavailableClaimScopes.has(key)) continue;
         let claimed: { ok: boolean; data: ClaimedTask | null };
         try {
+          // 共享轮次内的 claim 是“本轮已知可能有活”的即时探测，绝不 blocking：
+          // scheduleIfRequested 串行驱动全部 slot 与 PM 门铃，一次最长 60s 的长轮询
+          // 会冻结整个共享轮次。空闲拾取延迟由 Supervisor 轮次 + SSE 事件唤醒
+          // （BIAO_SUPERVISOR_EVENT_WAKE=1）负责；常驻 worker loop 的空闲等待走
+          // runWorkerLoop 的 blocking 长轮询（blockingClaimTimeoutMs）。
           claimed = await slot.client.claim({
             blocking: false,
             timeout_ms: 1,

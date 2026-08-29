@@ -896,6 +896,7 @@ curl -X POST http://127.0.0.1:7331/agent/offline \
 | `BIAO_MAX_TASKS` | `0` | 最大处理任务数；`0` 表示常驻 |
 | `BIAO_EXIT_ON_IDLE` | 原始 Worker 默认关闭；bootstrap 启动器默认 `1` | `1` 表示队列为空后退出 |
 | `BIAO_IDLE_POLL_MS` | `5000` | 仅遗留常驻单 Worker 的空闲轮询间隔；生产共享 Supervisor 不使用它 |
+| `BIAO_CLAIM_LONG_POLL_MS` | `50000` | 常驻单 Worker（`BIAO_EXIT_ON_IDLE=0`）空闲 claim 的服务端长轮询上限（`0` 关闭）：等待挂在中央、任务出现即返回，空闲请求从每 5s 一次降到约每 50s 一次，拾取延迟≈0；旧中央不支持 blocking 时自动降级回本地节拍。一次性 worker 与共享 Supervisor 轮内探测始终非阻塞 |
 | `BIAO_HEARTBEAT_MS` | `30000` | 运行中 Worker 的任务心跳间隔；共享 Supervisor 的空闲 presence 使用共享轮次，不使用独立 timer |
 | `BIAO_EXEC_CMD` | 无 | 通用 CLI Worker 的执行命令 |
 | `BIAO_MODEL` | `human` | 通用 Worker 写入结果的模型名称 |

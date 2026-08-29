@@ -15,6 +15,8 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
   const maxTasks = overrides.maxTasks ?? Number(process.env.BIAO_MAX_TASKS ?? '0');
   const preferredProject = overrides.preferredProject ?? process.env.BIAO_PREFERRED_PROJECT;
   const idlePollMs = overrides.idlePollMs ?? (Number(process.env.BIAO_IDLE_POLL_MS ?? '5000') || 5000);
+  const blockingClaimTimeoutMs = overrides.blockingClaimTimeoutMs
+    ?? Number(process.env.BIAO_CLAIM_LONG_POLL_MS ?? '50000');
   const heartbeatMs = overrides.heartbeatMs ?? (Number(process.env.BIAO_HEARTBEAT_MS ?? '30000') || 30000);
   const exitOnIdle = overrides.exitOnIdle ?? (process.env.BIAO_EXIT_ON_IDLE
     ? /^(1|true|yes)$/i.test(process.env.BIAO_EXIT_ON_IDLE)
@@ -26,6 +28,7 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
     maxTasks,
     preferredProject,
     idlePollMs,
+    blockingClaimTimeoutMs,
     heartbeatMs,
     exitOnIdle,
     capabilities: overrides.capabilities ?? ['code', 'review', 'research', 'docs', 'acceptance'],
