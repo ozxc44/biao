@@ -18,6 +18,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { isPmActionableItem } from './pm-actionable.mjs';
 import {
   BiaoSupervisorRuntime,
   releaseLocalLock,
@@ -658,8 +659,17 @@ try {
       const kinds = [...new Set(items.map((item) => item.kind))].join(',');
       // 监视器只负责低噪声提醒；不展开 task/question/event ID，避免把一个历史批次
       // 刷成终端日志。PM 需要详情时再主动从平台读取。
+      const actionable = items.filter(isPmActionableItem);
+      if (actionable.length === 0) {
+        // acceptance_ready 等是给 Worker/Supervisor 的信号，PM 没有可执行动作：
+        // 不启动 PM Agent（否则 pm-agent 判定无事可做、--require-drained 必然退出码
+        // 4，退避循环反复唤醒大模型却零进展）。返回 true 让本机去重生效，同一事项
+        // 后续轮次不再重复响铃；新的 PM 可执行门铃仍会立即唤醒。
+        console.log(`[biao] PM 门铃 plan=${planId} kinds=${kinds} count=${items.length}（无 PM 可执行事项，不唤醒 PM Agent）`);
+        return true;
+      }
       console.log(`[biao] PM 门铃 plan=${planId} kinds=${kinds} count=${items.length}（详情请到平台查看）`);
-      const handled = await dispatchPmDoorbell(planId, items);
+      const handled = await dispatchPmDoorbell(planId, actionable);
       if (handled === false) pmWakeFailed = true;
       return handled;
     },
