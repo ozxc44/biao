@@ -118,6 +118,61 @@ export function tryAcquireLocalLock(biaoUrl: string, lockDir: string): LocalLock
   return { acquired: false, path, reason: '锁文件正在被另一个本机 Supervisor 创建或接管' };
 }
 
+/**
+ * 常驻周期自证：锁文件可能被系统清理（历史默认在 tmpdir，macOS 会定期清空）或
+ * 人工误删。文件丢失时立即原子重建（wx），被并发接管则 EEXIST 落入读取判定；
+ * 内容已是另一个存活 Supervisor 时返回 false——调用方必须优雅退出，避免双
+ * 实例互翻注册 epoch（表现为 worker 的 AGENT_REGISTRATION_CHANGED）。
+ */
+export function assertLocalLockStillMine(handle: LocalLockHandle): boolean {
+  if (!handle.acquired || !handle.owner) return true;
+  let raw = '';
+  try {
+    raw = readFileSync(handle.path, 'utf8').trim();
+  } catch {
+    // 丢失：原子重建。被并发接管时 wx 得 EEXIST，落入下方读取判定。
+    try {
+      const fd = openSync(handle.path, 'wx', 0o600);
+      try {
+        writeFileSync(fd, `${handle.owner}\n`);
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch {
+      // 重建失败（如已被接管）：读取现状判定。
+    }
+    try {
+      raw = readFileSync(handle.path, 'utf8').trim();
+    } catch {
+      return true;
+    }
+  }
+  if (raw === handle.owner) return true;
+  const holderPid = Number(raw.split(':')[0]);
+  if (Number.isSafeInteger(holderPid) && holderPid > 0 && holderPid !== process.pid && isProcessAlive(holderPid)) {
+    return false;
+  }
+  // 持有者已死或内容损坏：本实例是仍在运行的合法持有者，重建自己的锁，
+  // 避免长时间处于无锁状态放行第二个实例。
+  try {
+    unlinkSync(handle.path);
+  } catch {
+    // 已不存在则直接进入重建。
+  }
+  try {
+    const fd = openSync(handle.path, 'wx', 0o600);
+    try {
+      writeFileSync(fd, `${handle.owner}\n`);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // 极端竞态下未能重建；下一轮自证再试。
+  }
+  return true;
+}
+
 /** 释放本机锁（中断清理 / 正常退出时调用） */
 export function releaseLocalLock(handle: LocalLockHandle): void {
   if (!handle.acquired || !handle.owner) return;
@@ -1070,6 +1125,8 @@ export interface SupervisorWorkerSlot {
   agentId: string;
   agentType: string;
   preferredProject?: string;
+  /** 跨机 slot 的本地工作区：任务 project_path 本地不存在时在此执行。 */
+  localWorkspace?: string;
   capabilities?: string[];
   /** 可领取 task type；默认由 capabilities 与 Biao TaskType 交集派生。 */
   preferredTypes?: TaskType[];
@@ -1475,6 +1532,7 @@ export class SharedWorkerCoordinator {
       agentId: slot.agentId,
       agentType: slot.agentType,
       preferredProject: slot.preferredProject,
+      localWorkspace: slot.localWorkspace,
       capabilities: slot.capabilities,
       heartbeatMs: slot.heartbeatMs,
       maxTasks: 1,

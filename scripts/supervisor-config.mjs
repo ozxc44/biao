@@ -29,6 +29,7 @@ function usage() {
 用法：
   biao-supervisor-config --config /absolute/runtime/config.env [--dry-run] worker add \\
     --id <agent-id> --kind <codex|kimi|custom|cli> --project <absolute-path> --types <a,b> \\
+    [--workspace <absolute-path>] \\
     [--command <command>] [--model <model>] [--agent-type <type>] \\
     [[--binding-id <id>] --harness-kind <kind> --wake-mode <visible_session|background_executor|external_worker> --adapter-id <id>]
   biao-supervisor-config --config /absolute/runtime/config.env worker remove --id <agent-id>
@@ -208,6 +209,22 @@ function replaceSlots(content, role, slots) {
   return `${content.slice(0, start)}${line}${match[2]}${content.slice(end)}`;
 }
 
+// pm-watch 保留 worker slots 的开关与 slot 配置同步：配置了 worker slot 即声明
+// 本机执行意图，留守监视器不应再清空 slots，否则纯 pm-watch 常驻机会出现
+// "打回的修复任务无人接"的空窗；移除到空时回落为纯 PM 门铃模式。
+const KEEP_VARIABLE = 'BIAO_PM_WATCH_KEEP_WORKER_SLOTS';
+function syncWatchKeepFlag(content, workerSlots) {
+  const line = `${KEEP_VARIABLE}=${shellQuote(workerSlots.length > 0 ? '1' : '0')}`;
+  const match = variableMatch(content, KEEP_VARIABLE);
+  if (!match) {
+    const separator = content.length === 0 || content.endsWith('\n') ? '' : '\n';
+    return `${content}${separator}${line}\n`;
+  }
+  const start = match.index;
+  const end = start + match[0].length;
+  return `${content.slice(0, start)}${line}${match[2]}${content.slice(end)}`;
+}
+
 function parseOptions(args, allowed) {
   const options = new Map();
   for (let index = 0; index < args.length; index += 2) {
@@ -272,7 +289,7 @@ function validateSlots(role, slots) {
 
 function buildWorkerSlot(args) {
   const options = parseOptions(args, new Set([
-    '--id', '--kind', '--project', '--types', '--command', '--model', '--agent-type',
+    '--id', '--kind', '--project', '--workspace', '--types', '--command', '--model', '--agent-type',
     '--binding-id', '--harness-kind', '--wake-mode', '--adapter-id',
   ]));
   const agentId = safeId(required(options, '--id'), 'Worker id');
@@ -284,11 +301,19 @@ function buildWorkerSlot(args) {
   if (!isAbsolute(project) || resolve(project) === parse(resolve(project)).root || /[\u0000\r\n]/.test(project)) {
     throw new Error('--project 必须是非根目录的绝对路径');
   }
+  const workspace = options.get('--workspace');
+  if (workspace !== undefined) {
+    const trimmed = workspace.trim();
+    if (!isAbsolute(trimmed) || resolve(trimmed) === parse(resolve(trimmed)).root || /[\u0000\r\n]/.test(trimmed)) {
+      throw new Error('--workspace 必须是非根目录的绝对路径（本机 checkout，project 为中央规范路径时的跨机执行目录）');
+    }
+  }
   const slot = {
     kind,
     agentId,
     project,
     types: commaList(required(options, '--types'), '--types'),
+    ...(workspace !== undefined ? { workspace: oneLine(workspace.trim(), '--workspace') } : {}),
   };
   const command = options.get('--command');
   const model = options.get('--model');
@@ -397,7 +422,9 @@ function main() {
       console.log(JSON.stringify(next, null, 2));
       return;
     }
-    atomicWriteOwnerConfig(configPath, replaceSlots(content, role, next));
+    let nextContent = replaceSlots(content, role, next);
+    if (role === 'worker') nextContent = syncWatchKeepFlag(nextContent, next);
+    atomicWriteOwnerConfig(configPath, nextContent);
     console.log(`${role} slot 已添加：${slot[idField]}`);
     return;
   }
@@ -411,7 +438,9 @@ function main() {
     console.log(JSON.stringify(next, null, 2));
     return;
   }
-  atomicWriteOwnerConfig(configPath, replaceSlots(content, role, next));
+  let nextContent = replaceSlots(content, role, next);
+  if (role === 'worker') nextContent = syncWatchKeepFlag(nextContent, next);
+  atomicWriteOwnerConfig(configPath, nextContent);
   console.log(`${role} slot 已移除：${id}`);
 }
 

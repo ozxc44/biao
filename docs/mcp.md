@@ -45,6 +45,8 @@
 
 - `command` 指向仓库入口 `scripts/mcp-server.mjs`（或等价的 `bin/biao-mcp.js`）；已通过 npm 安装 biao 包时，也可直接用 `biao-mcp` 命令——`package.json` 的 `bin.biao-mcp` 指向 `scripts/mcp-server.mjs`。
 - **环境变量三件套**：`BIAO_URL`（中央服务地址）、`BIAO_API_TOKEN`（Bearer 凭据）、`BIAO_MCP_TIMEOUT_MS`（可选，毫秒，默认 10000）。`src/mcp/runtime.ts` 的 `createLanMcpRuntime` 要求前两个必须提供，否则以 `REMOTE_CONFIG_INVALID` 拒绝启动；`BIAO_MCP_TIMEOUT_MS` 必须是 10..60000 的整数。
+- **执行期自动心跳**（`BIAO_MCP_AUTO_HEARTBEAT_MS`，可选，毫秒，默认 60000，`0` 关闭，合法范围 1000..600000）：`task_claim` 领取成功后，MCP 进程在后台按该间隔自动 `POST /heartbeat` + `POST /lease/renew`，直到 `task_report` / `task_block` / `question_ask` 释放 lease。这样长任务执行中即使会话不再调用工具，中央也不会把仍在干活的 Agent 判成 stale（阈值 5 分钟）并回收 lease。实现见 `src/mcp/auto-heartbeat.ts`：定时器 `unref()` 不拖住 stdio 进程退出；lease 判失效时自动忘记本地句柄；传输层连续失败 5 次后静默停止。
+- **留守监视器自愈（`BIAO_SUPERVISOR_AUTO_ENSURE` + `BIAO_PM_WATCH_CMD`，可选）**：开启后，MCP 会话在 `task_claim` / `task_report` / `pm_review_decide` / `question_answer` 成功后及每 5 分钟，幂等确认本机 `pm-watch` 留守监视器在运行（`src/mcp/stdio.ts` / `src/mcp/tools.ts`）。env 未显式携带开关时，读取 `BIAO_PM_WATCH_CMD` 同目录（bootstrap 布局即 `.biao/`）`config.env` 里的同名键作为机器级兜底，只读这一个开关键、不读凭据（`src/worker/ensure-supervisor.ts`）。默认关闭：未部署 pm-watch 的机器不会被拉起任何常驻进程。
 - stdio 传输的 `stdout` 只输出 JSON-RPC 消息（每行一条），日志全部走 `stderr`（`src/mcp/stdio.ts`）。
 
 ## 工具清单
@@ -64,7 +66,7 @@
 | `pm_review_list` | `GET /reviews/pending?plan_id` | 只列待验收交付摘要 |
 | `pm_review_read` | `GET /task/{task_id}/review` | 只给验收状态与证据摘要；`changed_files` 过滤绝对路径，产出 `verify_summary` / `result_ref` |
 | `task_claim` | 自动 `POST /register` 后 `POST /claim` | claim 回执（`claim_token`）只保存在进程内运行时；输出含 `goal_md` 正文，剥离 `claim_token`/`project_path`/`verify`（命令不外泄，报告时可用 `execute_verify` 由中央代执行） |
-| `task_heartbeat` | `POST /heartbeat`（持 lease 时再 `POST /lease/renew`） | 只用本会话 registration epoch 与内部 lease |
+| `task_heartbeat` | `POST /heartbeat`（持 lease 时再 `POST /lease/renew`） | 只用本会话 registration epoch 与内部 lease；领取后默认已有后台自动心跳，通常无需手动调用 |
 | `task_report` | `POST /report` | 上报 done/failed/partial；可内联携带 `result_md`/`result_json`（中央受控落盘，远程 Worker 无需服务器文件系统）并传 `execute_verify` 让中央在工作区代执行声明的 verify；done 仍需独立 PM Review |
 | `task_block` | `POST /task/{task_id}/block` | 成功后释放本地 lease 句柄 |
 | `question_ask` | `POST /question` | 成功后旧 lease 失效 |
@@ -96,7 +98,7 @@
 | `REMOTE_PROTOCOL_MISMATCH` | 非 JSON 响应、信封与 HTTP 状态不一致、health 版本不兼容、registration epoch 不一致 |
 | `REMOTE_UNAVAILABLE` | 中央 API 不可达 |
 | `REMOTE_RESPONSE_TOO_LARGE` | 响应超过控制面上限（默认 1 MiB） |
-| `REMOTE_CONFIG_INVALID` | `BIAO_URL`/`BIAO_API_TOKEN` 缺失、`BIAO_MCP_TIMEOUT_MS` 非法、`BIAO_URL` 不是合法 HTTP(S) URL |
+| `REMOTE_CONFIG_INVALID` | `BIAO_URL`/`BIAO_API_TOKEN` 缺失、`BIAO_MCP_TIMEOUT_MS`/`BIAO_MCP_AUTO_HEARTBEAT_MS` 非法、`BIAO_URL` 不是合法 HTTP(S) URL |
 
 ## 权威规格测试
 
@@ -113,6 +115,7 @@
 - `src/mcp/stdio.ts` — stdio 传输：逐行 JSON-RPC、stdout 只出协议、日志走 stderr
 - `src/mcp/session.ts` — JSON-RPC 分发（`MCP_SERVER_NAME = 'biao-lan-mcp'`、initialize/tools/list/tools/call/ping）
 - `src/mcp/runtime.ts` — `createLanMcpRuntime`：读 `BIAO_URL`/`BIAO_API_TOKEN`/`BIAO_MCP_TIMEOUT_MS`，维护会话内 agent 注册态与 claim lease
+- `src/mcp/auto-heartbeat.ts` — 领取后的执行期自动心跳（`BIAO_MCP_AUTO_HEARTBEAT_MS`）
 - `src/mcp/tools.ts` — 15 个工具注册表 + 输出脱敏投影
 - `src/mcp/client.ts` — `BiaoHttpClient`：HTTP 请求、超时/大小上限、fail-closed 错误分类、secret scrub
 - `src/mcp/http-route.ts` — 中央 Streamable HTTP MCP 空插件（推迟到 RBAC 之后）

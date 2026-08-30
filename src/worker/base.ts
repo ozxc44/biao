@@ -834,8 +834,11 @@ export function writeResult(
   backend: string,
   model: string,
   changedFiles: string[],
+  /** 跨机 slot 的本地项目根；缺省回落 task.project_path（同机模式）。 */
+  projectRoot?: string,
 ): { resultMdPath: string; resultJsonPath: string } {
-  const artifactContext = assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path);
+  const effectiveRoot = projectRoot ?? task.project_path;
+  const artifactContext = assertSecureTaskArtifactContext(workDir, task.task_id, effectiveRoot);
 
   const passedCount = verifyResults.filter((v) => v.passed).length;
   const failedCount = verifyResults.length - passedCount;
@@ -874,7 +877,7 @@ ${failedCount > 0 ? `## 失败详情\n${verifyResults.filter((v) => !v.passed).m
     timed_out: agentRun.timedOut,
     verify_results: verifyResults,
     changed_files: changedFiles,
-    diff_stats: collectDiffStats(task.project_path || process.cwd()),
+    diff_stats: collectDiffStats(effectiveRoot || process.cwd()),
     duration_seconds: Number((agentRun.durationMs / 1000).toFixed(1)),
     stdout_tail: agentRun.stdout.slice(-2000),
     stderr_tail: agentRun.stderr.slice(-2000),
@@ -904,12 +907,19 @@ export interface ClaimFile {
   claimed_at: number;
 }
 
-export function writeClaimFile(workDir: string, task: ClaimedTask, agentId: string): string {
-  const expectedTaskWorkDir = resolve(task.project_path || process.cwd(), 'work', task.task_id);
+export function writeClaimFile(
+  workDir: string,
+  task: ClaimedTask,
+  agentId: string,
+  /** 跨机 slot 的本地项目根；缺省回落 task.project_path（同机模式）。 */
+  projectRoot?: string,
+): string {
+  const effectiveRoot = projectRoot ?? task.project_path;
+  const expectedTaskWorkDir = resolve(effectiveRoot || process.cwd(), 'work', task.task_id);
   // 正式 Worker 只能走 project/work/task 绑定；旧 crash-recovery 测试所需的独立
   // 临时目录由专用能力承接，不再向任意 artifact API 暴露 allowStandalone。
   const artifactContext = resolve(workDir) === expectedTaskWorkDir
-    ? assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path)
+    ? assertSecureTaskArtifactContext(workDir, task.task_id, effectiveRoot)
     : secureStandaloneClaimRecoveryContext(workDir);
   const data: ClaimFile = {
     task_id: task.task_id,
@@ -920,11 +930,11 @@ export function writeClaimFile(workDir: string, task: ClaimedTask, agentId: stri
   return atomicWriteWorkerArtifact(artifactContext, '.claim.json', JSON.stringify(data, null, 2));
 }
 
-export function clearClaimFile(workDir: string, task?: ClaimedTask): void {
+export function clearClaimFile(workDir: string, task?: ClaimedTask, projectRoot?: string): void {
   const artifactContext = registeredWorkerArtifactContext(
     workDir,
     task?.task_id,
-    task?.project_path,
+    projectRoot ?? task?.project_path,
   );
   // unlinkWorkerArtifact 自身忽略 ENOENT；身份不可信必须向上传播，不能静默吞掉。
   unlinkWorkerArtifact(artifactContext, '.claim.json');
@@ -1009,8 +1019,13 @@ export class WorkerProgressTracker {
     workDir: string,
     task: ClaimedTask,
     agentId: string,
+    projectRoot?: string,
   ) {
-    this.artifactContext = assertSecureTaskArtifactContext(workDir, task.task_id, task.project_path);
+    this.artifactContext = assertSecureTaskArtifactContext(
+      workDir,
+      task.task_id,
+      projectRoot ?? task.project_path,
+    );
     const now = new Date().toISOString();
     this.value = {
       schema_version: 1,
@@ -1058,8 +1073,9 @@ export function createWorkerProgressTracker(
   workDir: string,
   task: ClaimedTask,
   agentId: string,
+  projectRoot?: string,
 ): WorkerProgressTracker {
-  return new WorkerProgressTracker(workDir, task, agentId);
+  return new WorkerProgressTracker(workDir, task, agentId, projectRoot);
 }
 
 /** 进度审计故障不能阻止 Worker 释放 lease/report；磁盘问题仍会留下明确本地警告。 */
@@ -1443,6 +1459,11 @@ export interface WorkerConfig {
   client?: BiaoClient;
   /** 按项目过滤（只领该项目的任务）；undefined = 不过滤 */
   preferredProject?: string;
+  /**
+   * 远程 slot 的本地工作区：跨机 V1 模式下中央规范 project_path 只在工作区
+   * 宿主机上存在；本机执行时若任务路径不是本地目录，回落到这里执行。
+   */
+  localWorkspace?: string;
   /** 执行函数：task → (agentRun, changedFiles)，可通过 question 交回 PM 决策。 */
   execute: (task: ClaimedTask, projectPath: string, signal?: AbortSignal) => Promise<{
     run: AgentRunResult;
@@ -1451,6 +1472,30 @@ export interface WorkerConfig {
     model: string;
     question?: WorkerQuestion;
   }>;
+}
+
+function isLocalDirectory(candidate: string): boolean {
+  try {
+    return statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 跨机执行路径解析：任务携带的 project_path 是中央规范路径，只在宿主机器上
+ * 存在。本机没有该目录而配置了 localWorkspace（slot 声明的本地 checkout）时，
+ * 在本地工作区执行；两者都不可用则原样返回任务路径，让执行错误自然暴露。
+ */
+export function resolveExecutionProjectPath(
+  taskProjectPath: string | undefined,
+  localWorkspace?: string,
+): string {
+  const taskPath = taskProjectPath?.trim() ?? '';
+  if (taskPath && isLocalDirectory(taskPath)) return taskPath;
+  const local = localWorkspace?.trim() ?? '';
+  if (local && isLocalDirectory(local)) return local;
+  return taskPath || process.cwd();
 }
 
 export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
@@ -1571,21 +1616,20 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
     let stopRenewingOnAbort: (() => void) | undefined;
     let preserveRunningProjectionOnAbort = false;
     // catch 路径也需要在 failed report 成功后清理 claim，因此不能只在 try 作用域内声明。
-    const workDir = join(task.project_path || process.cwd(), 'work', task.task_id);
+    // 跨机 slot：任务 project_path 在本机不存在时回落到 slot 声明的本地工作区。
+    const projectPath = resolveExecutionProjectPath(task.project_path, cfg.localWorkspace);
+    const workDir = join(projectPath, 'work', task.task_id);
     let progress: WorkerProgressTracker | undefined;
     try {
-      // 任务的 project_path 作为工作根目录（claim 返回带这个字段）
-      const projectPath = task.project_path || process.cwd();
-
       // `.progress.json` 只能由外层调度器写；claimed 必须早于 Agent 执行和任何最终产物。
       try {
-        progress = createWorkerProgressTracker(workDir, task, cfg.agentId);
+        progress = createWorkerProgressTracker(workDir, task, cfg.agentId, projectPath);
       } catch (error) {
         console.warn(`[worker-progress] claimed 写入失败：${(error as Error).message}`);
       }
 
       // crash recovery：本地持久化 claim 凭证（Redis 被清时可人工核对）
-      writeClaimFile(workDir, task, cfg.agentId);
+      writeClaimFile(workDir, task, cfg.agentId, projectPath);
 
       // plan MD 违规检测：execute 前对 plans/ 目录做快照（MD 职责分离，worker 不应改 plan MD）
       const planMdBefore = snapshotPlanMd(projectPath);
@@ -1603,7 +1647,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           cfg.ownershipConflictMode ?? 'wait',
         );
         if (!canProceed) {
-          if (cfg.ownershipConflictMode === 'block') clearClaimFile(workDir, task);
+          if (cfg.ownershipConflictMode === 'block') clearClaimFile(workDir, task, projectPath);
           conflictAborted = true;
           break; // 某个 glob 超时放弃，跳过整个任务
         }
@@ -1737,7 +1781,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
         }
         console.log(`[worker:${cfg.agentId}]   已通过平台提交 Question ${asked.data?.question_id ?? ''}，当前 slot 将继续领取其他任务`);
         advanceWorkerProgress(progress, 'blocked', { failureReason: 'waiting_pm_reply' });
-        clearClaimFile(workDir, task);
+        clearClaimFile(workDir, task, projectPath);
         count++;
         continue;
       }
@@ -1748,6 +1792,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
       // 写 result
       const { resultMdPath, resultJsonPath } = writeResult(
         workDir, task, run, verifyResults, cfg.agentId, backend, model, actualChangedFiles,
+        projectPath,
       );
 
       if (ownershipBoundaryViolations.length > 0) {
@@ -1755,7 +1800,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
         for (const violation of ownershipBoundaryViolations) {
           console.log(`[worker:${cfg.agentId}]     ${violation.path} (${violation.changeType})`);
         }
-        const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, task.project_path);
+        const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, projectPath ?? task.project_path);
         const resultJson = JSON.parse(readWorkerArtifact(artifactContext, 'result.json'));
         resultJson.status = 'failed';
         resultJson.ownership_violations = ownershipBoundaryViolations;
@@ -1784,7 +1829,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
         console.log(`[worker:${cfg.agentId}]   worker 不应直接改 plan MD，应通过 question 机制问 PM。违规已记录到 report。`);
         // 把 violations 写入 result.json（供 PM review 时看到）
         try {
-          const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, task.project_path);
+          const artifactContext = registeredWorkerArtifactContext(workDir, task.task_id, projectPath ?? task.project_path);
           const rj = JSON.parse(readWorkerArtifact(artifactContext, 'result.json'));
           rj.plan_md_violations = planMdViolations;
           atomicWriteWorkerArtifact(artifactContext, 'result.json', JSON.stringify(rj, null, 2));
@@ -1829,7 +1874,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           failureReason: status === 'failed' ? 'execution_or_verification_failed' : undefined,
         });
         logReportLifecycle(cfg.agentId, task.task_id, status, reportDelivery.response);
-        clearClaimFile(workDir, task); // report 成功，本地凭证使命完成
+        clearClaimFile(workDir, task, projectPath); // report 成功，本地凭证使命完成
       } else if (reportDelivery.state === 'confirmed_after_uncertain_response') {
         advanceWorkerProgress(progress, status === 'done' ? 'finished' : 'failed', {
           artifactsWritten: true,
@@ -1838,7 +1883,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
           failureReason: status === 'failed' ? 'execution_or_verification_failed' : undefined,
         });
         console.warn(`[worker:${cfg.agentId}]   ⚠ report 响应中断，但平台已确认 task=${status}；不补报 failed。`);
-        clearClaimFile(workDir, task);
+        clearClaimFile(workDir, task, projectPath);
       } else if (reportDelivery.state === 'unknown') {
         advanceWorkerProgress(progress, 'reporting', {
           artifactsWritten: true,
@@ -1928,7 +1973,7 @@ export async function runWorkerLoop(cfg: WorkerConfig): Promise<void> {
             failureReason: 'worker_exception',
           });
           logReportLifecycle(cfg.agentId, task.task_id, 'failed', failedReport);
-          clearClaimFile(workDir, task);
+          clearClaimFile(workDir, task, projectPath);
         } else {
           advanceWorkerProgress(progress, 'failed', {
             artifactsWritten: resultArtifactsWritten,
