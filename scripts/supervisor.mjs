@@ -22,6 +22,7 @@ import { isPmActionableItem } from './pm-actionable.mjs';
 import { ensureAgentProtocolBlock } from './agent-protocol.mjs';
 import {
   BiaoSupervisorRuntime,
+  assertLocalLockStillMine,
   releaseLocalLock,
   tryAcquireLocalLock,
 } from '../dist/worker/supervisor.js';
@@ -31,7 +32,12 @@ import { createCliWorkerConfig } from '../dist/worker/cli.js';
 
 const DEFAULT_URL = process.env.BIAO_URL ?? 'http://127.0.0.1:7331';
 const DEFAULT_CONSUMER = process.env.BIAO_PM_CONSUMER ?? 'pm';
-const DEFAULT_LOCK_DIR = process.env.BIAO_LOCK_DIR ?? (await import('node:os')).tmpdir();
+// 本机单实例锁默认放 .biao/locks：tmpdir 会被 macOS 定期清理，锁文件丢失后
+// 新旧 Supervisor 可并存并互翻注册 epoch（AGENT_REGISTRATION_CHANGED）。
+const { dirname: __dirname, join: __join } = await import('node:path');
+const { fileURLToPath: __fileURLToPath } = await import('node:url');
+const DEFAULT_LOCK_DIR = process.env.BIAO_LOCK_DIR
+  ?? __join(process.env.BIAO_RUNTIME_DIR ?? __join(__dirname(__fileURLToPath(import.meta.url)), '..'), '.biao', 'locks');
 
 function deriveWorkerApiToken(ownerToken) {
   return ownerToken
@@ -721,6 +727,10 @@ try {
     while (!shutdown.signal.aborted) {
       await runtime.run();
       if (shutdown.signal.aborted) break;
+      if (!assertLocalLockStillMine(handle)) {
+        console.error('[supervisor] 本机锁已被新实例接管；为避免双实例互翻注册 epoch，本实例退出。');
+        break;
+      }
       terminalDrained = await requestedPlansAreTerminal();
       if (!terminalDrained) {
         residentAnnounced = false;
