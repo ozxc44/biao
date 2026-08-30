@@ -599,8 +599,11 @@ export function bootstrap(options) {
     `BIAO_PM_AGENT_ROUTES=${shellQuote('')}`,
     `BIAO_PM_SLOTS=${shellQuote('')}`,
     `BIAO_WORKER_SLOTS=${shellQuote('')}`,
+    '# 配置了 worker slot 后由 supervisor-config 自动置 1：pm-watch 留守时保留',
+    '# slots，本机常驻链同时守 PM 门铃并主动领取/执行任务。',
+    `BIAO_PM_WATCH_KEEP_WORKER_SLOTS=${shellQuote('0')}`,
     '# 完成事件自愈：设为 1 后，task 上报 / pm ack / question answer 成功时会',
-    '# 自动确保 .biao/pm-watch 留守监视器在本机运行（无 worker slot、低频轮询）。',
+    '# 自动确保 .biao/pm-watch 留守监视器在本机运行（低频轮询；slots 按 KEEP 开关保留）。',
     `BIAO_SUPERVISOR_AUTO_ENSURE=${shellQuote('0')}`,
     '',
   ].join('\n');
@@ -881,8 +884,13 @@ exec "$SCRIPT_DIR/pm" pm heartbeat --once "$@"
 # 与 start 的区别：不启动本地服务进程，不注册 worker slot；所有计划闭环后
 # 留守低频复查。中央失联导致 supervisor 退出时，按 BIAO_PM_WATCH_RESTART_DELAY
 # （默认 30s）退避后自动重新轮询。
-BIAO_WORKER_SLOTS=''
-export BIAO_WORKER_SLOTS
+# 默认纯 PM 门铃模式（无 worker slot）。机器配置了 BIAO_WORKER_SLOTS 且
+# BIAO_PM_WATCH_KEEP_WORKER_SLOTS=1 时保留 slots：同一常驻既守 PM 门铃，
+# 也按配置主动领取/执行任务，避免"打回的修复任务无人接"的空窗。
+if [ "\${BIAO_PM_WATCH_KEEP_WORKER_SLOTS:-0}" != "1" ]; then
+  BIAO_WORKER_SLOTS=''
+  export BIAO_WORKER_SLOTS
+fi
 
 lock_dir="$SCRIPT_DIR/pm-watch.lock"
 if [ "\${1:-}" = "--ensure" ]; then
@@ -915,7 +923,8 @@ fi
 echo "[pm-watch] $(date '+%F %T') 启动：BIAO_URL=\${BIAO_URL}（PM 门铃留守监视，无 worker slot）" >> "$log_file"
 
 child_pid=''
-cleanup() {
+# 操作员显式停止（INT/TERM）：连带回收 supervisor 子进程并清锁。
+stop_by_signal() {
   rc=$?
   if [ -n "$child_pid" ]; then
     kill "$child_pid" 2>/dev/null || true
@@ -923,7 +932,17 @@ cleanup() {
   rm -rf "$lock_dir" 2>/dev/null || true
   exit "$rc"
 }
-trap cleanup INT TERM EXIT
+# 意外退出（EXIT，含 set -e 触发的异常路径）：只清包装器锁，绝不杀 supervisor。
+# 孤儿 supervisor 持有自己的本机单实例锁继续处理门铃与 Worker 调度（下方
+# "已由其他本机实例接管"路径即为此设计）；把包装器自身故障升级成整条监听链
+# 死亡才是最坏结果。需要彻底停止时请向 supervisor 发信号或停止 pm-watch。
+cleanup() {
+  rc=$?
+  rm -rf "$lock_dir" 2>/dev/null || true
+  exit "$rc"
+}
+trap stop_by_signal INT TERM
+trap cleanup EXIT
 
 while :; do
   node "$BIAO_PACKAGE_ROOT/scripts/supervisor.mjs" --stay-resident >> "$log_file" 2>&1 &

@@ -3,9 +3,11 @@ import type { LanMcpRuntime } from './runtime.js';
 import { remoteErrorEnvelope, randomRuntimeId } from './runtime.js';
 import { maybeEnsureSupervisor } from '../worker/ensure-supervisor.js';
 
-// 这些工具成功后意味着本机刚产生/刚消费了会改变门铃队列的事件；
-// opt-in 时顺带确认留守监视器在运行（pm-watch --ensure 幂等）。
-const SUPERVISOR_ENSURE_TOOLS = new Set(['task_report', 'pm_review_decide', 'question_answer']);
+// 这些工具成功后意味着本机刚产生/刚消费了会改变门铃队列的事件，或至少证明
+// 本机有活跃 Worker 会话；opt-in 时顺带确认留守监视器在运行（pm-watch --ensure
+// 幂等）。常驻链可能在外壳异常退出时整体死亡，领取/上报这类高频动作是最可靠的
+// 自愈时机。
+const SUPERVISOR_ENSURE_TOOLS = new Set(['task_claim', 'task_report', 'pm_review_decide', 'question_answer']);
 
 export interface McpToolResult {
   payload: BiaoApiEnvelope;
@@ -349,7 +351,7 @@ const tools: McpToolSpec[] = [
   },
   {
     name: 'task_claim',
-    description: '注册当前本机会话并通过中央 CAS 领取任务；响应含 goal 正文（verify 命令不外泄）。agent_id 首次携带后可省略。',
+    description: '注册当前本机会话并通过中央 CAS 领取任务；响应含 goal 正文（verify 命令不外泄）。agent_id 首次携带后可省略。领取成功后本 MCP 进程会按 BIAO_MCP_AUTO_HEARTBEAT_MS（默认 60s，0 关闭）自动心跳并续租，直到 task_report/task_block/question_ask 释放 lease。',
     inputSchema: objectSchema({
       agent_id: nonEmptyString,
       agent_type: nonEmptyString,
@@ -411,7 +413,7 @@ const tools: McpToolSpec[] = [
   },
   {
     name: 'task_heartbeat',
-    description: '用本 MCP 会话的 registration epoch 向中央 Biao 发送 Worker heartbeat。',
+    description: '用本 MCP 会话的 registration epoch 向中央 Biao 发送 Worker heartbeat。领取后已有后台自动心跳（BIAO_MCP_AUTO_HEARTBEAT_MS）时通常无需手动调用。',
     inputSchema: objectSchema({ agent_id: nonEmptyString, current_task: nonEmptyString }),
     handler: async (args, runtime) => {
       assertExactKeys(args, ['agent_id', 'current_task']);

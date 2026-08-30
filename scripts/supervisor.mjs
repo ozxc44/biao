@@ -597,10 +597,16 @@ function parseSlots() {
     if (slot.project !== undefined && (typeof slot.project !== 'string' || !slot.project.startsWith('/'))) {
       throw new Error(`第 ${index + 1} 个 Worker slot 的 project 必须是绝对路径`);
     }
+    if (slot.workspace !== undefined && (typeof slot.workspace !== 'string' || !slot.workspace.startsWith('/'))) {
+      throw new Error(`第 ${index + 1} 个 Worker slot 的 workspace 必须是绝对路径`);
+    }
     const baseOptions = {
       agentId,
       agentType,
       preferredProject: slot.project ?? process.env.BIAO_PREFERRED_PROJECT,
+      // 跨机 slot：project 是中央规范路径（用于注册/claim 匹配），workspace 是
+      // 本机真实 checkout（任务 project_path 本地不存在时在此执行）。
+      localWorkspace: slot.workspace,
       capabilities: Array.isArray(slot.capabilities) ? slot.capabilities : undefined,
     };
     const config = slot.kind === 'codex'
@@ -612,6 +618,7 @@ function parseSlots() {
       agentId: config.agentId,
       agentType: config.agentType,
       preferredProject: config.preferredProject,
+      localWorkspace: config.localWorkspace,
       capabilities: config.capabilities,
       preferredTypes: Array.isArray(slot.types) ? slot.types : undefined,
       heartbeatMs: config.heartbeatMs,

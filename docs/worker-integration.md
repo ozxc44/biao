@@ -78,6 +78,19 @@ bootstrap 生成的单 Worker 入口默认在队列为空后退出，适合一�
 .biao/supervisor-config worker add --id kimi-qa-1 --kind kimi \
   --project /path/to/workspace/my-project --types review,acceptance
 .biao/start
+
+跨机 slot（中央规范路径 ≠ 本机路径时）：`--project` 填中央规范 project_path（用于
+注册与 claim 匹配），`--workspace` 填本机真实 checkout。任务 project_path 在本机
+不存在时，执行、verify 与产物目录都落在 workspace 下；上报的 result_path 仍按
+中央规范路径记账。示例：
+
+```bash
+.biao/supervisor-config worker add --id kimi-remote-1 --kind kimi \
+  --project /data/workspaces/my-project --workspace /Users/me/src/my-project --types code,docs
+```
+
+`worker add/remove` 会同步维护 `BIAO_PM_WATCH_KEEP_WORKER_SLOTS`：配置了 slot 的
+机器，pm-watch 留守链同时守 PM 门铃并主动领取/执行任务；移除到空则回落纯门铃模式。
 ```
 
 `agentId` 在同一台机器上必须唯一；`project` 是传给 claim 的 `preferred_project`，只会领取完全匹配该项目路径的任务。每个 slot 的 `types` 只限制可领取任务类型，不会绕过依赖、独立验收或 ownership 规则。
@@ -219,6 +232,8 @@ curl -X POST http://127.0.0.1:7331/claim \
 ```
 
 注册响应中的 `registration_id` 是该 Agent 进程的会话代次，不是任务凭据；`heartbeat`、`claim` 和 `agent/offline` 都必须携带它。每次业务 claim 还要新建一个高熵 `claim_request_id`；同一次 claim 的网络重试必须复用它，新的领取调用必须换新 ID。这样平台在“已领取、响应丢失”时会重放原任务与原 token，不会把 Worker 卡到 lease 过期。新进程用新的代次重新注册后，旧进程的心跳、领取和离线请求会被拒绝，不能覆盖同名新会话。领取成功响应中的 `task_id`、`claim_token`、`project_path`、`ownership_files`、`verify`、`timeout_seconds` 是本次 claim 的事实来源。不要复用旧 token；同一个 `agent_id` 同时只能持有一个 `running` 任务。
+
+经 MCP 领取的会话有一层兜底：`task_claim` 成功后，`biao-mcp` stdio 进程会按 `BIAO_MCP_AUTO_HEARTBEAT_MS`（默认 60s，`0` 关闭）在后台自动 `heartbeat + lease/renew`，直到 `task_report` / `task_block` / `question_ask` 释放 lease（见 [MCP 接口](mcp.md)）。裸 HTTP Worker 没有这层兜底，仍必须自己在执行期维护心跳。
 
 ### 2. ownership：先检查，再写入
 

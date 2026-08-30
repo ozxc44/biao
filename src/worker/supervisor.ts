@@ -1070,6 +1070,8 @@ export interface SupervisorWorkerSlot {
   agentId: string;
   agentType: string;
   preferredProject?: string;
+  /** 跨机 slot 的本地工作区：任务 project_path 本地不存在时在此执行。 */
+  localWorkspace?: string;
   capabilities?: string[];
   /** 可领取 task type；默认由 capabilities 与 Biao TaskType 交集派生。 */
   preferredTypes?: TaskType[];
@@ -1475,6 +1477,7 @@ export class SharedWorkerCoordinator {
       agentId: slot.agentId,
       agentType: slot.agentType,
       preferredProject: slot.preferredProject,
+      localWorkspace: slot.localWorkspace,
       capabilities: slot.capabilities,
       heartbeatMs: slot.heartbeatMs,
       maxTasks: 1,

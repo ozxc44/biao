@@ -68,6 +68,7 @@ export function createCliWorkerConfig(overrides: CliWorkerOptions = {}): WorkerC
   const execCmd = overrides.execCmd ?? process.env.BIAO_EXEC_CMD;
   const model = overrides.model ?? process.env.BIAO_MODEL ?? 'human';
   const preferredProject = overrides.preferredProject ?? process.env.BIAO_PREFERRED_PROJECT;
+  const localWorkspace = overrides.localWorkspace;
   const idlePollMs = overrides.idlePollMs ?? (Number(process.env.BIAO_IDLE_POLL_MS ?? '5000') || 5000);
   const blockingClaimTimeoutMs = overrides.blockingClaimTimeoutMs
     ?? Number(process.env.BIAO_CLAIM_LONG_POLL_MS ?? '50000');
@@ -82,6 +83,7 @@ export function createCliWorkerConfig(overrides: CliWorkerOptions = {}): WorkerC
     agentType: overrides.agentType ?? 'cli',
     maxTasks,
     preferredProject,
+    localWorkspace,
     idlePollMs,
     blockingClaimTimeoutMs,
     heartbeatMs,

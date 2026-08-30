@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { BiaoHttpClient, BiaoRemoteError, type BiaoApiEnvelope, type BiaoHttpClientOptions } from './client.js';
+import { startAutoHeartbeat, resolveAutoHeartbeatIntervalMs, type AutoHeartbeatHandle } from './auto-heartbeat.js';
 
 export interface LanMcpRuntimeOptions extends BiaoHttpClientOptions {}
 
@@ -42,6 +43,8 @@ export function createLanMcpRuntime(
   if (!apiToken) throw new BiaoRemoteError('REMOTE_CONFIG_INVALID', '必须通过本机运行时提供 BIAO_API_TOKEN');
 
   const states = new Map<string, AgentRuntimeState>();
+  const autoHeartbeats = new Map<string, AutoHeartbeatHandle>();
+  const autoHeartbeatMs = resolveAutoHeartbeatIntervalMs(env);
   let defaultAgentId: string | undefined;
   const client = new BiaoHttpClient(biaoUrl, apiToken, {
     ...options,
@@ -57,6 +60,8 @@ export function createLanMcpRuntime(
     return state;
   };
 
+  const heartbeatKey = (agentId: string, taskId: string) => JSON.stringify([agentId, taskId]);
+
   return {
     client,
     agent,
@@ -68,9 +73,25 @@ export function createLanMcpRuntime(
       return token;
     },
     rememberClaim(agentId, taskId, claimToken) {
+      const key = heartbeatKey(agentId, taskId);
+      autoHeartbeats.get(key)?.stop();
+      if (autoHeartbeatMs > 0) {
+        autoHeartbeats.set(key, startAutoHeartbeat(agentId, taskId, autoHeartbeatMs, {
+          client,
+          registrationId: () => states.get(agentId)?.registrationId,
+          claimToken: () => states.get(agentId)?.claims.get(taskId),
+          forgetClaim: () => {
+            states.get(agentId)?.claims.delete(taskId);
+            autoHeartbeats.delete(key);
+          },
+        }));
+      }
       agent(agentId).claims.set(taskId, claimToken);
     },
     forgetClaim(agentId, taskId) {
+      const key = heartbeatKey(agentId, taskId);
+      autoHeartbeats.get(key)?.stop();
+      autoHeartbeats.delete(key);
       states.get(agentId)?.claims.delete(taskId);
     },
     rememberDefaultAgent(agentId) {

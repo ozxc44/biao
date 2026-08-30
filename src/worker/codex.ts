@@ -14,6 +14,7 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
   const agentId = overrides.agentId ?? process.env.BIAO_AGENT_ID ?? 'codex-1';
   const maxTasks = overrides.maxTasks ?? Number(process.env.BIAO_MAX_TASKS ?? '0');
   const preferredProject = overrides.preferredProject ?? process.env.BIAO_PREFERRED_PROJECT;
+  const localWorkspace = overrides.localWorkspace;
   const idlePollMs = overrides.idlePollMs ?? (Number(process.env.BIAO_IDLE_POLL_MS ?? '5000') || 5000);
   const blockingClaimTimeoutMs = overrides.blockingClaimTimeoutMs
     ?? Number(process.env.BIAO_CLAIM_LONG_POLL_MS ?? '50000');
@@ -27,6 +28,7 @@ export function createCodexWorkerConfig(overrides: Partial<WorkerConfig> = {}): 
     agentType: overrides.agentType ?? 'codex',
     maxTasks,
     preferredProject,
+    localWorkspace,
     idlePollMs,
     blockingClaimTimeoutMs,
     heartbeatMs,

@@ -25,6 +25,11 @@ if (db === 0 && !process.env.FORCE_TEST_ON_DB0) {
 const runtimeDir = mkdtempSync(join(tmpdir(), 'biao-vitest-'));
 process.env.BIAO_SQLITE_PATH = join(runtimeDir, 'biao.sqlite');
 
+// 测试进程不得触发留守监视器自愈：本仓库 .biao 是真实接线（config.env 带
+// opt-in、pm-watch 存在），否则工具调用后的 maybeEnsureSupervisor 会拉起真机
+// 常驻进程。显式 env 覆盖一切兜底；需要测自愈的用例自行改写该变量。
+process.env.BIAO_SUPERVISOR_AUTO_ENSURE = '0';
+
 // 测试 fixture 和动态 plan 只位于 package 目录或 /tmp。
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 process.env.BIAO_WORKSPACE_ROOTS ??= ['/tmp', tmpdir(), packageRoot].join(delimiter);
