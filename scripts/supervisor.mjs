@@ -37,7 +37,9 @@ const DEFAULT_CONSUMER = process.env.BIAO_PM_CONSUMER ?? 'pm';
 const { dirname: __dirname, join: __join } = await import('node:path');
 const { fileURLToPath: __fileURLToPath } = await import('node:url');
 const DEFAULT_LOCK_DIR = process.env.BIAO_LOCK_DIR
-  ?? __join(process.env.BIAO_RUNTIME_DIR ?? __join(__dirname(__fileURLToPath(import.meta.url)), '..'), '.biao', 'locks');
+  ?? (process.env.BIAO_RUNTIME_DIR
+    ? __join(process.env.BIAO_RUNTIME_DIR, 'locks')
+    : __join(__dirname(__fileURLToPath(import.meta.url)), '..', '.biao', 'locks'));
 
 function deriveWorkerApiToken(ownerToken) {
   return ownerToken
